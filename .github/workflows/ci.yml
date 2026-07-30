@@ -141,6 +141,7 @@ jobs:
         run: |
           for attempt in {1..30}; do
             if docker logs meshquill-ci-mosquitto 2>&1 | grep -q "mosquitto version .* running"; then
+              echo "broker ready after $attempt attempt(s)"
               exit 0
             fi
             sleep 1

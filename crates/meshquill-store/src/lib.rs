@@ -227,6 +227,7 @@ impl ConfigStore {
     pub fn save(&self, config: &Config) -> Result<(), StoreError> {
         config.validate()?;
         if let Some(parent) = self.path.parent() {
+            #[cfg(unix)]
             let parent_existed = parent.exists();
             fs::create_dir_all(parent).map_err(StoreError::Io)?;
             #[cfg(unix)]

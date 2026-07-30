@@ -86,14 +86,16 @@ jobs:
       - name: Smoke-test Unix archive
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          archive="dist/meshquill-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          archive="dist/meshquill-${GITHUB_REF_NAME}-${RELEASE_TARGET}.tar.gz"
           smoke=$(mktemp -d)
           tar -C "$smoke" -xzf "$archive"
-          binary="$smoke/meshquill-${GITHUB_REF_NAME}-${{ matrix.target }}/bin/meshquill"
+          binary="$smoke/meshquill-${GITHUB_REF_NAME}-${RELEASE_TARGET}/bin/meshquill"
           test "$("$binary" --version)" = "meshquill ${GITHUB_REF_NAME#v}"
-          root="$smoke/meshquill-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          root="$smoke/meshquill-${GITHUB_REF_NAME}-${RELEASE_TARGET}"
           test -s "$root/LICENSE-MIT"
           test -s "$root/LICENSE-APACHE"
           test -s "$root/docs/getting-started.md"
@@ -102,7 +104,7 @@ jobs:
           "$binary" --config "$smoke/config.toml" --non-interactive init --name demo --demo --set-default
           "$binary" --config "$smoke/config.toml" device info
           "$binary" --config "$smoke/config.toml" send Alice 'artifact smoke' --wait
-          if [[ "${{ matrix.target }}" == *-linux-gnu ]]; then
+          if [[ "$RELEASE_TARGET" == *-linux-gnu ]]; then
             highest=$(readelf --version-info "$binary" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' | sort -V | tail -1)
             test -n "$highest"
             test "$(printf '%s\n%s\n' "$highest" 2.35 | sort -V | tail -1)" = "2.35"
@@ -267,7 +269,7 @@ jobs:
           while IFS= read -r checksum; do
             (cd dist && sha256sum --check "$(basename "$checksum")")
           done < <(find dist -maxdepth 1 -type f -name '*.sha256' -print)
-          (cd dist && sha256sum *.tar.gz *.zip *.whl > SHA256SUMS)
+          (cd dist && sha256sum ./*.tar.gz ./*.zip ./*.whl > SHA256SUMS)
       - name: Create draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
