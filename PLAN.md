@@ -59,6 +59,8 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
       artifact reviews.
 - [x] Generate and smoke-test the local Linux x86-64 archive, checksum, completions, man pages, and
       abi3 wheel.
+- [x] Run the exact pushed commit through pre-tag CI on Linux x86-64, macOS Intel/ARM64, and Windows
+      x86-64, plus Python, MSRV, fuzz, broker, documentation, audit, and licence gates.
 - [ ] Run the prepared GitHub Actions matrix on Linux x86-64/ARM64, macOS Intel/ARM64, and Windows
       x86-64; inspect its five native archives and five wheels.
 - [ ] Run the separate physical-hardware suite and add actual device/firmware/transport rows.
@@ -69,6 +71,11 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
 
 1. No physical MeshCore companion is exposed to the environment. BLE/USB/radio smoke testing cannot
    be represented by the deterministic or TCP-loopback results.
+2. No crates.io credential-provider token or PyPI upload token is available locally or in the
+   repository. The tagged artifact workflow and draft inspection can proceed with GitHub authority,
+   but registry and public prerelease publication cannot pass the runbook boundary without those
+   independently scoped credentials.
 
-The GitHub repository now exists and authentication is active. Remote gates and publication proceed
-in the exact order kept in [the release runbook](docs/release.md).
+The GitHub repository now exists, authentication is active, and the pre-tag remote gates passed.
+Artifact and publication work proceeds in the exact order kept in
+[the release runbook](docs/release.md).

@@ -4,15 +4,18 @@ Last updated: 2026-07-30
 
 ## Release-candidate summary
 
-The `v0.1.0-rc.1` source tree is implemented and locally release-gated on Linux x86-64. The native
-CLI, Rust libraries, deterministic companion, transports, hooks, MQTT gateway, and installed-wheel
-Python SDK have all completed their applicable local tests. A local native archive and checksum
-were generated, extracted, and exercised from an isolated configuration.
+The `v0.1.0-rc.1` source tree is implemented and release-gated locally on Linux x86-64 and remotely
+on Linux x86-64, macOS Intel/ARM64, and Windows x86-64. The native CLI, Rust libraries,
+deterministic companion, transports, hooks, MQTT gateway, and installed-wheel Python SDK have all
+completed their applicable pre-tag tests. A local native archive and checksum were generated,
+extracted, and exercised from an isolated configuration.
 
-This is **not yet a cross-platform-verified release**. No physical MeshCore device was available.
-The public [GitHub repository](https://github.com/sol-aeternum/meshquill) has been created, and its
-Linux ARM64, macOS, and Windows Actions matrix is the remaining pre-tag publication gate. No GitHub
-release, crates.io package, or PyPI project is claimed to exist yet.
+This is **not yet a fully artifact-verified release**. No physical MeshCore device was available.
+The public [GitHub repository](https://github.com/sol-aeternum/meshquill) exists and the implementation
+commit passed its pre-tag [CI](https://github.com/sol-aeternum/meshquill/actions/runs/30560917595)
+and [supply-chain](https://github.com/sol-aeternum/meshquill/actions/runs/30560916669) gates. The
+annotated tag remains local, so the five-target native and wheel artifact matrix—including Linux
+ARM64—has not run. No GitHub release, crates.io package, or PyPI project is claimed to exist yet.
 
 ## Verification environment
 
@@ -42,9 +45,10 @@ physical matrix remains in [hardware testing](docs/hardware-testing.md).
 | MQTT | Both ignored integration tests passed separately against a disposable digest-pinned Mosquitto: publication/subscription and allowlisted broker-to-radio direct send |
 | Parsers | Both cargo-fuzz targets ran with sanitizers for 20 seconds on the pinned nightly without a crash; truncation, malformed, oversized, and property-style tests also passed |
 | Dependencies/licences | `cargo audit 0.22.2` passed for root and fuzz lockfiles against the refreshed RustSec database; `cargo deny 0.19.4 check` passed for both manifests |
-| Workflows/docs | actionlint 1.7.12 passed; generated Python API check passed; 128 source Markdown links passed with Lychee 0.24.2; shell release script passed `bash -n` |
+| Workflows/docs | actionlint 1.7.12 with ShellCheck 0.11.0 passed locally and remotely; generated Python API check passed; 128 source Markdown links passed with Lychee 0.24.2; shell release script passed `bash -n` |
 | Native package | Local x86-64 GNU archive checksum, 129-file inventory, licences, docs, four completions, 77 man pages, version, init, info, and ACKed send passed |
-| Remote platform matrix | **Pending:** the pinned workflow covers Linux x86-64/ARM64, macOS Intel/ARM64, and Windows x86-64; its pushed-commit result must be recorded before the tag is pushed |
+| Remote source matrix | **Passed:** commit `0661982538693b6a35c5c177f754c4416bd36d03` passed the pinned CI run on Linux x86-64, macOS Intel/ARM64, and Windows x86-64, plus Python 3.9/3.14, MSRV, fuzz, MQTT, workflow, and link jobs; its matching audit/licence run also passed |
+| Tagged artifact matrix | **Pending:** the unpublished annotated tag triggers five native archives and five wheels for Linux x86-64/ARM64, macOS Intel/ARM64, and Windows x86-64 |
 
 The local archive was built on the rolling host and references glibc 2.39. It is only local smoke
 evidence. Release CI builds Linux archives on Ubuntu 22.04 and rejects a referenced glibc version
@@ -102,7 +106,10 @@ The name was available when checked on 2026-07-30: GitHub search returned no con
 repository, `cargo search` returned no `meshquill` package, and PyPI returned an exact 404 for
 `meshquill-sdk`. The project now lives at <https://github.com/sol-aeternum/meshquill>.
 
-GitHub authentication for `sol-aeternum` is active and the remote is configured. The quality and
-release workflows, registry publication, and prerelease publication remain gated in the order
-documented by the [release runbook](docs/release.md). Physical validation is a separately recorded
-hardware limitation, not a publication credential problem.
+GitHub authentication for `sol-aeternum` is active, the remote is configured, and the exact pre-tag
+quality and supply-chain workflows passed. Private vulnerability reporting, secret scanning, push
+protection, dependency alerts, and automatic security-fix pull requests are enabled. No crates.io
+or PyPI publication credential is present in the maintainer environment or repository; registry and
+prerelease publication therefore remain gated in the order documented by the
+[release runbook](docs/release.md). Physical validation is a separately recorded hardware
+limitation, not a publication credential problem.
