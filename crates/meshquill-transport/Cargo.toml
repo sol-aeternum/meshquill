@@ -1,0 +1,33 @@
+[package]
+name = "meshquill-transport"
+description = "BLE, USB serial, TCP, and discovery transports for Meshquill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+async-trait.workspace = true
+btleplug.workspace = true
+bytes.workspace = true
+futures.workspace = true
+meshquill-core = { version = "=0.1.0-rc.1", path = "../meshquill-core" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-serial.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

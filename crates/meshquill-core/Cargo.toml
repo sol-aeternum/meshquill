@@ -1,0 +1,29 @@
+[package]
+name = "meshquill-core"
+description = "Core protocol, domain types, and transport/client primitives for Meshquill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

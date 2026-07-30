@@ -1,0 +1,95 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/meshquill-core",
+  "crates/meshquill-transport",
+  "crates/meshquill-store",
+  "crates/meshquill-mqtt",
+  "crates/meshquill-hooks",
+  "crates/meshquill-cli",
+  "crates/meshquill-python",
+  "crates/meshquill-test-support",
+]
+default-members = [
+  "crates/meshquill-core",
+  "crates/meshquill-transport",
+  "crates/meshquill-store",
+  "crates/meshquill-mqtt",
+  "crates/meshquill-hooks",
+  "crates/meshquill-cli",
+  "crates/meshquill-test-support",
+]
+
+[workspace.package]
+version = "0.1.0-rc.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+authors = ["Meshquill contributors"]
+repository = "https://github.com/sol-aeternum/meshquill"
+homepage = "https://github.com/sol-aeternum/meshquill"
+keywords = ["meshcore", "lora", "mesh", "cli", "radio"]
+categories = ["command-line-utilities", "network-programming"]
+
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+btleplug = "0.12"
+bytes = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4", features = ["derive", "env", "string", "wrap_help"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+directories = "6"
+futures = "0.3"
+hex = "0.4"
+humantime = "2"
+keyring = "4.1.5"
+rand = "0.9"
+rumqttc = { package = "battalion-rumqttc", version = "0.27.0" }
+rpassword = "7"
+rustls-pki-types = "1.15"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio-serial = { version = "5.5", features = ["libudev"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+await_holding_lock = "deny"
+dbg_macro = "deny"
+empty_drop = "deny"
+exit = "deny"
+large_futures = "warn"
+mem_forget = "deny"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"

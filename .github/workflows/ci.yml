@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  workflow-lint:
+    name: Workflow syntax
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Run checksum-verified actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          "$RUNNER_TEMP/actionlint" -no-color
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Install Linux transport headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev libudev-dev pkg-config
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      - name: Lint all targets and features
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Check all feature combinations
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: Test all targets
+        # PyO3's extension-module feature intentionally omits libpython linkage on Unix. The
+        # installed-wheel job below exercises that feature; native Rust tests use default features.
+        run: cargo test --workspace --all-targets --locked
+      - name: Build documentation with warnings denied
+        shell: bash
+        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev libudev-dev pkg-config
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
+
+  fuzz-smoke:
+    name: Parser fuzz smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: rustup toolchain install nightly-2026-07-30 --profile minimal
+      - run: cargo +nightly-2026-07-30 install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +nightly-2026-07-30 fuzz run protocol_packet -- -max_total_time=20
+      - run: cargo +nightly-2026-07-30 fuzz run outer_frames -- -max_total_time=20
+
+  python:
+    name: Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.14"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: crates/meshquill-python/pyproject.toml
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev libudev-dev pkg-config
+      - name: Install Python development tools
+        run: python -m pip install "maturin>=1.9,<2" "mypy>=1.13,<2" "pytest>=8.3,<9" "pytest-asyncio>=0.24,<2" "ruff>=0.9"
+      - name: Build and install extension into the test environment
+        working-directory: crates/meshquill-python
+        shell: bash
+        run: |
+          # This job validates the extension on the runner that built it. Release wheels are built
+          # and audited in the pinned manylinux container in release.yml.
+          maturin build --locked --auditwheel skip --out ../../dist/python-ci
+          python -m pip install --force-reinstall ../../dist/python-ci/*.whl
+      - name: Lint Python
+        working-directory: crates/meshquill-python
+        run: |
+          ruff format --check python examples tests
+          ruff check python examples tests
+      - name: Check Python types
+        working-directory: crates/meshquill-python
+        run: |
+          mypy
+          python -m mypy.stubtest meshcore_sdk
+          python ../../scripts/generate-python-api.py --check
+      - name: Test Python SDK
+        working-directory: crates/meshquill-python
+        run: pytest
+      - name: Run Python examples
+        working-directory: crates/meshquill-python
+        run: |
+          python examples/quickstart.py
+          python examples/streaming.py
+
+  mqtt-mosquitto:
+    name: MQTT integration (Mosquitto)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev libudev-dev pkg-config
+      - name: Start disposable broker
+        run: docker run --detach --rm --name meshquill-ci-mosquitto --publish 127.0.0.1:18884:1883 --volume "$PWD/.github/mosquitto-ci.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+      - name: Wait for broker
+        shell: bash
+        run: |
+          for attempt in {1..30}; do
+            if docker logs meshquill-ci-mosquitto 2>&1 | grep -q "mosquitto version .* running"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs meshquill-ci-mosquitto
+          exit 1
+      - name: Exercise publish and allowlisted outbound command
+        env:
+          MESHQUILL_MQTT_TEST_HOST: 127.0.0.1
+          MESHQUILL_MQTT_TEST_PORT: 18884
+        run: |
+          cargo test --locked --package meshquill-mqtt --test mosquitto -- --ignored --exact mosquitto_roundtrip_uses_real_subscription_and_publication
+          cargo test --locked --package meshquill --test mqtt_bridge -- --ignored --exact mqtt_bridge_with_real_broker_roundtrip_send_direct_to_demo_destination
+      - name: Stop disposable broker
+        if: always()
+        run: docker stop meshquill-ci-mosquitto || true
+
+  docs-links:
+    name: Documentation links
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
+        with:
+          args: --root-dir . --max-retries 3 --timeout 20 --no-progress './**/*.md'
+          fail: true
+          token: ${{ secrets.GITHUB_TOKEN }}

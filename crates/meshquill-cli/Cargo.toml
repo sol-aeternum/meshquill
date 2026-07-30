@@ -1,0 +1,50 @@
+[package]
+name = "meshquill"
+description = "Native Meshquill command-line application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "meshquill"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+humantime.workspace = true
+hex.workspace = true
+meshquill-core = { version = "=0.1.0-rc.1", path = "../meshquill-core" }
+meshquill-hooks = { version = "=0.1.0-rc.1", path = "../meshquill-hooks" }
+meshquill-mqtt = { version = "=0.1.0-rc.1", path = "../meshquill-mqtt" }
+meshquill-store = { version = "=0.1.0-rc.1", path = "../meshquill-store" }
+meshquill-test-support = { version = "=0.1.0-rc.1", path = "../meshquill-test-support" }
+meshquill-transport = { version = "=0.1.0-rc.1", path = "../meshquill-transport" }
+rpassword.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rumqttc.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

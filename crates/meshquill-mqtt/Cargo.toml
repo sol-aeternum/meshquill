@@ -1,0 +1,30 @@
+[package]
+name = "meshquill-mqtt"
+description = "Optional application-level MQTT gateway for Meshquill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+meshquill-core = { version = "=0.1.0-rc.1", path = "../meshquill-core" }
+rumqttc = { workspace = true }
+rustls-native-certs = "0.8"
+rustls-pki-types = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

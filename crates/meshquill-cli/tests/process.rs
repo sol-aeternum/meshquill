@@ -1,0 +1,1431 @@
+//! Process-level contracts for the native CLI binary.
+
+use std::{
+    fs,
+    io::Write as _,
+    path::Path,
+    process::{Command, Stdio},
+};
+
+use serde_json::Value;
+use tempfile::TempDir;
+
+fn invoke(arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_meshquill"))
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run meshquill: {error}"))
+}
+
+fn invoke_with_env(arguments: &[&str], name: &str, value: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_meshquill"))
+        .args(arguments)
+        .env(name, value)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run meshquill: {error}"))
+}
+
+fn invoke_with_input(arguments: &[&str], input: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meshquill"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn meshquill: {error}"));
+    let mut stdin = child.stdin.take().expect("piped child stdin");
+    stdin
+        .write_all(input)
+        .unwrap_or_else(|error| panic!("failed to write child stdin: {error}"));
+    drop(stdin);
+    child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to wait for meshquill: {error}"))
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec())
+        .unwrap_or_else(|error| panic!("process emitted invalid UTF-8: {error}"))
+}
+
+fn config_path(directory: &TempDir) -> String {
+    directory.path().join("config.toml").display().to_string()
+}
+
+fn hook_fixture(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../meshquill-hooks/tests/fixtures")
+        .join(name)
+        .display()
+        .to_string()
+}
+
+fn quoted_toml(value: &str) -> String {
+    format!("{value:?}")
+}
+
+fn add_hook_config(path: &str, script: &str, python_executable: Option<&str>) {
+    let mut config = fs::read_to_string(path).expect("read existing configuration");
+    let mut section = String::from("[hook]\nenabled = true\nscript = ");
+    section.push_str(&quoted_toml(script));
+    section.push('\n');
+    if let Some(python_executable) = python_executable {
+        section.push_str("python_executable = ");
+        section.push_str(&quoted_toml(python_executable));
+        section.push('\n');
+    }
+    if let Some(start) = config.find("[hook]\n") {
+        let end = config[start + 1..]
+            .find("\n[")
+            .map_or(config.len(), |offset| start + offset + 2);
+        config.replace_range(start..end, &section);
+    } else {
+        config.push('\n');
+        config.push_str(&section);
+    }
+    fs::write(path, config).expect("write configuration with hook section");
+}
+
+fn enable_history(path: &str) {
+    let config = fs::read_to_string(path).expect("read existing configuration");
+    let updated = config.replacen("[history]\nenabled = false", "[history]\nenabled = true", 1);
+    assert_ne!(updated, config, "history section was not found");
+    fs::write(path, updated).expect("enable local history");
+}
+
+fn init_demo(config: &str) {
+    let output = invoke(&[
+        "--config",
+        config,
+        "--non-interactive",
+        "init",
+        "--name",
+        "demo",
+        "--demo",
+        "--set-default",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+}
+
+#[test]
+fn noninteractive_init_creates_an_atomic_demo_profile() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--non-interactive",
+        "--output",
+        "json",
+        "init",
+        "--name",
+        "field",
+        "--demo",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON init result");
+    assert_eq!(parsed["type"], "configuration_initialized");
+    let saved = fs::read_to_string(&config).expect("saved configuration");
+    assert!(saved.contains("default_profile = \"field\""));
+    assert!(saved.contains("scenario = \"demo\""));
+}
+
+#[test]
+fn noninteractive_init_requires_name_and_one_transport() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&["--config", &config, "--non-interactive", "init"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("requires --name"));
+    assert!(!Path::new(&config).exists());
+}
+
+#[test]
+fn output_shape_is_rejected_before_init_writes() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--non-interactive",
+        "--output",
+        "jsonl",
+        "init",
+        "--name",
+        "demo",
+        "--demo",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!Path::new(&config).exists());
+}
+
+#[test]
+fn missing_config_is_actionable_and_stable() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&["--config", &config, "status"]);
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("configuration is missing"));
+    assert!(stderr.contains("meshquill init"));
+}
+
+#[test]
+fn documented_environment_overrides_are_effective_but_not_persisted_by_init() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let show = invoke_with_env(
+        &["--config", &config, "--output", "json", "config", "show"],
+        "MESHQUILL_TIMEOUT_REQUEST_MS",
+        "77",
+    );
+    assert_eq!(show.status.code(), Some(0), "{}", text(&show.stderr));
+    let effective: Value = serde_json::from_slice(&show.stdout).expect("effective config JSON");
+    assert_eq!(
+        effective["data"]["effective"]["timeout"]["request_timeout_ms"],
+        77
+    );
+
+    let second = invoke_with_env(
+        &[
+            "--config",
+            &config,
+            "--non-interactive",
+            "init",
+            "--name",
+            "second",
+            "--demo",
+        ],
+        "MESHQUILL_TIMEOUT_REQUEST_MS",
+        "77",
+    );
+    assert_eq!(second.status.code(), Some(0), "{}", text(&second.stderr));
+    let saved = fs::read_to_string(&config).expect("configuration after init");
+    assert!(saved.contains("request_timeout_ms = 3000"));
+    assert!(!saved.contains("request_timeout_ms = 77"));
+}
+
+#[test]
+fn demo_connect_uses_the_real_core_handshake() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&["--config", &config, "--output", "json", "connect"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON connection result");
+    assert_eq!(parsed["schema"], "meshquill.cli/v1");
+    assert_eq!(parsed["type"], "connection");
+    assert_eq!(parsed["data"]["connected"], true);
+}
+
+#[test]
+fn verbose_diagnostics_are_stderr_only_and_terminal_safe_when_redirected() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&["--config", &config, "-vv", "connect"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("creating bounded CLI client"));
+    assert!(!stderr.contains('\u{1b}'));
+    assert!(!text(&output.stdout).contains('\u{1b}'));
+}
+
+#[test]
+fn demo_contacts_support_show_search_and_unique_prefixes() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    for arguments in [
+        vec!["--config", &config, "contacts", "--search", "ali"],
+        vec!["--config", &config, "contacts", "show", "2222"],
+    ] {
+        let output = invoke(&arguments);
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        assert!(text(&output.stdout).contains("Alice"));
+    }
+}
+
+#[test]
+fn explicit_contact_path_is_validated_and_confirmed() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    let refused = invoke(&[
+        "--config", &config, "contacts", "path", "set", "Alice", "12,ab,ff",
+    ]);
+    assert_eq!(refused.status.code(), Some(9));
+
+    let updated = invoke(&[
+        "--config", &config, "--yes", "--output", "json", "contacts", "path", "set", "Alice",
+        "12,ab,ff",
+    ]);
+    assert_eq!(updated.status.code(), Some(0), "{}", text(&updated.stderr));
+    let parsed: Value = serde_json::from_slice(&updated.stdout).expect("path set JSON");
+    assert_eq!(parsed["type"], "contact_path_set");
+    assert_eq!(parsed["data"]["path"], "12abff");
+    assert_eq!(parsed["data"]["hash_bytes"], 3);
+    assert_eq!(parsed["data"]["hop_count"], 1);
+
+    let malformed = invoke(&[
+        "--config", &config, "--yes", "contacts", "path", "set", "Alice", "zz",
+    ]);
+    assert_eq!(malformed.status.code(), Some(2));
+}
+
+#[test]
+fn demo_direct_send_waits_for_deterministic_ack() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config", &config, "--output", "json", "send", "Alice", "hello", "--wait",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON send result");
+    assert_eq!(parsed["data"]["acknowledged"], true);
+    assert_eq!(parsed["data"]["ack_code"], "12345678");
+}
+
+#[test]
+fn remote_login_reads_only_stdin_and_reports_authentication_failure_safely() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    let failed = invoke_with_input(
+        &[
+            "--config",
+            &config,
+            "--non-interactive",
+            "remote",
+            "login",
+            "Alice",
+            "--password-stdin",
+        ],
+        b"wrong-password\n",
+    );
+    assert_eq!(failed.status.code(), Some(8));
+    let stderr = text(&failed.stderr);
+    assert!(!stderr.contains("wrong-password"));
+    assert!(!text(&failed.stdout).contains("wrong-password"));
+
+    let authenticated = invoke_with_input(
+        &[
+            "--config",
+            &config,
+            "--non-interactive",
+            "--output",
+            "json",
+            "remote",
+            "login",
+            "Alice",
+            "--password-stdin",
+        ],
+        b"meshquill-demo\n",
+    );
+    assert_eq!(
+        authenticated.status.code(),
+        Some(0),
+        "{}",
+        text(&authenticated.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&authenticated.stdout).expect("remote login JSON");
+    assert_eq!(parsed["type"], "remote_login");
+    assert_eq!(parsed["data"]["authenticated"], true);
+    assert!(parsed["data"].get("password").is_none());
+}
+
+#[test]
+fn demo_remote_and_sensor_queries_use_correlated_protocol_responses() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    for (arguments, expected_type) in [
+        (vec!["remote", "status", "Alice"], "remote_status"),
+        (
+            vec!["remote", "neighbours", "Alice", "--prefix-length", "6"],
+            "remote_neighbours",
+        ),
+        (vec!["remote", "regions", "Alice"], "remote_regions"),
+        (vec!["remote", "owner", "Alice"], "remote_owner"),
+        (vec!["remote", "clock", "Alice"], "remote_clock"),
+        (vec!["sensor", "telemetry", "Alice"], "sensor_telemetry"),
+        (vec!["sensor", "summary", "Alice"], "sensor_summary"),
+        (vec!["sensor", "acl", "Alice"], "sensor_acl"),
+    ] {
+        let mut command = vec!["--config", &config, "--output", "json"];
+        command.extend(arguments);
+        let output = invoke(&command);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{expected_type}: {}",
+            text(&output.stderr)
+        );
+        let parsed: Value = serde_json::from_slice(&output.stdout).expect("remote query JSON");
+        assert_eq!(parsed["type"], expected_type);
+    }
+}
+
+#[test]
+fn arbitrary_remote_commands_require_explicit_destructive_intent() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    let denied = invoke(&["--config", &config, "remote", "run", "Alice", "reboot"]);
+    assert_eq!(denied.status.code(), Some(9));
+    assert!(text(&denied.stderr).contains("read-only allowlist"));
+
+    let still_unconfirmed = invoke(&[
+        "--config",
+        &config,
+        "remote",
+        "run",
+        "Alice",
+        "reboot",
+        "--destructive",
+    ]);
+    assert_eq!(still_unconfirmed.status.code(), Some(9));
+
+    let confirmed = invoke(&[
+        "--config",
+        &config,
+        "--yes",
+        "--output",
+        "json",
+        "remote",
+        "run",
+        "Alice",
+        "reboot",
+        "--destructive",
+    ]);
+    assert_eq!(
+        confirmed.status.code(),
+        Some(0),
+        "{}",
+        text(&confirmed.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&confirmed.stdout).expect("remote command JSON");
+    assert_eq!(parsed["type"], "remote_command");
+    assert_eq!(parsed["data"]["destructive"], true);
+}
+
+#[test]
+fn explicit_ack_timeout_maps_to_timeout_without_success_output() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let current = fs::read_to_string(&config).expect("demo configuration");
+    fs::write(
+        &config,
+        current.replace("scenario = \"demo\"", "scenario = \"ack-timeout\""),
+    )
+    .expect("timeout scenario configuration");
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--timeout",
+        "20ms",
+        "--output",
+        "json",
+        "send",
+        "Alice",
+        "hello",
+        "--wait",
+    ]);
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("timed out"));
+}
+
+#[test]
+fn numeric_channel_send_is_supported_but_named_channel_is_not_guessed() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let numeric = invoke(&["--config", &config, "send", "2", "hello", "--channel"]);
+    assert_eq!(numeric.status.code(), Some(0), "{}", text(&numeric.stderr));
+    let named = invoke(&["--config", &config, "send", "field", "hello", "--channel"]);
+    assert_eq!(named.status.code(), Some(2));
+}
+
+#[test]
+fn device_reboot_requires_confirmation() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let refused = invoke(&["--config", &config, "device", "reboot"]);
+    assert_eq!(refused.status.code(), Some(9));
+    assert!(text(&refused.stderr).contains("confirmation is required"));
+
+    let rebooted = invoke(&[
+        "--config", &config, "--yes", "--output", "json", "device", "reboot",
+    ]);
+    assert_eq!(
+        rebooted.status.code(),
+        Some(0),
+        "{}",
+        text(&rebooted.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&rebooted.stdout).expect("JSON reboot result");
+    assert_eq!(parsed["type"], "device_reboot");
+    assert_eq!(parsed["data"]["disconnected"], true);
+}
+
+#[test]
+fn network_scope_query_and_set_default_are_reported_without_key_material() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    let before = invoke(&["--config", &config, "--output", "json", "network", "scope"]);
+    assert_eq!(before.status.code(), Some(0), "{}", text(&before.stderr));
+    let before_data: Value = serde_json::from_slice(&before.stdout).expect("query scope output");
+    assert_eq!(before_data["type"], "network_scope");
+    assert_eq!(before_data["data"]["action"], "query");
+
+    let set_default = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "network",
+        "scope",
+        "#field",
+        "--set-default",
+    ]);
+    assert_eq!(
+        set_default.status.code(),
+        Some(0),
+        "{}",
+        text(&set_default.stderr)
+    );
+    let set_json: Value =
+        serde_json::from_slice(&set_default.stdout).expect("JSON scope set_default result");
+    assert_eq!(set_json["type"], "network_scope");
+    assert_eq!(set_json["data"]["scope"], "#field");
+    assert!(set_json["data"].get("public_key").is_none());
+}
+
+#[test]
+fn network_discover_collects_correlated_mock_responses() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--timeout",
+        "20ms",
+        "--output",
+        "json",
+        "network",
+        "discover",
+        "--kind",
+        "room",
+        "--scope",
+        "#field",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON node discovery");
+    assert_eq!(parsed["type"], "network_discovery");
+    assert_eq!(parsed["data"]["filter"], "room");
+    assert_eq!(parsed["data"]["scope"], "#field");
+    assert_eq!(
+        parsed["data"]["nodes"][0]["public_key_prefix"],
+        "42".repeat(8)
+    );
+    assert_eq!(parsed["data"]["nodes"][0]["key_bytes"], 8);
+    assert_eq!(parsed["data"]["nodes"][0]["node_type"], 2);
+    assert_eq!(parsed["data"]["nodes"][0]["kind"], "room");
+    assert_eq!(parsed["data"]["nodes"][0]["snr_qdb"], 20);
+    assert_eq!(parsed["data"]["nodes"][0]["inbound_snr_qdb"], 12);
+    assert_eq!(parsed["data"]["nodes"][0]["rssi_dbm"], -91);
+    assert_eq!(parsed["data"]["nodes"][0]["path_len"], 0);
+}
+
+#[test]
+fn batch_command_files_execute_bounded_non_streaming_commands() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let commands = directory.path().join("commands.meshquill");
+    fs::write(
+        &commands,
+        "# one command per line\nstatus\ncontacts --search Alice\n",
+    )
+    .expect("batch command file");
+
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "batch",
+        "run",
+        &commands.display().to_string(),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON batch output");
+    assert_eq!(parsed["type"], "batch_run");
+    assert_eq!(parsed["data"]["command_count"], 2);
+    assert_eq!(parsed["data"]["results"][0]["line"], 2);
+    assert_eq!(parsed["data"]["results"][0]["result"]["type"], "status");
+    assert_eq!(parsed["data"]["results"][1]["result"]["type"], "contacts");
+}
+
+#[test]
+fn batch_contact_filters_support_dry_run_and_single_destructive_confirmation() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    let dry_run = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "batch",
+        "contacts",
+        "--filter",
+        "type=client,name~ali",
+        "remote-status",
+        "--dry-run",
+    ]);
+    assert_eq!(dry_run.status.code(), Some(0), "{}", text(&dry_run.stderr));
+    let parsed: Value = serde_json::from_slice(&dry_run.stdout).expect("batch dry-run JSON");
+    assert_eq!(parsed["type"], "batch_contacts");
+    assert_eq!(parsed["data"]["dry_run"], true);
+    assert_eq!(parsed["data"]["target_count"], 1);
+    assert_eq!(parsed["data"]["targets"][0]["name"], "Alice");
+    assert!(parsed["data"]["targets"][0].get("result").is_none());
+
+    let refused = invoke(&[
+        "--config",
+        &config,
+        "batch",
+        "contacts",
+        "--filter",
+        "type=client",
+        "path-reset",
+    ]);
+    assert_eq!(refused.status.code(), Some(9));
+
+    let confirmed = invoke(&[
+        "--config",
+        &config,
+        "--yes",
+        "--output",
+        "json",
+        "batch",
+        "contacts",
+        "--filter",
+        "type=client",
+        "path-reset",
+    ]);
+    assert_eq!(
+        confirmed.status.code(),
+        Some(0),
+        "{}",
+        text(&confirmed.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&confirmed.stdout).expect("batch reset JSON");
+    assert_eq!(parsed["data"]["target_count"], 1);
+    assert_eq!(
+        parsed["data"]["targets"][0]["result"]["type"],
+        "contact_path_reset"
+    );
+}
+
+#[test]
+fn network_trace_reports_contact() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config", &config, "--output", "json", "network", "trace", "Alice",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON network trace");
+    assert_eq!(parsed["type"], "network_trace");
+    assert_eq!(parsed["data"]["target"], "Alice");
+}
+
+#[test]
+fn network_trace_rejects_reserved_four_byte_hash_mode_before_connecting() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "network",
+        "trace",
+        "Alice",
+        "--hash-bytes",
+        "4",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("reserved"));
+}
+
+#[test]
+fn scoped_send_and_advertise_work_and_cleanup_scope() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    let sent = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "send",
+        "Alice",
+        "scoped hello",
+        "--scope",
+        "#field",
+    ]);
+    assert_eq!(sent.status.code(), Some(0), "{}", text(&sent.stderr));
+    let parsed: Value = serde_json::from_slice(&sent.stdout).expect("JSON scoped send result");
+    assert_eq!(parsed["type"], "send");
+
+    let advertise = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "device",
+        "advertise",
+        "--flood",
+        "--scope",
+        "#field",
+    ]);
+    assert_eq!(
+        advertise.status.code(),
+        Some(0),
+        "{}",
+        text(&advertise.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&advertise.stdout).expect("JSON advertise result");
+    assert_eq!(parsed["type"], "advertise");
+    assert_eq!(parsed["data"]["flood"], true);
+}
+
+#[test]
+fn invalid_network_scope_length_is_rejected_before_default_is_mutated() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let before = fs::read(&config).expect("read config before rejected scope");
+    let failed = invoke(&[
+        "--config",
+        &config,
+        "network",
+        "scope",
+        "#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--set-default",
+    ]);
+    assert_eq!(failed.status.code(), Some(2), "{}", text(&failed.stderr));
+    assert!(text(&failed.stderr).contains("1..=30"));
+
+    let after = fs::read(&config).expect("read config after rejected scope");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn inbox_limit_and_drain_return_real_demo_message() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config", &config, "--output", "json", "inbox", "--limit", "1",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON inbox result");
+    assert_eq!(
+        parsed["data"]["messages"][0]["text"],
+        "Demo direct packet for deterministic CLI tests"
+    );
+    assert_eq!(parsed["data"]["drained"], false);
+}
+
+#[test]
+fn opt_in_history_tracks_delivery_receive_and_confirmed_clear() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    enable_history(&config);
+
+    let sent = invoke(&["--config", &config, "send", "Alice", "retained", "--wait"]);
+    assert_eq!(sent.status.code(), Some(0), "{}", text(&sent.stderr));
+    let received = invoke(&["--config", &config, "inbox", "--limit", "1"]);
+    assert_eq!(
+        received.status.code(),
+        Some(0),
+        "{}",
+        text(&received.stderr)
+    );
+
+    let listed = invoke(&["--config", &config, "--output", "json", "history", "list"]);
+    assert_eq!(listed.status.code(), Some(0), "{}", text(&listed.stderr));
+    let parsed: Value = serde_json::from_slice(&listed.stdout).expect("history JSON");
+    assert_eq!(parsed["data"]["storage"], "plaintext_opt_in");
+    let entries = parsed["data"]["entries"]
+        .as_array()
+        .expect("history entries");
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["status"] == "acknowledged")
+    );
+    assert!(entries.iter().any(|entry| entry["status"] == "received"));
+
+    let refused = invoke(&["--config", &config, "history", "clear"]);
+    assert_eq!(refused.status.code(), Some(9));
+    let cleared = invoke(&[
+        "--config", &config, "--yes", "--output", "json", "history", "clear",
+    ]);
+    assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared.stderr));
+    assert!(!directory.path().join("history/demo.jsonl").exists());
+}
+
+#[test]
+fn bounded_watch_emits_jsonl_and_exits() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "jsonl",
+        "watch",
+        "--event",
+        "connection",
+        "--count",
+        "1",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<_> = text(&output.stdout).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 1);
+    let parsed: Value = serde_json::from_str(&lines[0]).expect("JSONL event");
+    assert_eq!(parsed["data"]["event"], "connected");
+}
+
+#[test]
+fn mock_devices_are_listed_only_when_explicitly_requested() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "devices",
+        "--transport",
+        "mock",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON devices result");
+    assert_eq!(parsed["data"]["mock_profiles"][0], "demo:demo");
+}
+
+#[test]
+fn repair_never_prompts_in_noninteractive_mode() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let before = fs::read(&config).expect("configuration before repair");
+    let output = invoke(&["--config", &config, "--non-interactive", "config", "repair"]);
+    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(
+        fs::read(&config).expect("configuration after refusal"),
+        before
+    );
+}
+
+#[test]
+fn config_show_migrate_and_confirmed_repair_are_real_file_operations() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    fs::write(
+        &config,
+        concat!(
+            "default_profile = \"desk\"\n",
+            "[devices.desk]\n",
+            "transport = \"serial\"\n",
+            "port = \"/dev/ttyUSB0\"\n",
+            "baud = 9600\n",
+        ),
+    )
+    .expect("legacy configuration");
+    let migration = invoke(&["--config", &config, "--output", "json", "config", "migrate"]);
+    assert_eq!(
+        migration.status.code(),
+        Some(0),
+        "{}",
+        text(&migration.stderr)
+    );
+    let migrated: Value = serde_json::from_slice(&migration.stdout).expect("migration JSON");
+    assert_eq!(migrated["data"]["changed"], true);
+    let backup = migrated["data"]["backup_path"]
+        .as_str()
+        .expect("migration backup path");
+    assert!(Path::new(backup).exists());
+    assert!(
+        fs::read_to_string(&config)
+            .expect("migrated configuration")
+            .starts_with("version = 1")
+    );
+
+    let show = invoke(&["--config", &config, "--output", "json", "config", "show"]);
+    assert_eq!(show.status.code(), Some(0), "{}", text(&show.stderr));
+    let shown: Value = serde_json::from_slice(&show.stdout).expect("configuration JSON");
+    assert_eq!(shown["data"]["effective"]["default_profile"], "desk");
+
+    let repair = invoke(&[
+        "--config", &config, "--yes", "--output", "json", "config", "repair",
+    ]);
+    assert_eq!(repair.status.code(), Some(0), "{}", text(&repair.stderr));
+    let repaired: Value = serde_json::from_slice(&repair.stdout).expect("repair JSON");
+    assert_eq!(repaired["data"]["changed"], true);
+}
+
+#[test]
+fn legacy_default_address_import_is_additive_and_never_overwrites() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let legacy = directory.path().join("default_address");
+    fs::write(&legacy, "AA:BB:CC:DD:EE:FF\n").expect("legacy default address");
+
+    let imported = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "config",
+        "import-legacy",
+        &legacy.display().to_string(),
+    ]);
+    assert_eq!(
+        imported.status.code(),
+        Some(0),
+        "{}",
+        text(&imported.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&imported.stdout).expect("legacy import JSON");
+    assert_eq!(parsed["type"], "legacy_configuration_import");
+    assert_eq!(parsed["data"]["profile"], "legacy");
+    let saved = fs::read_to_string(&config).expect("imported configuration");
+    assert!(saved.contains("default_profile = \"legacy\""));
+    assert!(saved.contains("id = \"AA:BB:CC:DD:EE:FF\""));
+
+    let duplicate = invoke(&[
+        "--config",
+        &config,
+        "config",
+        "import-legacy",
+        &legacy.display().to_string(),
+    ]);
+    assert_eq!(duplicate.status.code(), Some(9));
+    assert!(text(&duplicate.stderr).contains("never overwrites"));
+}
+
+#[test]
+fn doctor_without_connect_keeps_host_only_checks() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--timeout",
+        "1ms",
+        "--output",
+        "json",
+        "doctor",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(parsed["data"]["healthy"], true);
+    let checks = parsed["data"]["checks"].as_array().expect("doctor checks");
+    assert!(checks.iter().any(|check| check["name"] == "configuration"));
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "serial_provider")
+    );
+    assert!(checks.iter().any(|check| check["name"] == "ble_provider"));
+    assert!(checks.iter().all(|check| {
+        check["name"] != "handshake" && check["name"] != "firmware_compatibility"
+    }));
+}
+
+#[test]
+fn doctor_connect_checks_the_demo_handshake_and_firmware_layout() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--timeout",
+        "1ms",
+        "--output",
+        "json",
+        "doctor",
+        "--connect",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(parsed["data"]["healthy"], true);
+    let checks = parsed["data"]["checks"].as_array().expect("doctor checks");
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "handshake" && check["status"] == "ok")
+    );
+    let compatibility = checks
+        .iter()
+        .find(|check| check["name"] == "firmware_compatibility")
+        .expect("firmware compatibility check");
+    assert_eq!(compatibility["status"], "ok");
+    assert!(
+        compatibility["detail"]
+            .as_str()
+            .expect("firmware compatibility detail")
+            .contains("protocol level 10")
+    );
+}
+
+#[test]
+fn line_chat_accepts_piped_lines_without_a_tui() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke_with_input(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        b"hello\n/quit\n",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+        .collect();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[0]["data"]["state"], "connected");
+    assert_eq!(lines[1]["data"]["state"], "incoming");
+    assert_eq!(
+        lines[1]["data"]["text"],
+        "Demo direct packet for deterministic CLI tests"
+    );
+    assert_eq!(lines[2]["data"]["state"], "sent");
+    assert_eq!(lines[3]["data"]["state"], "acknowledged");
+}
+
+#[test]
+fn line_chat_ack_timeout_emits_a_nonfatal_terminal_state() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let current = fs::read_to_string(&config).expect("demo configuration");
+    fs::write(
+        &config,
+        current.replace("scenario = \"demo\"", "scenario = \"ack-timeout\""),
+    )
+    .expect("timeout scenario configuration");
+    let output = invoke_with_input(
+        &[
+            "--config",
+            &config,
+            "--timeout",
+            "20ms",
+            "--output",
+            "jsonl",
+            "chat",
+            "Alice",
+            "--line",
+        ],
+        b"hello\n/quit\n",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+        .collect();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[0]["data"]["state"], "connected");
+    assert_eq!(lines[1]["data"]["state"], "incoming");
+    assert_eq!(lines[2]["data"]["state"], "sent");
+    assert_eq!(lines[3]["data"]["state"], "timed_out");
+}
+
+#[test]
+fn line_chat_channel_send_has_no_direct_ack_state() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke_with_input(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "2", "--line",
+        ],
+        b"hello\n/quit\n",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["data"]["state"], "connected");
+    assert_eq!(lines[1]["data"]["state"], "incoming");
+    assert_eq!(lines[2]["data"]["state"], "sent");
+}
+
+#[test]
+fn unsupported_mutation_is_honest_even_without_configuration() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&["--config", &config, "contacts", "pending", "list"]);
+    assert_eq!(output.status.code(), Some(9));
+    assert!(text(&output.stderr).contains("not supported"));
+    assert!(!Path::new(&config).exists());
+}
+
+#[test]
+fn important_help_and_readme_examples_stay_in_sync() {
+    for arguments in [
+        &["--help"][..],
+        &["init", "--help"],
+        &["devices", "--help"],
+        &["connect", "--help"],
+        &["doctor", "--help"],
+        &["contacts", "--help"],
+        &["send", "--help"],
+        &["inbox", "--help"],
+        &["watch", "--help"],
+        &["chat", "--help"],
+        &["batch", "--help"],
+        &["hooks", "--help"],
+        &["mqtt", "--help"],
+    ] {
+        let output = invoke(arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "help failed for {arguments:?}: {}",
+            text(&output.stderr)
+        );
+        assert!(
+            text(&output.stdout).contains("Examples:"),
+            "important help page has no examples: {arguments:?}"
+        );
+    }
+
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"))
+        .expect("read root README");
+    for example in [
+        "meshquill send Alice 'Are you receiving this?' --wait",
+        "meshquill --non-interactive --output json contacts --kind repeater",
+        "meshquill batch contacts --filter 'type=repeater,favorite=true' remote-status --dry-run",
+        "await mesh.wait_for_ack(receipt, timeout=5.0)",
+    ] {
+        assert!(
+            readme.contains(example),
+            "README example drifted: {example}"
+        );
+    }
+}
+
+#[test]
+fn completion_and_manpage_artifacts_are_real() {
+    let completion = invoke(&["completions", "bash"]);
+    assert_eq!(
+        completion.status.code(),
+        Some(0),
+        "{}",
+        text(&completion.stderr)
+    );
+    assert!(text(&completion.stdout).contains("meshquill"));
+
+    let directory = TempDir::new().expect("temporary directory");
+    let target = directory.path().display().to_string();
+    let manpages = invoke(&["manpages", &target]);
+    assert_eq!(
+        manpages.status.code(),
+        Some(0),
+        "{}",
+        text(&manpages.stderr)
+    );
+    assert!(directory.path().join("meshquill.1").exists());
+    assert!(directory.path().join("meshquill-send.1").exists());
+}
+
+#[test]
+fn hooks_validate_and_test_on_message_fixture() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let script = hook_fixture("working.py");
+    add_hook_config(&config, &script, None);
+
+    let validate = invoke(&["--output", "json", "hooks", "validate", &script]);
+    assert_eq!(
+        validate.status.code(),
+        Some(0),
+        "{}",
+        text(&validate.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&validate.stdout).expect("JSON validation result");
+    assert_eq!(parsed["schema"], "meshquill.cli/v1");
+    assert_eq!(parsed["type"], "hook_validation");
+    assert!(
+        parsed["data"]["handlers"]
+            .as_array()
+            .is_some_and(|handlers| { handlers.iter().any(|entry| entry == "on_message") }),
+        "validation output should include on_message"
+    );
+
+    let test = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "hooks",
+        "test",
+        "on_message",
+    ]);
+    assert_eq!(test.status.code(), Some(0), "{}", text(&test.stderr));
+    let parsed: Value = serde_json::from_slice(&test.stdout).expect("JSON test result");
+    assert_eq!(parsed["type"], "hook_test");
+    assert_eq!(parsed["data"]["event"], "on_message");
+    assert_eq!(parsed["data"]["status"]["status"], "completed");
+}
+
+#[test]
+fn configured_on_message_hook_runs_during_real_inbox_flow() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let script = directory.path().join("observe_hook.py");
+    fs::write(
+        &script,
+        concat!(
+            "from pathlib import Path\n",
+            "\n",
+            "def on_message(event):\n",
+            "    marker = Path(__file__).with_suffix('.observed')\n",
+            "    marker.write_text(event['payload']['text'], encoding='utf-8')\n",
+        ),
+    )
+    .expect("write on_message hook");
+    add_hook_config(&config, &script.display().to_string(), None);
+
+    let output = invoke(&["--config", &config, "inbox", "--limit", "1"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let observed =
+        fs::read_to_string(script.with_extension("observed")).expect("on_message hook marker");
+    assert_eq!(observed, "Demo direct packet for deterministic CLI tests");
+}
+
+#[test]
+fn hooks_invalid_script_reports_hook_exit_code() {
+    let validate = invoke(&[
+        "--output",
+        "json",
+        "hooks",
+        "validate",
+        "/definitely-not-a-valid-hook.py",
+    ]);
+    assert_eq!(
+        validate.status.code(),
+        Some(11),
+        "{}",
+        text(&validate.stderr)
+    );
+}
+
+#[test]
+fn hooks_status_is_json_and_schema_only_without_paths() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+
+    let status = invoke(&["--config", &config, "--output", "json", "hooks", "status"]);
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+    let parsed: Value = serde_json::from_slice(&status.stdout).expect("JSON status");
+    assert_eq!(parsed["schema"], "meshquill.cli/v1");
+    assert_eq!(parsed["type"], "hook_status");
+    assert_eq!(parsed["data"]["protocol"], "meshquill.hook/v1");
+    assert_eq!(parsed["data"]["enabled"], false);
+    assert_eq!(parsed["data"]["configured"], false);
+    assert!(parsed["data"].get("config_path").is_none());
+    let stdout = text(&status.stdout);
+    assert!(!stdout.contains("python_executable"));
+}
+
+#[test]
+fn hooks_status_does_not_invoke_python() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    add_hook_config(
+        &config,
+        &hook_fixture("working.py"),
+        Some("definitely-missing-python"),
+    );
+
+    let status = invoke(&["--config", &config, "--output", "json", "hooks", "status"]);
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+    let parsed: Value = serde_json::from_slice(&status.stdout).expect("JSON status");
+    assert_eq!(parsed["data"]["enabled"], true);
+    assert_eq!(parsed["data"]["configured"], true);
+    let stdout = text(&status.stdout);
+    assert!(!stdout.contains("definitely-missing-python"));
+}
+
+#[test]
+fn mqtt_status_is_side_effect_free_and_redacted_without_configuration() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&["--config", &config, "--output", "json", "mqtt", "status"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(!Path::new(&config).exists());
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("MQTT status JSON");
+    assert_eq!(parsed["type"], "mqtt_status");
+    assert_eq!(parsed["data"]["schema"], "meshquill.mqtt/v1");
+    assert_eq!(parsed["data"]["enabled"], false);
+    assert_eq!(parsed["data"]["broker_state"], "not_probed");
+    assert!(parsed["data"].get("password").is_none());
+    assert!(parsed["data"].get("ca_path").is_none());
+}
+
+#[test]
+fn mqtt_configure_persists_valid_non_secret_gateway_settings() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "mqtt",
+        "configure",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "1883",
+        "--no-tls",
+        "--protocol",
+        "5",
+        "--qos",
+        "2",
+        "--topic-prefix",
+        "field/team",
+        "--allow-send",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("MQTT configure JSON");
+    assert_eq!(parsed["type"], "mqtt_configuration");
+    assert_eq!(parsed["data"]["tls"], false);
+    assert_eq!(parsed["data"]["protocol"], "5");
+    assert_eq!(parsed["data"]["qos"], 2);
+    assert_eq!(parsed["data"]["allow_send"], true);
+    assert_eq!(parsed["data"]["authentication"], false);
+
+    let saved = fs::read_to_string(&config).expect("saved MQTT configuration");
+    assert!(saved.contains("enabled = true"));
+    assert!(saved.contains("host = \"127.0.0.1\""));
+    assert!(saved.contains("topic_prefix = \"field/team\""));
+    assert!(!saved.contains("password ="));
+}
+
+#[test]
+fn mqtt_tls_validation_fails_before_writing_configuration() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let missing_ca = directory.path().join("missing-ca.pem");
+    let output = invoke(&[
+        "--config",
+        &config,
+        "mqtt",
+        "configure",
+        "--host",
+        "broker.invalid",
+        "--ca-file",
+        &missing_ca.display().to_string(),
+    ]);
+    assert_eq!(output.status.code(), Some(12));
+    assert!(text(&output.stderr).contains("TLS"));
+    assert!(!Path::new(&config).exists());
+}
+
+#[test]
+fn mqtt_password_input_is_bounded_before_credential_store_access() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let oversized = vec![b'x'; 4097];
+    let output = invoke_with_input(
+        &[
+            "--config",
+            &config,
+            "mqtt",
+            "configure",
+            "--host",
+            "broker.invalid",
+            "--username",
+            "alice",
+            "--password-stdin",
+        ],
+        &oversized,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("4096-byte limit"));
+    assert!(!Path::new(&config).exists());
+}
+
+#[test]
+fn mqtt_test_has_a_bounded_mqtt_specific_failure_status() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let configure = invoke(&[
+        "--config",
+        &config,
+        "mqtt",
+        "configure",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9",
+        "--no-tls",
+    ]);
+    assert_eq!(
+        configure.status.code(),
+        Some(0),
+        "{}",
+        text(&configure.stderr)
+    );
+    let output = invoke(&["--config", &config, "--timeout", "30ms", "mqtt", "test"]);
+    assert_eq!(output.status.code(), Some(12));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("timed out"));
+}
+
+#[test]
+fn mqtt_bridge_requires_stream_output_before_connecting() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let output = invoke(&["--config", &config, "--output", "json", "mqtt", "bridge"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("jsonl"));
+    assert!(!Path::new(&config).exists());
+}

@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Check annotated semantic tag and version consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tags must be semantic versions such as v0.1.0-rc.1" >&2
+            exit 2
+          fi
+          expected=${GITHUB_REF_NAME#v}
+          actual=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$actual" = "$expected"
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          python_expected=${expected/-rc./rc}
+          python_expected=${python_expected/-alpha./a}
+          python_expected=${python_expected/-beta./b}
+          python_actual=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/meshquill-python/pyproject.toml | head -1)
+          test "$python_actual" = "$python_expected"
+          grep -Fq "## [$expected]" CHANGELOG.md
+
+  quality:
+    name: Full CI gate
+    needs: validate-tag
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  supply-chain:
+    name: Supply-chain gate
+    needs: validate-tag
+    uses: ./.github/workflows/supply-chain.yml
+    secrets: inherit
+
+  native:
+    name: Native ${{ matrix.target }}
+    needs: [validate-tag, quality, supply-chain]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Rust target
+        run: rustup toolchain install 1.97.1 --profile minimal --target ${{ matrix.target }}
+      - name: Install Linux transport headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev libudev-dev pkg-config
+      - name: Build Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/package-release.sh "${{ matrix.target }}" "$GITHUB_REF_NAME" dist
+      - name: Build Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -Target '${{ matrix.target }}' -Version "$env:GITHUB_REF_NAME" -OutputDirectory dist
+      - name: Smoke-test Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/meshquill-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          smoke=$(mktemp -d)
+          tar -C "$smoke" -xzf "$archive"
+          binary="$smoke/meshquill-${GITHUB_REF_NAME}-${{ matrix.target }}/bin/meshquill"
+          test "$("$binary" --version)" = "meshquill ${GITHUB_REF_NAME#v}"
+          root="$smoke/meshquill-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          test -s "$root/LICENSE-MIT"
+          test -s "$root/LICENSE-APACHE"
+          test -s "$root/docs/getting-started.md"
+          test -s "$root/share/completions/meshquill.bash"
+          grep -Fq "${GITHUB_REF_NAME#v}" "$root/share/man/man1/meshquill-send.1"
+          "$binary" --config "$smoke/config.toml" --non-interactive init --name demo --demo --set-default
+          "$binary" --config "$smoke/config.toml" device info
+          "$binary" --config "$smoke/config.toml" send Alice 'artifact smoke' --wait
+          if [[ "${{ matrix.target }}" == *-linux-gnu ]]; then
+            highest=$(readelf --version-info "$binary" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' | sort -V | tail -1)
+            test -n "$highest"
+            test "$(printf '%s\n%s\n' "$highest" 2.35 | sort -V | tail -1)" = "2.35"
+          fi
+      - name: Smoke-test Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $smoke = Join-Path $env:RUNNER_TEMP "meshquill-release-smoke"
+          Expand-Archive "dist/meshquill-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip" $smoke
+          $root = Join-Path $smoke "meshquill-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $binary = Join-Path $root "bin/meshquill.exe"
+          $version = ($env:GITHUB_REF_NAME).Substring(1)
+          if ((& $binary --version) -ne "meshquill $version") { throw "version mismatch" }
+          foreach ($required in @("LICENSE-MIT", "LICENSE-APACHE", "docs/getting-started.md", "share/completions/_meshquill.ps1", "share/man/man1/meshquill-send.1")) {
+            $requiredPath = Join-Path $root $required
+            if (!(Test-Path -LiteralPath $requiredPath -PathType Leaf)) { throw "missing $required" }
+            if ((Get-Item -LiteralPath $requiredPath).Length -eq 0) { throw "empty $required" }
+          }
+          if (!(Select-String -SimpleMatch $version -Path (Join-Path $root "share/man/man1/meshquill-send.1") -Quiet)) { throw "manpage version mismatch" }
+          $config = Join-Path $smoke "config.toml"
+          & $binary --config $config --non-interactive init --name demo --demo --set-default
+          if ($LASTEXITCODE -ne 0) { throw "artifact init failed" }
+          & $binary --config $config device info
+          if ($LASTEXITCODE -ne 0) { throw "artifact device info failed" }
+          & $binary --config $config send Alice "artifact smoke" --wait
+          if ($LASTEXITCODE -ne 0) { throw "artifact send failed" }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-native-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  wheels:
+    name: Wheel ${{ matrix.target }}
+    needs: [validate-tag, quality, supply-chain]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+            smoke: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+            smoke: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: "off"
+            smoke: true
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            manylinux: "off"
+            smoke: true
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+            smoke: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          command: build
+          args: --release --locked --compatibility pypi --out ../../dist/wheels
+          maturin-version: v1.11.5
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: crates/meshquill-python
+          before-script-linux: dnf install -y dbus-devel systemd-devel pkgconf-pkg-config
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: matrix.smoke
+        with:
+          python-version: "3.13"
+      - name: Audit Linux wheel compatibility
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install "auditwheel==6.7.0"
+          report=$(python -m auditwheel show dist/wheels/*.whl)
+          printf '%s\n' "$report"
+          export AUDITWHEEL_REPORT="$report"
+          python - <<'PY'
+          import os
+          import re
+
+          report = os.environ["AUDITWHEEL_REPORT"]
+          platform = re.search(
+              r'is\s+consistent with\s+the following platform tag: "([^"]+)"',
+              report,
+          )
+          if platform is None:
+              raise SystemExit("auditwheel did not report an actual platform tag")
+          manylinux = re.search(r"manylinux_(\d+)_(\d+)_", platform.group(1))
+          if manylinux is None or tuple(map(int, manylinux.groups())) > (2, 28):
+              raise SystemExit(
+                  f"wheel actually requires {platform.group(1)!r}, newer than manylinux_2_28"
+              )
+          PY
+      - name: Install and import wheel
+        if: matrix.smoke
+        shell: bash
+        run: |
+          python -m pip install "mypy>=1.13,<2" "pytest>=8.3,<9" "pytest-asyncio>=0.24,<2"
+          python -m pip install --force-reinstall dist/wheels/*.whl
+          python -m pip check
+          EXPECTED_RUST=${GITHUB_REF_NAME#v}
+          EXPECTED_PY=${EXPECTED_RUST/-rc./rc}
+          export EXPECTED_RUST EXPECTED_PY
+          python - <<'PY'
+          import importlib.metadata
+          import os
+          from pathlib import Path
+          import zipfile
+
+          import meshcore_sdk
+
+          assert meshcore_sdk.__version__ == os.environ["EXPECTED_RUST"]
+          assert importlib.metadata.version("meshquill-sdk") == os.environ["EXPECTED_PY"]
+          wheels = list(Path("dist/wheels").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = archive.namelist()
+              assert any(name.endswith(".dist-info/licenses/LICENSE-MIT") for name in names)
+              assert any(name.endswith(".dist-info/licenses/LICENSE-APACHE") for name in names)
+          PY
+          python -m pytest crates/meshquill-python/tests
+          python -m mypy.stubtest meshcore_sdk
+          python crates/meshquill-python/examples/quickstart.py
+          python crates/meshquill-python/examples/streaming.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-wheel-${{ matrix.target }}
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+
+  draft-release:
+    name: Assemble draft release
+    needs: [native, wheels]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify archives and artifact inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 5
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
+          while IFS= read -r checksum; do
+            (cd dist && sha256sum --check "$(basename "$checksum")")
+          done < <(find dist -maxdepth 1 -type f -name '*.sha256' -print)
+          (cd dist && sha256sum *.tar.gz *.zip *.whl > SHA256SUMS)
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --generate-notes --title "Meshquill $GITHUB_REF_NAME"
