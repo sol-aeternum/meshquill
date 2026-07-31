@@ -11,10 +11,12 @@ bounds, balanced hook lifecycles, and strict CLI/hook/MQTT schemas plus MQTT sta
 persisted environment-secret coverage.
 
 RC3 is **not tagged or published yet**. The local candidate evidence below was generated fresh from
-the RC3 content; no RC2 count or artifact result is reused as RC3 evidence. The exact pushed commit
-must still pass remote CI and supply-chain gates. A successful tag workflow creates a private draft
-prerelease. Making that draft public is a separate maintainer decision after all 16 assets are
-inspected.
+the RC3 content; no RC2 count or artifact result is reused as RC3 evidence. Source candidate
+`dcb7c97aab723ec96bfc900aa773ddaff710ea2a` is pushed and passed its exact GitHub CI and
+supply-chain workflows. Recording that evidence in this file creates the final tag candidate; that
+resulting exact commit must pass both workflows before an annotated `v0.1.0-rc.3` tag may trigger
+the artifact matrix. A successful tag workflow creates a private draft prerelease. Making that
+draft public is a separate maintainer decision after all 16 assets are inspected.
 
 No physical MeshCore companion was available, so no BLE, serial, or over-the-air radio result is
 claimed. No crates.io or PyPI credential is available; those independent registry uploads remain
@@ -65,6 +67,7 @@ The physical matrix remains in [hardware testing](docs/hardware-testing.md).
 | Fuzzing | All four sanitizer targets completed fresh 20-second unsandboxed gates without a crash: `protocol_packet`, `outer_frames`, `remote_payloads`, and `mqtt_commands` |
 | Dependencies/licences | `cargo audit --no-fetch` and `cargo deny check` passed for root and fuzz lockfiles; Pip Audit reported no known vulnerabilities for the exact Python requirements |
 | Workflows/docs | Actionlint 1.7.12 passed; the shell package script passed `bash -n`; Lychee 0.24.2 validated 162 source Markdown links. PowerShell packaging remains delegated to tagged Windows CI because `pwsh` is unavailable locally |
+| Remote source matrix | Passed for pushed source candidate `dcb7c97aab723ec96bfc900aa773ddaff710ea2a`: [CI run 30613191343](https://github.com/sol-aeternum/meshquill/actions/runs/30613191343) and [supply-chain run 30613191030](https://github.com/sol-aeternum/meshquill/actions/runs/30613191030) both completed successfully. This evidence-only status commit still requires its own exact-SHA rerun before tagging |
 | Source install/interactive use | A locked offline `cargo install` reported RC3. Real PTYs exercised both guided profile/transport prompts and destination-prompted line chat; chat displayed the queued message, sent one reply, observed its ACK, and exited via `/quit` |
 | Public hook example | An isolated copy of `examples/hooks/basic.py` validated and dispatched `on_message`, producing exactly one `meshquill.hook/v1` metadata record beside the copied script |
 | Native package | The RC3 shell package produced one archive and sibling checksum. Safe clean extraction found 130 regular files, no symlinks, both licences, 26 docs, one example, nine schemas/fixtures, four completions, and 83 man pages; the extracted binary passed version, init, info, contacts, ACKed send, inbox, and bounded JSONL watch |
@@ -173,11 +176,12 @@ disconnect instrumentation.
   are disabled by default and broker ACLs remain a security boundary.
 - Release archives and wheels use SHA-256 integrity checks but are unsigned; macOS and Windows
   binaries are not code-signed.
-- RC3 still requires: committing and pushing the exact source candidate, successful CI and
-  supply-chain runs for that SHA, an immutable annotated tag, successful five-target artifact jobs,
-  inspection of all 16 private-draft assets and packaged documentation, explicit approval before
-  public GitHub prerelease publication, and a fresh public checksum/download smoke. Physical
-  hardware and registry publication remain separately recorded limitations.
+- RC3 still requires: committing and pushing this evidence-only status update, successful CI and
+  supply-chain runs for that resulting exact SHA, an immutable annotated tag, successful
+  five-target artifact jobs, inspection of all 16 private-draft assets and packaged documentation,
+  explicit approval before public GitHub prerelease publication, and a fresh public
+  checksum/download smoke. Physical hardware and registry publication remain separately recorded
+  limitations.
 
 ## Historical RC1 evidence
 
