@@ -345,7 +345,7 @@ jobs:
           set -euo pipefail
           mapfile -t assets < "$RUNNER_TEMP/meshquill-release-assets.txt"
           for index in "${!assets[@]}"; do
-            assets[$index]="dist/${assets[$index]}"
+            assets[index]="dist/${assets[index]}"
           done
           gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
             --draft --prerelease --latest=false --verify-tag --generate-notes \
