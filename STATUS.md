@@ -74,7 +74,7 @@ behavior remains covered by the historical RC3 evidence below.
 | Dependencies/licences | `cargo audit --no-fetch` and `cargo deny check` passed for root and fuzz lockfiles; a current online Pip Audit reported no known vulnerabilities in the exact Python requirements |
 | Workflows/docs | Actionlint 1.7.12, shell package syntax, and `git diff --check` passed; Lychee 0.24.2 validated all 165 tracked source Markdown links |
 | Native package | The RC4 shell package produced a verified archive and sibling checksum. Safe clean extraction found 130 regular files, no links or unsafe paths, both licences, 26 docs, one example, nine schemas/fixtures, four completions, and 83 man pages. The extracted binary reported RC4 and passed init, device info, contacts, ACKed send, inbox, and bounded JSONL watch |
-| Remote source matrix | Pending the pushed candidate. The exact final tag commit must pass both CI and supply-chain workflows before tagging |
+| Remote source matrix | Passed for pushed source candidate `24f8f5745d12e7e05526d33713e60a540d8f6723`: [CI run 30620791102](https://github.com/sol-aeternum/meshquill/actions/runs/30620791102) and [supply-chain run 30620791160](https://github.com/sol-aeternum/meshquill/actions/runs/30620791160) both completed successfully. This evidence-only status commit must receive its own exact-SHA CI and supply-chain success before tagging |
 
 The local archive was built on a rolling Linux host and is local smoke evidence only; it is not a
 substitute for any tagged CI artifact. Tagged CI must build and validate all five native targets,
