@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use meshquill_core::{
     error::TransportError,
     protocol::{CommandCode, MAX_INNER_PAYLOAD, PacketCode},
-    transport::{ReconnectableTransport, Transport, TransportKind},
+    transport::{ReadyRead, ReconnectableTransport, Transport, TransportKind},
 };
 
 const APP_START_COMMAND: &[u8] = b"\x01\x03      mccli";
@@ -1542,6 +1542,7 @@ impl VirtualCompanion {
         payload.extend_from_slice(&125_000u32.to_le_bytes());
         payload.push(7);
         payload.push(5);
+        payload.extend_from_slice(b"Meshquill Demo");
         payload
     }
 }
@@ -1635,6 +1636,31 @@ impl Transport for VirtualCompanion {
             VirtualCompanionIdleReadMode::Timeout => Err(TransportError::Timeout),
             VirtualCompanionIdleReadMode::Pending => std::future::pending().await,
         }
+    }
+
+    fn try_read(&mut self) -> Result<ReadyRead, TransportError> {
+        let mut state = lock_state(&self.state);
+        if !state.connected {
+            return Err(TransportError::NotConnected);
+        }
+        if let Some(fault) = state.next_fault.take() {
+            return match fault {
+                VirtualCompanionFault::Timeout => Err(TransportError::Timeout),
+                VirtualCompanionFault::CleanDisconnect => {
+                    state.connected = false;
+                    Ok(ReadyRead::Closed)
+                }
+            };
+        }
+        if let Some(payload) = state.inbound.pop_front() {
+            return Ok(ReadyRead::Packet(payload));
+        }
+        if state.idle_disconnects_remaining > 0 {
+            state.idle_disconnects_remaining -= 1;
+            state.connected = false;
+            return Ok(ReadyRead::Closed);
+        }
+        Ok(ReadyRead::Pending)
     }
 }
 
@@ -1926,6 +1952,7 @@ mod tests {
 
         let info = must_ok(client.connect().await, "handshake failed");
         assert_eq!(info.public_key.as_bytes()[0], 1);
+        assert_eq!(info.name, "Meshquill Demo");
 
         let outbound = companion.outbound_packets();
         assert_eq!(outbound.len(), 1);
@@ -2532,6 +2559,51 @@ mod tests {
         assert!(second.is_some());
         let third = must_ok(client.sync_next_message().await, "third sync failed");
         assert!(third.is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_drains_preexisting_notification_before_writing_and_returns_its_response() {
+        let companion = VirtualCompanion::new();
+        let queued = must_ok(
+            make_channel_message_packet(2, "requested queue response"),
+            "queued fixture failed",
+        );
+
+        let mut client = Client::new(companion.clone());
+        let _ = must_ok(client.connect().await, "handshake failed");
+        let mut events = client.subscribe();
+        must_ok(
+            companion.enqueue_push(vec![PacketCode::MessagesWaiting.to_u8()]),
+            "message-waiting setup failed",
+        );
+        must_ok(
+            companion.push_sync_message(queued),
+            "sync response setup failed",
+        );
+
+        let returned = must_some(
+            must_ok(client.sync_next_message().await, "sync failed"),
+            "sync response missing",
+        );
+        assert_eq!(returned.text, "requested queue response");
+
+        let first = must_ok(events.try_recv(), "preexisting event missing");
+        let second = must_ok(events.try_recv(), "sync event missing");
+        assert!(matches!(first, Event::MessagesWaiting));
+        let Event::Message(queued) = second else {
+            panic!("sync response was not published as a message");
+        };
+        assert_eq!(queued.observation_id, returned.observation_id);
+        assert_eq!(
+            companion
+                .outbound_packets()
+                .iter()
+                .filter(|packet| {
+                    packet.first().copied() == Some(CommandCode::SyncNextMessage.to_u8())
+                })
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

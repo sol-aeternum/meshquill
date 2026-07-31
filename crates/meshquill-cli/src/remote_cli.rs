@@ -32,6 +32,7 @@ use crate::{
     error::CliError,
     output::{ExitStatus, OutputWriter},
     runtime::{confirm, make_client, resolve_contact},
+    workflow::CompanionSession,
 };
 
 const CREDENTIAL_SERVICE: &str = "meshquill.remote";
@@ -182,7 +183,7 @@ async fn login<W: Write>(
     save: bool,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote login").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         let account = credential_account(&selected.path, &selected.name, &contact);
@@ -232,7 +233,7 @@ async fn logout<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote logout").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         require_session(&client, &contact).await?;
@@ -260,7 +261,7 @@ async fn credentials_forget<W: Write>(
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
     confirm(cli, "delete the stored remote credential")?;
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote credentials forget").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         let account = credential_account(&selected.path, &selected.name, &contact);
@@ -308,7 +309,7 @@ async fn run<W: Write>(
         confirm(cli, "send the explicitly marked destructive remote command")?;
     }
 
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote run").await?;
     let operation = async {
         let contact = load_contact(&client, &args.contact).await?;
         require_session(&client, &contact).await?;
@@ -342,7 +343,7 @@ async fn status<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote status").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         require_session(&client, &contact).await?;
@@ -387,7 +388,7 @@ async fn neighbours<W: Write>(
         .encode()
         .map_err(remote_payload_error)?;
 
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote neighbours").await?;
     let operation = async {
         let contact = load_contact(&client, &args.contact).await?;
         require_session(&client, &contact).await?;
@@ -424,7 +425,7 @@ async fn regions<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote regions").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         let response = anonymous(&client, &contact, AnonymousRequestKind::Regions).await?;
@@ -448,7 +449,7 @@ async fn owner<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote owner").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         let response = anonymous(&client, &contact, AnonymousRequestKind::Owner).await?;
@@ -475,7 +476,7 @@ async fn clock<W: Write>(
     args: &RemoteClockArgs,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "remote clock").await?;
     let operation = async {
         let contact = load_contact(&client, &args.contact).await?;
         let response = anonymous(&client, &contact, AnonymousRequestKind::Basic).await?;
@@ -539,7 +540,7 @@ async fn telemetry<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "sensor telemetry").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         require_session(&client, &contact).await?;
@@ -582,7 +583,7 @@ async fn summary<W: Write>(
         ));
     }
     let payload = summary_request_payload(args.start_secs_ago, args.end_secs_ago);
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "sensor summary").await?;
     let operation = async {
         let contact = load_contact(&client, &args.contact).await?;
         require_session(&client, &contact).await?;
@@ -620,7 +621,7 @@ async fn acl<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (selected, client) = open(cli).await?;
+    let (selected, client) = open(cli, "sensor acl").await?;
     let operation = async {
         let contact = load_contact(&client, query).await?;
         require_session(&client, &contact).await?;
@@ -676,14 +677,14 @@ async fn anonymous(
         .map_err(CliError::from)
 }
 
-async fn open(cli: &Cli) -> Result<(SelectedProfile, ManagedClient), CliError> {
+async fn open(
+    cli: &Cli,
+    operation: &'static str,
+) -> Result<(SelectedProfile, CompanionSession), CliError> {
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        let _ = client.shutdown().await;
-        return Err(CliError::from(error));
-    }
-    Ok((selected, client))
+    let (session, _) = CompanionSession::connect(&selected, client, operation).await?;
+    Ok((selected, session))
 }
 
 async fn load_contact(client: &ManagedClient, query: &str) -> Result<Contact, CliError> {
@@ -710,20 +711,10 @@ async fn require_session(client: &ManagedClient, contact: &Contact) -> Result<()
 }
 
 async fn shutdown_with<T>(
-    client: &ManagedClient,
+    client: &CompanionSession,
     operation: Result<T, CliError>,
 ) -> Result<T, CliError> {
-    let shutdown = client.shutdown().await.map_err(CliError::from);
-    match operation {
-        Ok(value) => {
-            shutdown?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = shutdown;
-            Err(error)
-        }
-    }
+    client.finish(operation).await
 }
 
 async fn resolve_login_password(
@@ -797,19 +788,23 @@ fn read_password_stdin() -> Result<SecretString, CliError> {
             "remote password from stdin must not be empty",
         ));
     }
-    let password = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|_| {
-        CliError::new(
-            ExitStatus::Usage,
-            "remote password from stdin must be valid UTF-8",
-        )
-    })?;
+    let mut password = match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(password) => Zeroizing::new(password),
+        Err(error) => {
+            let _invalid_password = Zeroizing::new(error.into_bytes());
+            return Err(CliError::new(
+                ExitStatus::Usage,
+                "remote password from stdin must be valid UTF-8",
+            ));
+        }
+    };
     if password.contains('\0') {
         return Err(CliError::new(
             ExitStatus::Usage,
             "remote password from stdin must not contain NUL",
         ));
     }
-    Ok(SecretString::from(password))
+    Ok(SecretString::from(std::mem::take(&mut *password)))
 }
 
 async fn store_credential(account: String, password: SecretString) -> Result<(), CliError> {

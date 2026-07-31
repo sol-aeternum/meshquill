@@ -14,8 +14,11 @@ use crate::domain::{
 };
 use crate::error::{CoreError, PacketDisplay, ParseError};
 
-/// Maximum payload size for a single companion packet.
-pub const MAX_INNER_PAYLOAD: usize = 300;
+/// Maximum payload size for one companion-protocol packet accepted by current firmware.
+///
+/// This is intentionally smaller than the defensive serial/TCP declared-frame bound. Current
+/// `MeshCore` firmware queues at most 176 bytes for one logical companion frame on every transport.
+pub const MAX_INNER_PAYLOAD: usize = 176;
 
 /// Command selector sent to companion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -562,7 +565,7 @@ impl Command {
     /// # Errors
     ///
     /// Returns [`CoreError::InvalidArgument`] when the card is shorter than the minimum firmware
-    /// advert card or would make the outbound companion packet exceed 300 bytes.
+    /// advert card or would make the outbound companion packet exceed 176 bytes.
     pub fn import_contact(card: &[u8]) -> Result<Self, CoreError> {
         const MIN_CARD_BYTES: usize = 98;
         if card.len() < MIN_CARD_BYTES {
@@ -628,7 +631,7 @@ impl Command {
     /// # Errors
     ///
     /// Returns [`CoreError::InvalidArgument`] when either UTF-8 field is empty, contains a wire
-    /// separator or NUL, or when the encoded packet would exceed 300 bytes.
+    /// separator or NUL, or when the encoded packet would exceed 176 bytes.
     pub fn set_custom_var(key: &str, value: &str) -> Result<Self, CoreError> {
         validate_custom_component(key, "key")?;
         validate_custom_component(value, "value")?;
@@ -2217,6 +2220,7 @@ fn parse_contact_msg(raw: &[u8], is_v3: bool) -> Result<Packet, ParseError> {
         },
     )?;
     Ok(Packet::ContactMsg(Message {
+        observation_id: None,
         source: MessageSource::Direct { pubkey_prefix },
         route,
         txt_type,
@@ -2264,6 +2268,7 @@ fn parse_channel_msg(raw: &[u8], is_v3: bool) -> Result<Packet, ParseError> {
     )?;
 
     Ok(Packet::ChannelMsg(Message {
+        observation_id: None,
         source: MessageSource::Channel { channel_idx },
         route,
         txt_type,
@@ -2995,9 +3000,9 @@ mod tests {
         assert!(Command::get_contact(&[]).is_err());
         assert!(Command::get_advert_path(&[0; 6]).is_err());
         assert!(Command::import_contact(&[0; 97]).is_err());
-        assert!(Command::import_contact(&vec![0; MAX_INNER_PAYLOAD]).is_err());
+        assert!(Command::import_contact(&[0; MAX_INNER_PAYLOAD]).is_err());
         assert_eq!(
-            built(Command::import_contact(&vec![0; MAX_INNER_PAYLOAD - 1]))
+            built(Command::import_contact(&[0; MAX_INNER_PAYLOAD - 1]))
                 .encode()
                 .len(),
             MAX_INNER_PAYLOAD
@@ -3023,7 +3028,7 @@ mod tests {
         assert!(Command::send_login(&[0; 31], "password").is_err());
         assert!(Command::send_login(&[0; 32], "bad\0password").is_err());
         assert!(Command::send_binary_request(&[0; 31], 0, &[]).is_err());
-        assert!(Command::send_binary_request(&[0; 32], 0, &vec![0; MAX_INNER_PAYLOAD]).is_err());
+        assert!(Command::send_binary_request(&[0; 32], 0, &[0; MAX_INNER_PAYLOAD]).is_err());
         let empty_path = Path::try_from_bytes(&[]).expect("empty path should be valid");
         assert!(
             Command::send_anonymous_request(&[0; 32], 1, ContactRoute::Flood, &empty_path,)
@@ -3044,11 +3049,12 @@ mod tests {
         assert!(Command::discover_path(&[0; 31]).is_err());
         assert!(Command::send_node_discovery(0xff, true, 0, None).is_err());
         assert!(Command::sign_data(&[]).is_err());
-        assert!(Command::sign_data(&vec![0; MAX_INNER_PAYLOAD]).is_err());
+        assert!(Command::sign_data(&[0; MAX_INNER_PAYLOAD]).is_err());
         assert!(Command::set_device_pin(1_000_000).is_err());
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn debug_output_redacts_command_scope_path_and_raw_payloads() {
         let secret_text = "TOP_SECRET_SENTINEL";
         let command = built(Command::set_custom_var("token", secret_text));
@@ -3107,6 +3113,7 @@ mod tests {
         assert!(!format!("{direct_path:?}").contains("cafebabe"));
 
         let message = Message {
+            observation_id: None,
             source: MessageSource::Direct {
                 pubkey_prefix: "CONTACT_GRAPH_SENTINEL".to_owned(),
             },
@@ -3808,6 +3815,18 @@ mod tests {
         }
 
         assert!(Packet::parse(&[PacketCode::CurrentTime.to_u8(), 1, 2, 3, 4, 5]).is_err());
+    }
+
+    #[test]
+    fn current_firmware_frame_limit_rejects_byte_177() {
+        let raw = vec![0xff; MAX_INNER_PAYLOAD + 1];
+        assert!(matches!(
+            Packet::parse(&raw),
+            Err(ParseError::OversizedPacketPayload {
+                actual,
+                maximum: MAX_INNER_PAYLOAD,
+            }) if actual == MAX_INNER_PAYLOAD + 1
+        ));
     }
 
     #[test]

@@ -18,8 +18,11 @@ surface is classified as implemented, superseded, core-only, or explicitly unsup
 | Channel CRUD | `channels list/show/set/remove`; secret accepted only as a 16-byte file | implemented |
 | Scope/default scope | `default`, `unscoped` and named `#scope` states; temporary scope restored | implemented |
 | Contact list/search/type/info | `contacts --search/--kind`, `show`, `--refresh` | implemented |
-| Contact rename/flags/path/remove | `contacts update/forget/path show/discover/reset/set` | implemented |
-| Contact URI export/import | `contacts export/import` | implemented |
+| Contact rename/favorite/path/remove | `contacts update/forget/path show/discover/reset/set`; the CLI changes only the documented favorite bit and preserves all other firmware flags | implemented; arbitrary raw flag writes remain typed-core-only because upstream bit semantics are not stable enough for a safe CLI |
+| Contact URI export/import | `contacts export/import` for stored contacts; the Rust core also supports self-card export with no key | implemented; self-card export is core-only until the CLI has an unambiguous identity/export destination workflow |
+| Raw `add_contact` record mutation | strict typed `update_contact` core API plus validated URI import in the CLI | superseded for normal users; no raw flags/coordinates/path record is accepted from argv |
+| Latest `advert_path` request | typed `get_advert_path` core API; CLI path display/discovery uses its explicit contact/path workflows | core-only; no duplicate low-level CLI spelling |
+| Internet-backed `upload_contact` / `upload_card` | local contact URI export; the user deliberately chooses their own transfer channel | unsupported by design: no upstream MeshCore upload service is normative, and an implicit internet dependency would violate the off-grid/privacy boundary |
 | Share-contact packet | typed Rust core only | core-only; no normal-user CLI need established |
 | Pending/manual contacts | command subtree returns a stable unsupported diagnostic before device access | unsupported: one-shot CLI lacks the advert cache required for safe acceptance |
 | Contact-specific timeout | profile/global request timeout, not per-contact persistence | superseded by coherent bounded operation timeouts |
@@ -35,7 +38,7 @@ surface is classified as implemented, superseded, core-only, or explicitly unsup
 | Sensor telemetry/MMA/ACL | `sensor telemetry/summary/acl` | implemented |
 | Node discovery | `network discover` with kind and scope filter | implemented/correlated control responses |
 | Trace | `network trace` performs supported path discovery (`0x34`) | supersedes unverified legacy trace packet `0x24` |
-| Batch `apply_to` | `batch contacts --filter ... OP`, dry-run, full-key targeting, one destructive confirmation | implemented for status/owner/regions/clock, sensor queries, path discover/reset |
+| Batch `apply_to` | `batch contacts --filter ... OP`, dry-run, full-key targeting, one destructive confirmation | implemented for status/owner/regions/clock, sensor telemetry, path discover/reset |
 | Factory reset/private-key/PIN/radio writes | typed Rust core where protocol is stable | core-only; deliberately absent from general CLI pending stronger policy/hardware evidence |
 | Serial repeater console and region file upload/download | `remote run` handles explicit CommonCLI text; no raw serial console/file protocol | unsupported in RC; no silent claim of parity |
 | Firmware bridge settings | explicit `remote run`; MQTT remains a separate application gateway | superseded for stable typed reads; obscure firmware mutations remain explicit raw remote commands |
@@ -53,6 +56,8 @@ surface is classified as implemented, superseded, core-only, or explicitly unsup
 | Presentation preferences (`classic_prompt`, arrows/slashes, print/echo toggles) | stable human/JSON/JSONL contracts and TTY detection | superseded; legacy importer does not pretend to migrate them |
 | Completions/man pages | generated Bash/Zsh/Fish/PowerShell completions and command-tree man pages | implemented and packaged |
 | Doctor/setup | guided `init`, `devices`, `connect`, `doctor`, effective config/migrate/repair | implemented |
+| Stored profile lifecycle/default selection | `profiles list/reconfigure/rename/delete/set-default`; selection is explicit profile, configured default, then the sole stored profile | implemented; ambiguous multi-profile selection fails with corrective guidance |
+| Platform data roots/history migration | `--data-dir`/`MESHQUILL_DATA_DIR`, config-path namespaces, and bounded reconciliation from config-adjacent history | implemented; history remains opt-in bounded plaintext |
 
 ## Parameter-level `get`/`set` families
 

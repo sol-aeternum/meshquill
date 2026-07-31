@@ -1,0 +1,16 @@
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3201","origin":"compat-fixture","timestamp":1725000001001,"type":"ack","data":{"code":[1,2,3,4]}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3202","origin":"compat-fixture","timestamp":1725000001002,"type":"ack","data":{"code":"AABBCCDD"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3203","origin":"compat-fixture","timestamp":1725000001003,"type":"telemetry","data":{"values":{"battery":88}}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3204","origin":"compat-fixture","timestamp":1725000001004,"type":"send_direct","data":{"destination":"alice","text":"hello","admin":true}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3205","origin":"compat-fixture","timestamp":1725000001005,"type":"connection_state","data":{"component":"mesh_core"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3206","origin":"compat-fixture","timestamp":1725000001006,"type":"contacts","data":{"contacts":[],"lastmod":1},"extra":true}
+{"schema":"meshquill.mqtt/v1","event_id":"00000000-0000-0000-0000-000000000000","origin":"compat-fixture","timestamp":1725000001007,"type":"send_channel","data":{"channel":1,"text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3208","origin":" compat-fixture","timestamp":1725000001008,"type":"send_channel","data":{"channel":1,"text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3209","origin":"compat\u0000fixture","timestamp":1725000001009,"type":"send_channel","data":{"channel":1,"text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3210","origin":"compat-fixture","timestamp":18446744073709551616,"type":"send_channel","data":{"channel":1,"text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3211","origin":"compat-fixture","timestamp":1725000001011,"type":"send_direct","data":{"destination":"alice ","text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3212","origin":"compat-fixture","timestamp":1725000001012,"type":"send_direct","data":{"destination":"ali\u0007ce","text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f65-9b50-7cc2-a6e9-3b8b3a7f3213","origin":"compat-fixture","timestamp":1725000001013,"type":"send_channel","data":{"channel":1,"text":"hello\u0000world"}}
+{"schema":"meshquill.mqtt/v1","event_id":"018f0f659b507cc2a6e93b8b3a7f3214","origin":"compat-fixture","timestamp":1725000001014,"type":"send_channel","data":{"channel":1,"text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"{018f0f65-9b50-7cc2-a6e9-3b8b3a7f3215}","origin":"compat-fixture","timestamp":1725000001015,"type":"send_channel","data":{"channel":1,"text":"hello"}}
+{"schema":"meshquill.mqtt/v1","event_id":"urn:uuid:018f0f65-9b50-7cc2-a6e9-3b8b3a7f3216","origin":"compat-fixture","timestamp":1725000001016,"type":"send_channel","data":{"channel":1,"text":"hello"}}

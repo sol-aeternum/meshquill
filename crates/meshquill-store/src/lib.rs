@@ -1,22 +1,29 @@
 //! Persisted Meshquill configuration with migration, validation, atomic replacement,
 //! and secret-safe effective rendering.
 
+use fs4::TryLockError;
 use meshquill_hooks::{EnvironmentPolicy, FailurePolicy, HookConfig, HookRuntime};
 use meshquill_mqtt::{MqttConfig, MqttPassword};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::Builder as TempFileBuilder;
 use thiserror::Error;
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt};
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
 
 /// Active serialized schema version.
 pub const CONFIG_VERSION: u8 = 1;
@@ -36,6 +43,13 @@ pub const HISTORY_DIR_NAME: &str = "history";
 /// Current JSONL record version for optional local history.
 pub const HISTORY_FORMAT_VERSION: u8 = 1;
 
+/// Largest safe profile identifier, in ASCII bytes.
+pub const MAX_PROFILE_IDENTIFIER_BYTES: usize = 64;
+
+const MAX_HISTORY_MESSAGES: usize = 100_000;
+const MAX_HISTORY_ENTRY_BYTES: u64 = 8_192;
+const FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Supported runtime platform for config path lookup.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Platform {
@@ -54,8 +68,12 @@ pub struct PathEnvironment {
     pub home: Option<PathBuf>,
     /// XDG config directory override used by Linux resolution.
     pub xdg_config_home: Option<PathBuf>,
-    /// `AppData` directory override used by Windows resolution.
+    /// XDG data directory override used by Linux data resolution.
+    pub xdg_data_home: Option<PathBuf>,
+    /// Roaming `AppData` directory override used by Windows config resolution.
     pub app_data: Option<PathBuf>,
+    /// Local `AppData` directory override preferred by Windows data resolution.
+    pub local_app_data: Option<PathBuf>,
 }
 
 /// Resolve a platform config directory without reading process state.
@@ -67,9 +85,9 @@ pub fn resolve_platform_config_dir(
     app_name: &str,
     env: &PathEnvironment,
 ) -> Result<PathBuf, StoreError> {
-    match platform {
+    let base = match platform {
         Platform::Linux => {
-            let base = if let Some(dir) = &env.xdg_config_home {
+            if let Some(dir) = &env.xdg_config_home {
                 dir.clone()
             } else {
                 env.home
@@ -79,30 +97,31 @@ pub fn resolve_platform_config_dir(
                         platform,
                         context: "missing HOME/XDG_CONFIG_HOME".to_string(),
                     })?
-            };
-            Ok(base.join(app_name))
+            }
         }
         Platform::Macos => env
             .home
-            .as_ref()
-            .map(|home| {
-                home.join("Library")
-                    .join("Application Support")
-                    .join(app_name)
-            })
+            .clone()
             .ok_or_else(|| StoreError::MissingRuntimePath {
                 platform,
                 context: "missing HOME".to_string(),
-            }),
+            })?,
         Platform::Windows => env
             .app_data
             .as_ref()
-            .map(|base| base.join(app_name))
+            .or(env.local_app_data.as_ref())
+            .cloned()
             .ok_or_else(|| StoreError::MissingRuntimePath {
                 platform,
                 context: "missing APPDATA/LOCALAPPDATA".to_string(),
-            }),
-    }
+            })?,
+    };
+    let base = validated_platform_base(platform, base, "configuration")?;
+    let directory = match platform {
+        Platform::Macos => base.join("Library").join("Application Support"),
+        Platform::Linux | Platform::Windows => base,
+    };
+    Ok(directory.join(app_name))
 }
 
 /// Resolve a config file path without mutating process state.
@@ -117,15 +136,173 @@ pub fn resolve_platform_config_path(
     Ok(resolve_platform_config_dir(platform, app_name, env)?.join(CONFIG_FILE_NAME))
 }
 
+/// Resolve a platform data directory without reading process state.
+///
+/// Linux uses `XDG_DATA_HOME` or `~/.local/share`, macOS uses Application Support,
+/// and Windows prefers `LOCALAPPDATA` before falling back to `APPDATA`.
+///
+/// # Errors
+/// Returns [`StoreError::MissingRuntimePath`] when platform-specific data is unavailable.
+pub fn resolve_platform_data_dir(
+    platform: Platform,
+    app_name: &str,
+    env: &PathEnvironment,
+) -> Result<PathBuf, StoreError> {
+    let base = match platform {
+        Platform::Linux => {
+            if let Some(dir) = &env.xdg_data_home {
+                dir.clone()
+            } else {
+                env.home
+                    .as_ref()
+                    .map(|home| home.join(".local").join("share"))
+                    .ok_or_else(|| StoreError::MissingRuntimePath {
+                        platform,
+                        context: "missing HOME/XDG_DATA_HOME".to_owned(),
+                    })?
+            }
+        }
+        Platform::Macos => env
+            .home
+            .clone()
+            .ok_or_else(|| StoreError::MissingRuntimePath {
+                platform,
+                context: "missing HOME".to_owned(),
+            })?,
+        Platform::Windows => env
+            .local_app_data
+            .as_ref()
+            .or(env.app_data.as_ref())
+            .cloned()
+            .ok_or_else(|| StoreError::MissingRuntimePath {
+                platform,
+                context: "missing LOCALAPPDATA/APPDATA".to_owned(),
+            })?,
+    };
+    let base = validated_platform_base(platform, base, "data")?;
+    let directory = match platform {
+        Platform::Macos => base.join("Library").join("Application Support"),
+        Platform::Linux | Platform::Windows => base,
+    };
+    Ok(directory.join(app_name))
+}
+
+fn validated_platform_base(
+    platform: Platform,
+    base: PathBuf,
+    purpose: &str,
+) -> Result<PathBuf, StoreError> {
+    if base.as_os_str().is_empty() || !path_is_absolute_for(platform, &base) {
+        return Err(StoreError::MissingRuntimePath {
+            platform,
+            context: format!("{purpose} base directory must be absolute"),
+        });
+    }
+    Ok(base)
+}
+
+fn path_is_absolute_for(platform: Platform, path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    match platform {
+        Platform::Linux | Platform::Macos => bytes.starts_with(b"/"),
+        Platform::Windows => {
+            bytes.starts_with(b"\\\\")
+                || bytes.starts_with(b"//")
+                || (bytes.len() >= 3
+                    && bytes[0].is_ascii_alphabetic()
+                    && bytes[1] == b':'
+                    && matches!(bytes[2], b'/' | b'\\'))
+        }
+    }
+}
+
+/// Resolve the current process's default platform data directory.
+///
+/// # Errors
+/// Returns [`StoreError::MissingRuntimePath`] when path resolution fails.
+pub fn resolve_default_data_dir(platform: Platform, app_name: &str) -> Result<PathBuf, StoreError> {
+    resolve_platform_data_dir(platform, app_name, &current_process_env())
+}
+
 fn current_process_env() -> PathEnvironment {
     fn env_path(key: &str) -> Option<PathBuf> {
-        std::env::var_os(key).map(PathBuf::from)
+        std::env::var_os(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
     }
 
     PathEnvironment {
         home: env_path("HOME").or_else(|| env_path("USERPROFILE")),
         xdg_config_home: env_path("XDG_CONFIG_HOME"),
-        app_data: env_path("APPDATA").or_else(|| env_path("LOCALAPPDATA")),
+        xdg_data_home: env_path("XDG_DATA_HOME"),
+        app_data: env_path("APPDATA"),
+        local_app_data: env_path("LOCALAPPDATA"),
+    }
+}
+
+#[derive(Debug)]
+struct AdvisoryFileLock {
+    _file: fs::File,
+}
+
+fn sidecar_lock_path(target: &Path) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let mut name = target
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("meshquill"))
+        .to_os_string();
+    name.push(".lock");
+    parent.join(name)
+}
+
+fn acquire_target_locks<'a>(
+    targets: impl IntoIterator<Item = &'a Path>,
+) -> Result<Vec<AdvisoryFileLock>, StoreError> {
+    let paths = targets
+        .into_iter()
+        .map(sidecar_lock_path)
+        .collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .map(|path| acquire_lock_path(&path))
+        .collect()
+}
+
+fn acquire_lock_path(path: &Path) -> Result<AdvisoryFileLock, StoreError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    #[cfg(unix)]
+    let parent_existed = parent.exists();
+    fs::create_dir_all(parent).map_err(StoreError::Io)?;
+    #[cfg(unix)]
+    if !parent_existed {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(StoreError::Io)?;
+    }
+
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(StoreError::Io)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(StoreError::Io)?;
+
+    let started = Instant::now();
+    loop {
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => return Ok(AdvisoryFileLock { _file: file }),
+            Err(TryLockError::WouldBlock) if started.elapsed() < FILE_LOCK_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(StoreError::LockTimeout {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(TryLockError::Error(error)) => return Err(StoreError::Io(error)),
+        }
     }
 }
 
@@ -154,6 +331,12 @@ pub struct ConfigStore {
     path: PathBuf,
 }
 
+/// Exclusive cross-process transaction guard for one configuration file.
+pub struct LockedConfigStore<'a> {
+    store: &'a ConfigStore,
+    _locks: Vec<AdvisoryFileLock>,
+}
+
 impl ConfigStore {
     /// Use a caller-selected path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -175,11 +358,32 @@ impl ConfigStore {
         &self.path
     }
 
+    /// Acquire the cross-process transaction lock for this configuration file.
+    ///
+    /// The sidecar lock is retained on disk so all processes synchronize on one stable inode.
+    ///
+    /// # Errors
+    /// Returns an I/O error or [`StoreError::LockTimeout`] when the lock cannot be acquired.
+    pub fn lock_exclusive(&self) -> Result<LockedConfigStore<'_>, StoreError> {
+        let locks = acquire_target_locks([self.path.as_path()])?;
+        Ok(LockedConfigStore {
+            store: self,
+            _locks: locks,
+        })
+    }
+
     /// Load config and apply optional `MESHQUILL_*` overrides.
     ///
     /// # Errors
     /// Returns parsing, versioning, I/O, or validation errors while loading.
     pub fn load_with_overrides(
+        &self,
+        env_overrides: &HashMap<String, String>,
+    ) -> Result<LoadOutcome, StoreError> {
+        self.load_unlocked(env_overrides)
+    }
+
+    fn load_unlocked(
         &self,
         env_overrides: &HashMap<String, String>,
     ) -> Result<LoadOutcome, StoreError> {
@@ -241,6 +445,10 @@ impl ConfigStore {
     /// # Errors
     /// Returns validation, I/O, serialization, or atomic replace errors.
     pub fn save(&self, config: &Config) -> Result<(), StoreError> {
+        self.lock_exclusive()?.save(config)
+    }
+
+    fn save_unlocked(&self, config: &Config) -> Result<(), StoreError> {
         config.validate()?;
         if let Some(parent) = self.path.parent() {
             #[cfg(unix)]
@@ -293,14 +501,18 @@ impl ConfigStore {
     /// # Errors
     /// Returns I/O, serialization, validation, or atomic replace errors.
     pub fn repair(&self) -> Result<RepairOutcome, StoreError> {
+        self.lock_exclusive()?.repair()
+    }
+
+    fn repair_unlocked(&self) -> Result<RepairOutcome, StoreError> {
         let backup_path = if self.path.exists() {
-            Some(self.backup()?)
+            Some(self.backup_unlocked()?)
         } else {
             None
         };
 
         let config = Config::default();
-        self.save(&config)?;
+        self.save_unlocked(&config)?;
         Ok(RepairOutcome {
             config,
             backup_path,
@@ -330,6 +542,10 @@ impl ConfigStore {
     /// # Errors
     /// Returns I/O errors when backup creation fails.
     pub fn backup(&self) -> Result<PathBuf, StoreError> {
+        self.lock_exclusive()?.backup()
+    }
+
+    fn backup_unlocked(&self) -> Result<PathBuf, StoreError> {
         if !self.path.exists() {
             return Ok(self.backup_path());
         }
@@ -357,6 +573,49 @@ impl ConfigStore {
         backup.flush().map_err(StoreError::Io)?;
         backup.sync_all().map_err(StoreError::Io)?;
         Ok(())
+    }
+}
+
+impl LockedConfigStore<'_> {
+    /// Return the locked configuration path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.store.path()
+    }
+
+    /// Load the configuration while retaining the transaction lock.
+    ///
+    /// # Errors
+    /// Returns parsing, versioning, I/O, or validation errors while loading.
+    pub fn load_with_overrides(
+        &self,
+        env_overrides: &HashMap<String, String>,
+    ) -> Result<LoadOutcome, StoreError> {
+        self.store.load_unlocked(env_overrides)
+    }
+
+    /// Save the configuration while retaining the transaction lock.
+    ///
+    /// # Errors
+    /// Returns validation, I/O, serialization, or atomic replace errors.
+    pub fn save(&self, config: &Config) -> Result<(), StoreError> {
+        self.store.save_unlocked(config)
+    }
+
+    /// Create a backup while retaining the transaction lock.
+    ///
+    /// # Errors
+    /// Returns I/O errors when backup creation fails.
+    pub fn backup(&self) -> Result<PathBuf, StoreError> {
+        self.store.backup_unlocked()
+    }
+
+    /// Repair the configuration while retaining the transaction lock.
+    ///
+    /// # Errors
+    /// Returns I/O, serialization, validation, or atomic replace errors.
+    pub fn repair(&self) -> Result<RepairOutcome, StoreError> {
+        self.store.repair_unlocked()
     }
 }
 
@@ -400,6 +659,76 @@ impl Default for Config {
             mqtt: MqttSettings::default(),
             queues: QueueSettings::default(),
         }
+    }
+}
+
+/// A stored device profile selected by explicit name, configured default, or sole entry.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedProfile<'a> {
+    /// Exact key from [`Config::device_profiles`].
+    pub name: &'a str,
+    /// Profile stored under [`Self::name`].
+    pub profile: &'a DeviceProfile,
+}
+
+/// Typed profile-selection failures shared by native and Python clients.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ProfileSelectionError {
+    /// No device profiles are configured.
+    #[error("no device profiles are configured")]
+    NoneConfigured,
+    /// More than one profile exists and no default or explicit name selected one.
+    #[error("multiple device profiles are configured but no default profile is selected")]
+    Ambiguous {
+        /// Configured profile names in deterministic order.
+        profiles: Vec<String>,
+    },
+    /// An explicit profile name was not present.
+    #[error("device profile '{name}' was not found")]
+    NotFound {
+        /// Requested profile name.
+        name: String,
+    },
+}
+
+/// Resolve a device profile in strict precedence order: explicit, default, then sole profile.
+///
+/// # Errors
+/// Returns a typed [`ProfileSelectionError`] when no profile exists, an explicit profile is
+/// missing, or multiple profiles exist without a default.
+pub fn resolve_profile<'a>(
+    config: &'a Config,
+    explicit: Option<&str>,
+) -> Result<ResolvedProfile<'a>, ProfileSelectionError> {
+    if let Some(name) = explicit {
+        return config
+            .device_profiles
+            .get_key_value(name)
+            .map(|(name, profile)| ResolvedProfile { name, profile })
+            .ok_or_else(|| ProfileSelectionError::NotFound {
+                name: name.to_owned(),
+            });
+    }
+
+    if let Some(name) = &config.default_profile {
+        return config
+            .device_profiles
+            .get_key_value(name)
+            .map(|(name, profile)| ResolvedProfile { name, profile })
+            .ok_or_else(|| ProfileSelectionError::NotFound { name: name.clone() });
+    }
+
+    match config.device_profiles.len() {
+        0 => Err(ProfileSelectionError::NoneConfigured),
+        1 => {
+            let Some((name, profile)) = config.device_profiles.first_key_value() else {
+                return Err(ProfileSelectionError::NoneConfigured);
+            };
+            Ok(ResolvedProfile { name, profile })
+        }
+        _ => Err(ProfileSelectionError::Ambiguous {
+            profiles: config.device_profiles.keys().cloned().collect(),
+        }),
     }
 }
 
@@ -899,9 +1228,132 @@ impl fmt::Debug for HistoryEntry {
     }
 }
 
+/// Canonical and adjacent-legacy paths for one profile's plaintext history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPaths {
+    /// Canonical path under the selected data root.
+    pub canonical: PathBuf,
+    /// Previous config-adjacent path retained for one-way reconciliation.
+    pub legacy: PathBuf,
+}
+
+/// Return a deterministic SHA-256 digest of a lexically normalized config path.
+///
+/// This is a namespace key, not a security boundary. Relative paths remain relative so callers
+/// that need working-directory independence should supply an absolute path.
+#[must_use]
+pub fn normalized_config_path_digest(config_path: &Path) -> String {
+    use std::path::Component;
+
+    let mut prefix: Option<OsString> = None;
+    let mut rooted = false;
+    let mut parts: Vec<OsString> = Vec::new();
+    for component in config_path.components() {
+        match component {
+            Component::Prefix(value) => {
+                prefix = Some(value.as_os_str().to_os_string());
+            }
+            Component::RootDir => rooted = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts
+                    .last()
+                    .is_some_and(|part| part.as_os_str() != OsStr::new(".."))
+                {
+                    parts.pop();
+                } else if !rooted {
+                    parts.push(OsString::from(".."));
+                }
+            }
+            Component::Normal(value) => parts.push(value.to_os_string()),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    if let Some(prefix) = prefix {
+        hasher.update(b"prefix\0");
+        hash_os_str(&mut hasher, &prefix);
+        hasher.update(b"\0");
+    }
+    hasher.update(if rooted {
+        b"root\0".as_slice()
+    } else {
+        b"relative\0".as_slice()
+    });
+    for part in parts {
+        hash_os_str(&mut hasher, &part);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_os_str(hasher: &mut Sha256, value: &OsStr) {
+    #[cfg(unix)]
+    {
+        let bytes = value.as_bytes();
+        hasher.update(b"unix\0");
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    #[cfg(windows)]
+    {
+        let units = value.encode_wide().collect::<Vec<_>>();
+        hasher.update(b"windows\0");
+        hasher.update(u64::try_from(units.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for unit in units {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = value.as_encoded_bytes();
+        hasher.update(b"platform\0");
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(bytes);
+    }
+}
+
+/// Construct canonical data-root and adjacent legacy history paths.
+///
+/// An explicitly selected config receives a digest namespace so unrelated config files cannot
+/// collide. The platform-default config stores history directly below the application's history
+/// directory.
+///
+/// # Errors
+/// Returns [`StoreError::Validation`] when `profile` is not a safe identifier.
+pub fn history_paths(
+    data_dir: &Path,
+    config_path: &Path,
+    explicit_config: bool,
+    profile: &str,
+) -> Result<HistoryPaths, StoreError> {
+    if !validate_identifier(profile) {
+        return Err(StoreError::Validation {
+            field: "history.profile".to_owned(),
+            message: "profile must be a safe identifier".to_owned(),
+        });
+    }
+    let canonical_parent = if explicit_config {
+        data_dir
+            .join(HISTORY_DIR_NAME)
+            .join(normalized_config_path_digest(config_path))
+    } else {
+        data_dir.join(HISTORY_DIR_NAME)
+    };
+    let legacy_parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(HistoryPaths {
+        canonical: canonical_parent.join(format!("{profile}.jsonl")),
+        legacy: legacy_parent
+            .join(HISTORY_DIR_NAME)
+            .join(format!("{profile}.jsonl")),
+    })
+}
+
 /// Atomic, bounded storage for explicitly enabled plaintext history.
 pub struct HistoryStore {
     path: PathBuf,
+    legacy_path: Option<PathBuf>,
     max_messages: usize,
 }
 
@@ -935,6 +1387,29 @@ impl HistoryStore {
     /// # Errors
     /// Returns [`StoreError::Validation`] when retention is outside 1..=100000.
     pub fn new(path: impl Into<PathBuf>, max_messages: u32) -> Result<Self, StoreError> {
+        Self::with_optional_legacy(path.into(), None, max_messages)
+    }
+
+    /// Use canonical and adjacent-legacy paths with bounded, one-way reconciliation.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Validation`] when retention is outside 1..=100000.
+    pub fn with_legacy(
+        canonical_path: impl Into<PathBuf>,
+        legacy_path: impl Into<PathBuf>,
+        max_messages: u32,
+    ) -> Result<Self, StoreError> {
+        let canonical_path = canonical_path.into();
+        let legacy_path = legacy_path.into();
+        let legacy_path = (legacy_path != canonical_path).then_some(legacy_path);
+        Self::with_optional_legacy(canonical_path, legacy_path, max_messages)
+    }
+
+    fn with_optional_legacy(
+        path: PathBuf,
+        legacy_path: Option<PathBuf>,
+        max_messages: u32,
+    ) -> Result<Self, StoreError> {
         if !(1..=100_000).contains(&max_messages) {
             return Err(StoreError::Validation {
                 field: "history.max_messages".to_owned(),
@@ -942,7 +1417,8 @@ impl HistoryStore {
             });
         }
         Ok(Self {
-            path: path.into(),
+            path,
+            legacy_path,
             max_messages: usize::try_from(max_messages).map_err(|_| StoreError::Validation {
                 field: "history.max_messages".to_owned(),
                 message: "retention is not representable on this platform".to_owned(),
@@ -956,29 +1432,78 @@ impl HistoryStore {
         &self.path
     }
 
+    /// Return the adjacent legacy path, when it differs from the canonical path.
+    #[must_use]
+    pub fn legacy_path(&self) -> Option<&Path> {
+        self.legacy_path.as_deref()
+    }
+
     /// Load all retained records with strict per-line and total-file bounds.
+    ///
+    /// When an adjacent legacy file exists, both files are read within their independent bounds,
+    /// duplicate UUIDs are resolved in favor of the canonical file, and the canonical replacement
+    /// is made durable before the legacy file is removed.
     ///
     /// # Errors
     /// Returns I/O, parse, or validation errors without including message contents.
     pub fn load(&self) -> Result<Vec<HistoryEntry>, StoreError> {
-        const MAX_ENTRY_BYTES: u64 = 4_096;
-        if !self.path.exists() {
+        let _locks = acquire_target_locks(self.lock_targets())?;
+        self.load_unlocked()
+    }
+
+    fn load_unlocked(&self) -> Result<Vec<HistoryEntry>, StoreError> {
+        let canonical = Self::load_path(&self.path)?;
+        let canonical_len = canonical.len();
+        let Some(legacy_path) = self
+            .legacy_path
+            .as_ref()
+            .filter(|legacy_path| legacy_path.exists())
+        else {
+            let entries = self.merge_entries(Vec::new(), canonical);
+            if entries.len() != canonical_len {
+                self.persist(&entries)?;
+            }
+            return Ok(entries);
+        };
+        let legacy = Self::load_path(legacy_path)?;
+        let entries = self.merge_entries(legacy, canonical);
+        self.persist(&entries)?;
+        remove_file_if_exists(legacy_path)?;
+        Ok(entries)
+    }
+
+    fn load_path(path: &Path) -> Result<Vec<HistoryEntry>, StoreError> {
+        if !path.exists() {
             return Ok(Vec::new());
         }
-        let maximum = u64::try_from(self.max_messages)
+        let maximum = u64::try_from(MAX_HISTORY_MESSAGES)
             .unwrap_or(u64::MAX)
-            .saturating_mul(MAX_ENTRY_BYTES);
-        let metadata = fs::metadata(&self.path).map_err(StoreError::Io)?;
+            .saturating_mul(MAX_HISTORY_ENTRY_BYTES.saturating_add(2));
+        let metadata = fs::metadata(path).map_err(StoreError::Io)?;
         if metadata.len() > maximum {
             return Err(StoreError::Validation {
                 field: "history.file".to_owned(),
-                message: "history file exceeds its configured retention bound".to_owned(),
+                message: "history file exceeds the global input bound".to_owned(),
             });
         }
-        let raw = fs::read_to_string(&self.path).map_err(StoreError::Io)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(StoreError::Io)?;
+        let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
-        for line in raw.lines() {
-            if line.len() > usize::try_from(MAX_ENTRY_BYTES).unwrap_or(usize::MAX) {
+        loop {
+            let mut line = String::new();
+            let read = Read::by_ref(&mut reader)
+                .take(MAX_HISTORY_ENTRY_BYTES.saturating_add(3))
+                .read_line(&mut line)
+                .map_err(StoreError::Io)?;
+            if read == 0 {
+                break;
+            }
+            let line = line.strip_suffix('\n').unwrap_or(&line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_HISTORY_ENTRY_BYTES {
                 return Err(StoreError::Validation {
                     field: "history.entry".to_owned(),
                     message: "history entry exceeds its byte bound".to_owned(),
@@ -986,19 +1511,40 @@ impl HistoryStore {
             }
             let entry: HistoryEntry =
                 serde_json::from_str(line).map_err(|error| StoreError::Parse {
-                    path: self.path.clone(),
+                    path: path.to_path_buf(),
                     message: error.to_string(),
                 })?;
             entry.validate()?;
             entries.push(entry);
-            if entries.len() > self.max_messages {
+            if entries.len() > MAX_HISTORY_MESSAGES {
                 return Err(StoreError::Validation {
                     field: "history.file".to_owned(),
-                    message: "history file contains more entries than configured".to_owned(),
+                    message: "history file contains more entries than the global input bound"
+                        .to_owned(),
                 });
             }
         }
         Ok(entries)
+    }
+
+    fn merge_entries(
+        &self,
+        lower_priority: Vec<HistoryEntry>,
+        higher_priority: Vec<HistoryEntry>,
+    ) -> Vec<HistoryEntry> {
+        let mut by_id = BTreeMap::new();
+        for entry in lower_priority.into_iter().chain(higher_priority) {
+            by_id.insert(entry.id, entry);
+        }
+        let mut entries: Vec<_> = by_id.into_values().collect();
+        entries.sort_by(|left, right| {
+            (left.recorded_at_unix_ms, left.id).cmp(&(right.recorded_at_unix_ms, right.id))
+        });
+        let excess = entries.len().saturating_sub(self.max_messages);
+        if excess > 0 {
+            entries.drain(..excess);
+        }
+        entries
     }
 
     /// Insert a record or replace the matching local record ID, retaining newest entries only.
@@ -1007,17 +1553,85 @@ impl HistoryStore {
     /// Returns validation, I/O, serialization, or atomic replacement errors.
     pub fn upsert(&self, entry: &HistoryEntry) -> Result<(), StoreError> {
         entry.validate()?;
-        let mut entries = self.load()?;
+        let _locks = acquire_target_locks(self.lock_targets())?;
+        let mut entries = self.load_unlocked()?;
         if let Some(existing) = entries.iter_mut().find(|existing| existing.id == entry.id) {
             *existing = entry.clone();
         } else {
             entries.push(entry.clone());
         }
+        entries.sort_by(|left, right| {
+            (left.recorded_at_unix_ms, left.id).cmp(&(right.recorded_at_unix_ms, right.id))
+        });
         let excess = entries.len().saturating_sub(self.max_messages);
-        if excess > 0 {
-            entries.drain(..excess);
-        }
+        entries.drain(..excess);
         self.persist(&entries)
+    }
+
+    /// Copy retained history to an unused canonical store without removing this store.
+    ///
+    /// Any retained destination file is rejected instead of merging unrelated conversations.
+    ///
+    /// # Errors
+    /// Returns validation, I/O, parse, serialization, or atomic replacement errors.
+    pub fn copy_to(&self, destination: &Self) -> Result<(), StoreError> {
+        let _locks = acquire_target_locks(
+            self.lock_targets()
+                .into_iter()
+                .chain(destination.lock_targets()),
+        )?;
+        if destination.any_path_exists() {
+            return Err(StoreError::Validation {
+                field: "history.destination".to_owned(),
+                message: "retained destination history must be cleared before copying".to_owned(),
+            });
+        }
+        let source_entries = self.load_unlocked()?;
+        if source_entries.is_empty() && !self.path.exists() {
+            return Ok(());
+        }
+        destination.persist(&source_entries)
+    }
+
+    /// Move retained history to an unused destination while an owner update succeeds.
+    ///
+    /// Source and destination locks remain held while `update_owner` runs. Any retained
+    /// destination file is rejected instead of merging unrelated conversations. When the owner
+    /// update fails, a newly written destination is removed and the source remains authoritative.
+    ///
+    /// # Errors
+    /// Returns validation, I/O, parsing, serialization, lock, or owner-update errors.
+    pub fn move_to_with(
+        &self,
+        destination: &Self,
+        update_owner: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<bool, StoreError> {
+        let _locks = acquire_target_locks(
+            self.lock_targets()
+                .into_iter()
+                .chain(destination.lock_targets()),
+        )?;
+        if destination.any_path_exists() {
+            return Err(StoreError::Validation {
+                field: "history.destination".to_owned(),
+                message: "retained destination history must be cleared before profile rename"
+                    .to_owned(),
+            });
+        }
+
+        let source_present = self.any_path_exists();
+        let source_entries = self.load_unlocked()?;
+        if source_present {
+            destination.persist(&source_entries)?;
+        }
+        if let Err(error) = update_owner() {
+            if source_present {
+                let _cleanup_result = destination.clear_unlocked();
+            }
+            return Err(error);
+        }
+        self.clear_unlocked()?;
+        Ok(source_present)
     }
 
     /// Remove the selected profile history file. Missing files are already clear.
@@ -1025,11 +1639,32 @@ impl HistoryStore {
     /// # Errors
     /// Returns an I/O error if an existing file cannot be removed.
     pub fn clear(&self) -> Result<(), StoreError> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(StoreError::Io(error)),
+        let _locks = acquire_target_locks(self.lock_targets())?;
+        self.clear_unlocked()
+    }
+
+    fn clear_unlocked(&self) -> Result<(), StoreError> {
+        let canonical_result = remove_file_if_exists(&self.path);
+        let legacy_result = self
+            .legacy_path
+            .as_deref()
+            .map_or(Ok(()), remove_file_if_exists);
+        match (canonical_result, legacy_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
+    }
+
+    fn lock_targets(&self) -> Vec<&Path> {
+        let mut targets = vec![self.path.as_path()];
+        if let Some(legacy) = self.legacy_path.as_deref() {
+            targets.push(legacy);
+        }
+        targets
+    }
+
+    fn any_path_exists(&self) -> bool {
+        self.path.exists() || self.legacy_path.as_deref().is_some_and(Path::exists)
     }
 
     fn persist(&self, entries: &[HistoryEntry]) -> Result<(), StoreError> {
@@ -1047,9 +1682,16 @@ impl HistoryStore {
             .set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(StoreError::Io)?;
         for entry in entries {
-            serde_json::to_writer(&mut temp, entry).map_err(|error| StoreError::Serde {
+            let encoded = serde_json::to_vec(entry).map_err(|error| StoreError::Serde {
                 message: error.to_string(),
             })?;
+            if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_HISTORY_ENTRY_BYTES {
+                return Err(StoreError::Validation {
+                    field: "history.entry".to_owned(),
+                    message: "serialized history entry exceeds its byte bound".to_owned(),
+                });
+            }
+            temp.write_all(&encoded).map_err(StoreError::Io)?;
             temp.write_all(b"\n").map_err(StoreError::Io)?;
         }
         temp.flush().map_err(StoreError::Io)?;
@@ -1066,6 +1708,14 @@ impl HistoryStore {
             .and_then(|directory| directory.sync_all())
             .map_err(StoreError::Io)?;
         Ok(())
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), StoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StoreError::Io(error)),
     }
 }
 
@@ -1393,6 +2043,16 @@ pub enum SecretRef {
 }
 
 impl SecretRef {
+    /// Construct a validated environment-backed secret reference.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Validation`] when `name` is not a bounded environment identifier.
+    pub fn environment(name: impl Into<String>) -> Result<Self, StoreError> {
+        let reference = Self::Environment { name: name.into() };
+        reference.validate("secret.environment")?;
+        Ok(reference)
+    }
+
     fn validate(&self, field: &str) -> Result<(), StoreError> {
         match self {
             Self::CredentialStore { service, account } => {
@@ -1761,14 +2421,19 @@ fn parse_bool(raw: &str, field: &str) -> Result<bool, StoreError> {
     }
 }
 
-fn validate_identifier(name: &str) -> bool {
-    if name.is_empty() {
+/// Return whether a string is safe for use as a persisted profile identifier.
+///
+/// Identifiers contain at most [`MAX_PROFILE_IDENTIFIER_BYTES`] ASCII bytes, start with an
+/// ASCII letter or underscore, and contain only ASCII letters, digits, underscores, or hyphens.
+#[must_use]
+pub fn validate_identifier(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_PROFILE_IDENTIFIER_BYTES {
         return false;
     }
 
     let mut chars = name.chars();
     let first = chars.next();
-    if !matches!(first, Some(ch) if ch.is_ascii_alphabetic() || ch == '_' || ch == '-') {
+    if !matches!(first, Some(ch) if ch.is_ascii_alphabetic() || ch == '_') {
         return false;
     }
 
@@ -1806,6 +2471,13 @@ pub enum StoreError {
         platform: Platform,
         /// Failure context for troubleshooting.
         context: String,
+    },
+
+    /// A cross-process configuration or history transaction stayed busy past the deadline.
+    #[error("timed out waiting for the file lock at {path:?}")]
+    LockTimeout {
+        /// Stable sidecar lock path.
+        path: PathBuf,
     },
 
     /// Failed encoding or decoding with serde.
@@ -2079,6 +2751,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_bad_identifiers_ports_topic_prefixes() {
+        assert!(!validate_identifier("-leading-option"));
+        assert!(validate_identifier("field-unit_2"));
+        assert!(validate_identifier(&format!("a{}", "b".repeat(63))));
+        assert!(!validate_identifier(&format!("a{}", "b".repeat(64))));
         let mut bad = Config::default();
         bad.device_profiles.insert(
             "bad name".to_string(),
@@ -2255,6 +2931,30 @@ mod tests {
     }
 
     #[test]
+    fn resolved_mqtt_passwords_share_the_source_independent_bound() {
+        struct OversizedResolver;
+
+        impl SecretResolver for OversizedResolver {
+            fn resolve(&self, _reference: &SecretRef) -> Result<SecretString, StoreError> {
+                Ok(SecretString::from("x".repeat(
+                    meshquill_mqtt::MAX_MQTT_PASSWORD_BYTES.saturating_add(1),
+                )))
+            }
+        }
+
+        let settings = MqttSettings {
+            password: Some(SecretRef::Environment {
+                name: "MESHQUILL_MQTT_PASSWORD".to_owned(),
+            }),
+            ..MqttSettings::default()
+        };
+        assert!(matches!(
+            settings.resolve_password(&OversizedResolver),
+            Err(StoreError::Validation { field, .. }) if field == "mqtt.password"
+        ));
+    }
+
+    #[test]
     fn mqtt_username_and_password_reference_must_be_configured_together() {
         let mut config = Config::default();
         config.mqtt.gateway.username = Some("gateway-user".to_string());
@@ -2336,6 +3036,236 @@ mod tests {
     }
 
     #[test]
+    fn maximally_escaped_valid_history_fields_roundtrip_within_the_line_bound() {
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let store = assert_ok(
+            HistoryStore::new(dir.path().join("history.jsonl"), 1),
+            "history store",
+        );
+        let entry = assert_ok(
+            HistoryEntry::new(
+                HistoryDirection::Incoming,
+                "\u{001f}".repeat(256),
+                Some(u8::MAX),
+                "\u{001f}".repeat(1_024),
+                HistoryStatus::Received,
+                Some([u8::MAX; 4]),
+            ),
+            "maximally escaped history entry",
+        );
+        let encoded = assert_ok(serde_json::to_vec(&entry), "serialize history entry");
+        assert!(
+            encoded.len() > 4_096,
+            "fixture must cover the former line bound"
+        );
+        assert!(
+            u64::try_from(encoded.len()).unwrap_or(u64::MAX) <= MAX_HISTORY_ENTRY_BYTES,
+            "valid entry must fit the persisted line bound"
+        );
+
+        assert_ok(store.upsert(&entry), "persist escaped history entry");
+        assert_eq!(
+            assert_ok(store.load(), "reload escaped history entry"),
+            vec![entry]
+        );
+    }
+
+    #[test]
+    fn lowering_history_retention_prunes_and_rewrites_newest_entries() {
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let path = dir.path().join("history.jsonl");
+        let original = assert_ok(HistoryStore::new(&path, 3), "original history store");
+        for (id, timestamp) in [(1, 10), (2, 20), (3, 30)] {
+            let mut entry = assert_ok(
+                HistoryEntry::new(
+                    HistoryDirection::Incoming,
+                    "peer",
+                    None,
+                    format!("message-{id}"),
+                    HistoryStatus::Received,
+                    None,
+                ),
+                "history entry",
+            );
+            entry.id = Uuid::from_u128(id);
+            entry.recorded_at_unix_ms = timestamp;
+            assert_ok(original.upsert(&entry), "original upsert");
+        }
+
+        let reduced = assert_ok(HistoryStore::new(&path, 2), "reduced history store");
+        let loaded = assert_ok(reduced.load(), "load with reduced retention");
+        assert_eq!(
+            loaded.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![Uuid::from_u128(2), Uuid::from_u128(3)]
+        );
+        assert_eq!(
+            assert_ok(fs::read_to_string(&path), "read pruned history")
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_history_upserts_do_not_lose_distinct_records() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let store = Arc::new(assert_ok(
+            HistoryStore::new(dir.path().join("history.jsonl"), 32),
+            "history store",
+        ));
+        let barrier = Arc::new(Barrier::new(8));
+        let workers = (0_u128..8)
+            .map(|id| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut entry = HistoryEntry::new(
+                        HistoryDirection::Incoming,
+                        "peer",
+                        None,
+                        format!("message-{id}"),
+                        HistoryStatus::Received,
+                        None,
+                    )
+                    .expect("history entry");
+                    entry.id = Uuid::from_u128(id.saturating_add(1));
+                    entry.recorded_at_unix_ms = u64::try_from(id).expect("small id");
+                    barrier.wait();
+                    store.upsert(&entry).expect("concurrent upsert");
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("history worker");
+        }
+        assert_eq!(assert_ok(store.load(), "load concurrent history").len(), 8);
+    }
+
+    #[test]
+    fn history_copy_and_profile_move_refuse_retained_destination_without_mutation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let source = assert_ok(
+            HistoryStore::new(dir.path().join("old.jsonl"), 10),
+            "source history",
+        );
+        let destination = assert_ok(
+            HistoryStore::new(dir.path().join("new.jsonl"), 10),
+            "destination history",
+        );
+        for (store, id, text) in [(&source, 1, "source"), (&destination, 2, "destination")] {
+            let mut entry = assert_ok(
+                HistoryEntry::new(
+                    HistoryDirection::Incoming,
+                    "peer",
+                    None,
+                    text,
+                    HistoryStatus::Received,
+                    None,
+                ),
+                "history entry",
+            );
+            entry.id = Uuid::from_u128(id);
+            assert_ok(store.upsert(&entry), "seed history");
+        }
+        let source_before = assert_ok(fs::read(source.path()), "source bytes");
+        let destination_before = assert_ok(fs::read(destination.path()), "destination bytes");
+        let copy_error = source
+            .copy_to(&destination)
+            .expect_err("copy to retained destination must be refused");
+        assert!(matches!(
+            copy_error,
+            StoreError::Validation { field, .. } if field == "history.destination"
+        ));
+        assert_eq!(
+            assert_ok(fs::read(source.path()), "source after refused copy"),
+            source_before
+        );
+        assert_eq!(
+            assert_ok(
+                fs::read(destination.path()),
+                "destination after refused copy"
+            ),
+            destination_before
+        );
+
+        let owner_updated = AtomicBool::new(false);
+        let error = source
+            .move_to_with(&destination, || {
+                owner_updated.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect_err("retained destination must be refused");
+        assert!(matches!(
+            error,
+            StoreError::Validation { field, .. } if field == "history.destination"
+        ));
+        assert!(!owner_updated.load(Ordering::SeqCst));
+        assert_eq!(
+            assert_ok(fs::read(source.path()), "source after"),
+            source_before
+        );
+        assert_eq!(
+            assert_ok(fs::read(destination.path()), "destination after"),
+            destination_before
+        );
+    }
+
+    #[test]
+    fn config_transactions_preserve_concurrent_distinct_profile_updates() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let path = dir.path().join("config.toml");
+        assert_ok(
+            ConfigStore::new(&path).save(&Config::default()),
+            "seed config",
+        );
+        let barrier = Arc::new(Barrier::new(8));
+        let workers = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = ConfigStore::new(path);
+                    let locked = store.lock_exclusive().expect("config lock");
+                    let LoadOutcome::Loaded(mut config) = locked
+                        .load_with_overrides(&HashMap::new())
+                        .expect("load config")
+                    else {
+                        panic!("expected current config");
+                    };
+                    config.device_profiles.insert(
+                        format!("profile_{index}"),
+                        DeviceProfile {
+                            transport: TransportConfig::Mock {
+                                scenario: "default".to_owned(),
+                            },
+                            transport_overrides: None,
+                            secret: None,
+                        },
+                    );
+                    locked.save(&config).expect("save config");
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("config worker");
+        }
+        let LoadOutcome::Loaded(loaded) = assert_ok(
+            ConfigStore::new(&path).load_with_overrides(&HashMap::new()),
+            "load final config",
+        ) else {
+            panic!("expected current config");
+        };
+        assert_eq!(loaded.device_profiles.len(), 8);
+    }
+
+    #[test]
     fn history_rejects_unsafe_paths_fields_and_direction_state_pairs() {
         let config_path = PathBuf::from("/tmp/config.toml");
         assert!(matches!(
@@ -2379,11 +3309,256 @@ mod tests {
     }
 
     #[test]
+    fn profile_resolution_uses_explicit_default_then_sole_profile() {
+        fn profile(scenario: &str) -> DeviceProfile {
+            DeviceProfile {
+                transport: TransportConfig::Mock {
+                    scenario: scenario.to_owned(),
+                },
+                transport_overrides: None,
+                secret: None,
+            }
+        }
+
+        let mut config = Config::default();
+        assert_eq!(
+            resolve_profile(&config, None).expect_err("empty selection must fail"),
+            ProfileSelectionError::NoneConfigured
+        );
+
+        config
+            .device_profiles
+            .insert("sole".to_owned(), profile("one"));
+        assert_eq!(
+            resolve_profile(&config, None)
+                .expect("sole profile selection")
+                .name,
+            "sole"
+        );
+
+        config
+            .device_profiles
+            .insert("other".to_owned(), profile("two"));
+        assert_eq!(
+            resolve_profile(&config, None).expect_err("ambiguous selection must fail"),
+            ProfileSelectionError::Ambiguous {
+                profiles: vec!["other".to_owned(), "sole".to_owned()]
+            }
+        );
+
+        config.default_profile = Some("sole".to_owned());
+        assert_eq!(
+            resolve_profile(&config, None)
+                .expect("default selection")
+                .name,
+            "sole"
+        );
+        assert_eq!(
+            resolve_profile(&config, Some("other"))
+                .expect("explicit selection")
+                .name,
+            "other"
+        );
+        assert_eq!(
+            resolve_profile(&config, Some("missing"))
+                .expect_err("missing explicit profile must fail"),
+            ProfileSelectionError::NotFound {
+                name: "missing".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn history_paths_use_data_root_and_stable_explicit_config_namespace() {
+        let data = Path::new("/var/data/meshquill");
+        let config = Path::new("/etc/meshquill/./nested/../field.toml");
+        let normalized = Path::new("/etc/meshquill/field.toml");
+        assert_eq!(
+            normalized_config_path_digest(config),
+            normalized_config_path_digest(normalized)
+        );
+
+        let default_paths = assert_ok(
+            history_paths(data, config, false, "field"),
+            "default history paths",
+        );
+        assert_eq!(
+            default_paths.canonical,
+            data.join("history").join("field.jsonl")
+        );
+        assert_eq!(
+            default_paths.legacy,
+            Path::new("/etc/meshquill/./nested/..")
+                .join("history")
+                .join("field.jsonl")
+        );
+
+        let explicit_paths = assert_ok(
+            history_paths(data, normalized, true, "field"),
+            "explicit history paths",
+        );
+        assert_eq!(
+            explicit_paths.canonical.parent().and_then(Path::parent),
+            Some(data.join("history").as_path())
+        );
+        assert_eq!(
+            explicit_paths
+                .canonical
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                .map(str::len),
+            Some(64)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_path_digest_distinguishes_non_utf8_components() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(b"/tmp/config-\x80.toml".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"/tmp/config-\x81.toml".to_vec()));
+        assert_ne!(
+            normalized_config_path_digest(&first),
+            normalized_config_path_digest(&second)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_path_digest_distinguishes_unpaired_utf16_components() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xd800,
+        ]));
+        let second = PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xd801,
+        ]));
+        assert_ne!(
+            normalized_config_path_digest(&first),
+            normalized_config_path_digest(&second)
+        );
+    }
+
+    #[test]
+    fn canonical_history_reconciles_legacy_deduplicates_and_is_idempotent() {
+        fn entry(id: u128, timestamp: u64, text: &str) -> HistoryEntry {
+            let mut entry = assert_ok(
+                HistoryEntry::new(
+                    HistoryDirection::Incoming,
+                    "peer",
+                    None,
+                    text,
+                    HistoryStatus::Received,
+                    None,
+                ),
+                "history entry",
+            );
+            entry.id = Uuid::from_u128(id);
+            entry.recorded_at_unix_ms = timestamp;
+            entry
+        }
+
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let canonical_path = dir.path().join("data/history/field.jsonl");
+        let legacy_path = dir.path().join("config/history/field.jsonl");
+        let canonical = assert_ok(HistoryStore::new(&canonical_path, 3), "canonical store");
+        let legacy = assert_ok(HistoryStore::new(&legacy_path, 3), "legacy store");
+        assert_ok(
+            canonical.upsert(&entry(2, 20, "canonical wins")),
+            "canonical duplicate",
+        );
+        assert_ok(
+            canonical.upsert(&entry(4, 40, "newest")),
+            "canonical newest",
+        );
+        assert_ok(legacy.upsert(&entry(1, 10, "oldest")), "legacy oldest");
+        assert_ok(
+            legacy.upsert(&entry(2, 20, "legacy loses")),
+            "legacy duplicate",
+        );
+        assert_ok(legacy.upsert(&entry(3, 30, "middle")), "legacy middle");
+
+        let store = assert_ok(
+            HistoryStore::with_legacy(&canonical_path, &legacy_path, 3),
+            "reconciling store",
+        );
+        let entries = assert_ok(store.load(), "reconciled load");
+        assert_eq!(
+            entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![Uuid::from_u128(2), Uuid::from_u128(3), Uuid::from_u128(4)]
+        );
+        assert_eq!(entries[0].text, "canonical wins");
+        assert!(!legacy_path.exists());
+        let first_bytes = assert_ok(fs::read(&canonical_path), "canonical bytes");
+        assert_eq!(assert_ok(store.load(), "idempotent load"), entries);
+        assert_eq!(
+            assert_ok(fs::read(&canonical_path), "canonical bytes again"),
+            first_bytes
+        );
+    }
+
+    #[test]
+    fn failed_canonical_history_write_retains_legacy_and_clear_removes_both() {
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let blocked_parent = dir.path().join("blocked");
+        assert_ok(
+            fs::write(&blocked_parent, b"not a directory"),
+            "blocking file",
+        );
+        let canonical_path = blocked_parent.join("field.jsonl");
+        let legacy_path = dir.path().join("legacy/field.jsonl");
+        let legacy = assert_ok(HistoryStore::new(&legacy_path, 3), "legacy store");
+        let entry = assert_ok(
+            HistoryEntry::new(
+                HistoryDirection::Incoming,
+                "peer",
+                None,
+                "retained",
+                HistoryStatus::Received,
+                None,
+            ),
+            "history entry",
+        );
+        assert_ok(legacy.upsert(&entry), "legacy write");
+
+        let blocked = assert_ok(
+            HistoryStore::with_legacy(&canonical_path, &legacy_path, 3),
+            "blocked store",
+        );
+        assert!(blocked.load().is_err());
+        assert!(legacy_path.exists());
+
+        let canonical_path = dir.path().join("canonical/field.jsonl");
+        let both = assert_ok(
+            HistoryStore::with_legacy(&canonical_path, &legacy_path, 3),
+            "clear store",
+        );
+        assert_ok(
+            HistoryStore::new(&canonical_path, 3).and_then(|store| store.upsert(&entry)),
+            "canonical write",
+        );
+        assert_ok(both.clear(), "clear both paths");
+        assert!(!canonical_path.exists());
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
     fn cross_platform_path_resolution_is_pure() {
         let linux = PathEnvironment {
             home: Some(PathBuf::from("/home/me")),
             xdg_config_home: Some(PathBuf::from("/tmp/xdg")),
+            xdg_data_home: None,
             app_data: None,
+            local_app_data: None,
         };
         assert_eq!(
             assert_ok(
@@ -2392,11 +3567,20 @@ mod tests {
             ),
             PathBuf::from("/tmp/xdg/meshquill/config.toml")
         );
+        assert_eq!(
+            assert_ok(
+                resolve_platform_data_dir(Platform::Linux, "meshquill", &linux),
+                "linux data path"
+            ),
+            PathBuf::from("/home/me/.local/share/meshquill")
+        );
 
         let mac = PathEnvironment {
             home: Some(PathBuf::from("/Users/me")),
             xdg_config_home: None,
+            xdg_data_home: None,
             app_data: None,
+            local_app_data: None,
         };
         assert_eq!(
             assert_ok(
@@ -2405,11 +3589,20 @@ mod tests {
             ),
             PathBuf::from("/Users/me/Library/Application Support/meshquill/config.toml")
         );
+        assert_eq!(
+            assert_ok(
+                resolve_platform_data_dir(Platform::Macos, "meshquill", &mac),
+                "mac data path"
+            ),
+            PathBuf::from("/Users/me/Library/Application Support/meshquill")
+        );
 
         let win = PathEnvironment {
             home: Some(PathBuf::from("C:/Users/me")),
             xdg_config_home: None,
+            xdg_data_home: None,
             app_data: Some(PathBuf::from("C:/Users/me/AppData/Roaming")),
+            local_app_data: Some(PathBuf::from("C:/Users/me/AppData/Local")),
         };
         assert_eq!(
             assert_ok(
@@ -2418,6 +3611,36 @@ mod tests {
             ),
             PathBuf::from("C:/Users/me/AppData/Roaming/Meshquill/config.toml")
         );
+        assert_eq!(
+            assert_ok(
+                resolve_platform_data_dir(Platform::Windows, "Meshquill", &win),
+                "windows data path"
+            ),
+            PathBuf::from("C:/Users/me/AppData/Local/Meshquill")
+        );
+
+        let local_only_windows = PathEnvironment {
+            local_app_data: Some(PathBuf::from("C:/Users/me/AppData/Local")),
+            ..PathEnvironment::default()
+        };
+        assert_eq!(
+            assert_ok(
+                resolve_platform_config_path(Platform::Windows, "Meshquill", &local_only_windows,),
+                "windows config fallback path",
+            ),
+            PathBuf::from("C:/Users/me/AppData/Local/Meshquill/config.toml")
+        );
+
+        for invalid in [PathBuf::new(), PathBuf::from("relative/data")] {
+            let invalid_linux = PathEnvironment {
+                xdg_data_home: Some(invalid),
+                ..PathEnvironment::default()
+            };
+            assert!(matches!(
+                resolve_platform_data_dir(Platform::Linux, "meshquill", &invalid_linux),
+                Err(StoreError::MissingRuntimePath { .. })
+            ));
+        }
     }
 
     #[test]

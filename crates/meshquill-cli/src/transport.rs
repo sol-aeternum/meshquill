@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use meshquill_core::TransportError;
-use meshquill_core::transport::{ReconnectableTransport, Transport, TransportKind};
+use meshquill_core::transport::{ReadyRead, ReconnectableTransport, Transport, TransportKind};
 use meshquill_store::{DeviceProfile, TransportConfig};
 use meshquill_transport::{BleTransport, SerialTransport, TcpTransport};
 use thiserror::Error;
@@ -195,6 +195,15 @@ impl Transport for CliTransport {
             Self::Serial(transport) => transport.read().await,
             Self::Tcp(transport) => transport.read().await,
             Self::VirtualCompanion(transport) => transport.read().await,
+        }
+    }
+
+    fn try_read(&mut self) -> Result<ReadyRead, TransportError> {
+        match self {
+            Self::Ble(transport) => transport.try_read(),
+            Self::Serial(transport) => transport.try_read(),
+            Self::Tcp(transport) => transport.try_read(),
+            Self::VirtualCompanion(transport) => transport.try_read(),
         }
     }
 }

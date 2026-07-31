@@ -32,7 +32,7 @@ mkdir -p \
   "$stage_root/share/completions"
 install -m 0755 "$binary" "$stage_root/bin/meshquill"
 install -m 0644 \
-  README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md STATUS.md PLAN.md \
+  README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md \
   LICENSE-APACHE LICENSE-MIT \
   "$stage_root/"
 cp -R docs examples schemas "$stage_root/"

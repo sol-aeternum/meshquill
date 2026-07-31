@@ -9,18 +9,18 @@ Python, and the native CLI does not depend on Python.
 
 Python 3.9 or newer is supported through CPython's stable ABI.
 
-The current `0.1.0rc2` source is not claimed to be published on PyPI. Build this checkout using the
-[development steps](#development) below. After [project status](../../STATUS.md) records a published
-RC2 GitHub prerelease, install its downloaded platform wheel directly:
+The current `0.1.0rc3` source is not claimed to be published on PyPI. Build this checkout using the
+[development steps](#development) below. After [live project status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md)
+records a published RC3 GitHub prerelease, install its downloaded platform wheel directly:
 
 ```console
-python -m pip install ./meshquill_sdk-0.1.0rc2-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc3-*.whl
 ```
 
 Only after status records the separate PyPI publication will this exact index command work:
 
 ```console
-python -m pip install --pre "meshquill-sdk==0.1.0rc2"
+python -m pip install --pre "meshquill-sdk==0.1.0rc3"
 ```
 
 The installed import remains `meshcore_sdk` in code examples below.
@@ -48,9 +48,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`Client.auto()` uses the store's `default_profile`, global connect/request timeouts, a per-profile
-request-timeout override when present, and the configured bounded outbound capacity. Pass
-`profile=` to select another stored profile or `config_path=` for a caller-owned config file.
+`Client.auto()` selects an explicit `profile=`, then the store's `default_profile`, then the sole
+stored profile; multiple profiles without a default raise an ambiguity error. It uses global
+connect/request timeouts, a per-profile request-timeout override when present, and the configured
+bounded outbound capacity. Pass `config_path=` for a caller-owned config file.
 Stored secret references are neither resolved for these companion transports nor exposed in
 Python diagnostics.
 

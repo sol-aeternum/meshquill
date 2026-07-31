@@ -23,10 +23,10 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 async-trait = { workspace = true }
 hex = { workspace = true }
-meshquill-core = { version = "=0.1.0-rc.2", path = "../meshquill-core" }
-meshquill-store = { version = "=0.1.0-rc.2", path = "../meshquill-store" }
-meshquill-test-support = { version = "=0.1.0-rc.2", path = "../meshquill-test-support" }
-meshquill-transport = { version = "=0.1.0-rc.2", path = "../meshquill-transport" }
+meshquill-core = { version = "=0.1.0-rc.3", path = "../meshquill-core" }
+meshquill-store = { version = "=0.1.0-rc.3", path = "../meshquill-store" }
+meshquill-test-support = { version = "=0.1.0-rc.3", path = "../meshquill-test-support" }
+meshquill-transport = { version = "=0.1.0-rc.3", path = "../meshquill-transport" }
 pyo3 = { version = "0.29", features = ["abi3-py39"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 tokio = { workspace = true }

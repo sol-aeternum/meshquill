@@ -12,6 +12,18 @@ contacts, channels, keys, or message-history converter.
 
 Use `--config PATH` on every command when migrating a non-default destination.
 
+## RC2 config-adjacent history
+
+Moving RC2 history into the platform application-data root is a storage-path reconciliation, not a
+TOML schema migration, so it needs no separate command. On first history access, Meshquill reads the
+canonical and older config-adjacent files under independent bounds, resolves duplicate local UUIDs
+in favor of the canonical record, durably writes the merged canonical file, and only then removes
+the legacy file. `history clear` removes both locations.
+
+For an explicit configuration, keep both `--config` and `--data-dir` stable while reconciling; the
+canonical path includes a SHA-256 namespace of the absolute normalized config path. Inspect the
+resolved path with `meshquill --output json history list` before moving files manually.
+
 ## Back up and inspect first
 
 Before changing a file, keep your own copy and inspect the effective destination:

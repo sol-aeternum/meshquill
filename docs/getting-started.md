@@ -1,7 +1,8 @@
 # Getting started
 
-Meshquill `0.1.0-rc.2` is a pre-release command-line client in the current source checkout. Until
-[current status](../STATUS.md) records a published `v0.1.0-rc.2` prerelease, its GitHub tag,
+Meshquill `0.1.0-rc.3` is a pre-release command-line client in the current source checkout. Until
+[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published
+`v0.1.0-rc.3` prerelease, its GitHub tag,
 checksummed assets and tagged-install commands are future delivery paths, and no crates.io or PyPI
 package is assumed available. Build the current checkout below; [installation](installation.md)
 also documents the conditional release-asset flow. Physical BLE and serial verification has not
@@ -59,8 +60,10 @@ $ meshquill --config ./demo-config.toml --non-interactive init --name demo --dem
 $ meshquill --config ./demo-config.toml --profile demo contacts
 ```
 
-`init` never overwrites an existing profile. The first profile becomes the default automatically;
-`--set-default` makes the choice explicit and selects a later profile as the default.
+`init` never overwrites an existing profile. A new profile becomes the default automatically when
+none is persisted; `--set-default` explicitly replaces an existing default. With exactly one stored
+profile, commands select it even without a default. Use `meshquill profiles list` and
+`meshquill profiles set-default NAME` to inspect or persist selection.
 
 ## Try line chat
 

@@ -7,8 +7,8 @@ legacy Python MeshCore client.
 
 The API supports CPython 3.9 and newer through one stable-ABI wheel per operating-system and CPU
 target. The release workflow stages those wheels in a private draft. Until
-[current status](../STATUS.md) records a published RC2 prerelease, build the source checkout; a
-successful workflow draft alone is not a public download.
+[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published RC3
+prerelease, build the source checkout; a successful workflow draft alone is not a public download.
 
 ## Install
 
@@ -19,7 +19,7 @@ environment:
 python -m venv .venv
 . .venv/bin/activate
 # Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install ./meshquill_sdk-0.1.0rc2-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc3-*.whl
 python -c "import meshcore_sdk; print(meshcore_sdk.__version__)"
 ```
 
@@ -61,8 +61,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-For a configured device, replace `Client.demo()` with `Client.auto()`. `auto()` reads the same
-versioned profile file and default-profile selection as the CLI. It accepts `profile="field"` and
+For a configured device, replace `Client.demo()` with `Client.auto()`. `auto()` uses the same strict
+explicit profile, configured default, then sole-profile selection order as the CLI; multiple
+profiles without a default raise an actionable ambiguity error. It accepts `profile="field"` and
 `config_path="./field.toml"` when an application must make selection explicit. Configuration
 environment overrides are also applied; secret references that require an interactive prompt are
 not suitable for an unattended Python process.

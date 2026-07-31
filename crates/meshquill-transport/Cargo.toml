@@ -17,7 +17,7 @@ async-trait.workspace = true
 btleplug.workspace = true
 bytes.workspace = true
 futures.workspace = true
-meshquill-core = { version = "=0.1.0-rc.2", path = "../meshquill-core" }
+meshquill-core = { version = "=0.1.0-rc.3", path = "../meshquill-core" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -13,12 +13,14 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+fs4.workspace = true
 keyring = { workspace = true }
-meshquill-hooks = { version = "=0.1.0-rc.2", path = "../meshquill-hooks" }
-meshquill-mqtt = { version = "=0.1.0-rc.2", path = "../meshquill-mqtt" }
+meshquill-hooks = { version = "=0.1.0-rc.3", path = "../meshquill-hooks" }
+meshquill-mqtt = { version = "=0.1.0-rc.3", path = "../meshquill-mqtt" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

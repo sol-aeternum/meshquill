@@ -16,16 +16,19 @@ mod topics;
 pub use backoff::{BackoffError, ExponentialBackoff};
 pub use command::{
     AcceptedCommand, CommandError, CommandProcessor, DedupeDecision, DedupeError, EventIdDedupe,
-    SendCommand,
+    SendCommand, validate_send_command,
 };
 pub use config::{
     CommandLimits, ConfigError, DedupeConfig, MAX_BROKER_OPERATION_TIMEOUT_MS,
-    MAX_CONFIGURED_PAYLOAD_BYTES, MAX_RECONNECT_DELAY_MS, MAX_TLS_FILE_BYTES, MqttConfig,
-    MqttPassword, MqttProtocol, MqttQos, ReconnectConfig, SessionConfig, TlsConfig,
+    MAX_COMMAND_DESTINATION_BYTES, MAX_COMMAND_TEXT_BYTES, MAX_CONFIGURED_PAYLOAD_BYTES,
+    MAX_MQTT_PASSWORD_BYTES, MAX_RECONNECT_DELAY_MS, MAX_TLS_FILE_BYTES, MqttConfig, MqttPassword,
+    MqttProtocol, MqttQos, ReconnectConfig, SessionConfig, TlsConfig,
 };
 pub use runner::{GatewayError, GatewayHandle, GatewayNotice, GatewayPublisher, GatewayRunner};
 pub use schema::{
-    ConnectionComponent, ConnectionStateData, ConnectionStatus, ContactsData, EventEnvelope,
-    EventKind, Publication, SchemaError, TelemetryData,
+    AckData, ConnectionComponent, ConnectionStateData, ConnectionStatus, ContactData,
+    ContactRouteData, ContactTypeData, ContactsData, EventEnvelope, EventKind, IncomingMessageData,
+    MessageRouteData, MessageSourceData, MessageStatusData, Publication, SchemaError,
+    TelemetryData,
 };
 pub use topics::{SCHEMA_VERSION, TopicSet};

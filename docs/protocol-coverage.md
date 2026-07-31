@@ -9,9 +9,9 @@ RC intentionally has no CLI command. No row is hardware-tested—see [hardware-t
 
 | Surface | State | Evidence/limit |
 | --- | --- | --- |
-| BLE Nordic-UART, raw inner packets | Implemented, host-tested | UUID/selector discovery, characteristic validation, bounded writes and timeout/cancellation tests; OS Bluetooth service required; no physical test. |
-| USB serial app/device framing | Implemented, host-tested | `0x3c`/`0x3e` plus LE length, 300-byte cap, partial-frame/resync/malformed tests; libudev-backed fallible enumeration on Linux; no physical test. |
-| TCP app/device framing | Implemented, host-tested | Same bounded streaming codec, connect/read/write timeouts and loopback tests; no physical companion test. |
+| BLE Nordic-UART, raw inner packets | Implemented, host-tested | One complete write-with-response provider call (ATT long write permitted), without-response limited to `MTU - 3`, 176-byte firmware-frame cap, characteristic/timeout/no-replay tests; OS Bluetooth service required; no physical test. |
+| USB serial app/device framing | Implemented, host-tested | `0x3c`/`0x3e` plus LE length, defensive 300-byte declared-frame decoder bound followed by the 176-byte firmware-packet cap, partial-frame/resync/malformed tests; libudev-backed fallible enumeration on Linux; no physical test. |
+| TCP app/device framing | Implemented, host-tested | Same two-layer bounds and streaming codec, connect/read/write timeouts and loopback tests; no physical companion test. |
 | Mock/virtual companion | Implemented, deterministic | Handshake, contacts, info, direct/channel send, queued receive, ACK/timeout, reconnect/no-replay, node discovery and fault injection. |
 
 ## Command codes
@@ -74,8 +74,8 @@ contact URI, battery/storage, time, signing, custom variables, tuning, stats, au
 scope, authentication, remote status, telemetry, binary/anonymous responses, path discovery and
 control data. Python exposes raw local telemetry queries and unsolicited telemetry events as the
 same immutable typed response, separately from statistics. Exact field bounds, invalid UTF-8,
-truncated samples, unknown codes and oversized outer
-frames have unit tests. Four libFuzzer targets exercise two codecs (`protocol_packet` for inner
+truncated samples, unknown codes, 177-byte inner packets, and 301-byte declared outer frames have
+unit tests. Four libFuzzer targets exercise two codecs (`protocol_packet` for inner
 packets and `outer_frames` for transport framing) plus two remote/application parsers
 (`remote_payloads` and `mqtt_commands`).
 

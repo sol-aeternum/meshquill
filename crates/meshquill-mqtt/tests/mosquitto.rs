@@ -90,7 +90,14 @@ async fn observer_loop(
             }
         };
         let notice = match event {
-            Event::Incoming(Packet::SubAck(_)) => Some(ObserverNotice::Subscribed),
+            Event::Incoming(Packet::SubAck(ack))
+                if matches!(
+                    ack.return_codes.as_slice(),
+                    [rumqttc::SubscribeReasonCode::Success(_)]
+                ) =>
+            {
+                Some(ObserverNotice::Subscribed)
+            }
             Event::Incoming(Packet::Publish(publication)) => Some(ObserverNotice::Publish {
                 topic: publication.topic,
                 payload: publication.payload.to_vec(),
@@ -141,13 +148,90 @@ async fn wait_for_gateway_command(handle: &mut GatewayHandle) -> TestResult<Acce
             .ok_or_else(|| io::Error::other("gateway stopped before accepting the command"))?;
         match notice {
             GatewayNotice::Command(command) => return Ok(command),
-            GatewayNotice::BrokerState(_) => {}
+            GatewayNotice::BrokerState(_) | GatewayNotice::CommandReady => {}
             GatewayNotice::Rejected(error) => {
                 return Err(io::Error::other(format!(
                     "gateway rejected the integration command: {error}"
                 ))
                 .into());
             }
+        }
+    }
+}
+
+async fn wait_for_retained_rejection(handle: &mut GatewayHandle) -> TestResult {
+    loop {
+        let notice = tokio::time::timeout(Duration::from_secs(10), handle.recv_notice())
+            .await?
+            .ok_or_else(|| io::Error::other("gateway stopped before rejecting retained command"))?;
+        match notice {
+            GatewayNotice::Rejected(meshquill_mqtt::CommandError::RetainedCommand) => return Ok(()),
+            GatewayNotice::BrokerState(_) | GatewayNotice::CommandReady => {}
+            GatewayNotice::Rejected(error) => {
+                return Err(io::Error::other(format!(
+                    "gateway returned the wrong retained-command rejection: {error}"
+                ))
+                .into());
+            }
+            GatewayNotice::Command(_) => {
+                return Err(io::Error::other("gateway executed a retained command").into());
+            }
+        }
+    }
+}
+
+async fn seed_retained_send(
+    observer: &AsyncClient,
+    observer_receiver: &mut mpsc::Receiver<ObserverNotice>,
+    topics: &TopicSet,
+) -> TestResult<(Uuid, Vec<u8>)> {
+    let command_id = Uuid::now_v7();
+    let command = EventEnvelope::new(
+        command_id,
+        "mosquitto-test-sender",
+        1_725_000_000_000,
+        EventKind::SendDirect,
+        serde_json::json!({"destination": "alice", "text": "broker roundtrip"}),
+    )?;
+    let command_payload = command.encode()?;
+    observer
+        .publish(
+            topics.outbound_send(),
+            QoS::AtLeastOnce,
+            true,
+            command_payload.clone(),
+        )
+        .await?;
+    let retained_at_broker = wait_for_event(
+        observer_receiver,
+        topics.outbound_send(),
+        EventKind::SendDirect,
+    )
+    .await?;
+    assert_eq!(retained_at_broker.event_id, command_id);
+    Ok((command_id, command_payload))
+}
+
+async fn clear_retained_send(
+    observer: &AsyncClient,
+    observer_receiver: &mut mpsc::Receiver<ObserverNotice>,
+    topics: &TopicSet,
+) -> TestResult {
+    observer
+        .publish(
+            topics.outbound_send(),
+            QoS::AtLeastOnce,
+            true,
+            Vec::<u8>::new(),
+        )
+        .await?;
+    loop {
+        if let ObserverNotice::Publish { topic, payload } =
+            receive_observer(observer_receiver).await?
+            && topic == topics.outbound_send()
+            && payload.is_empty()
+        {
+            return Ok(());
         }
     }
 }
@@ -175,6 +259,9 @@ async fn run_roundtrip(protocol: MqttProtocol) -> TestResult {
         ObserverNotice::Subscribed
     ) {}
 
+    let (command_id, command_payload) =
+        seed_retained_send(&observer, &mut observer_receiver, &topics).await?;
+
     let gateway_cancellation = CancellationToken::new();
     let config = MqttConfig {
         host: broker.host,
@@ -199,21 +286,14 @@ async fn run_roundtrip(protocol: MqttProtocol) -> TestResult {
         EventKind::ConnectionState,
     )
     .await?;
+    wait_for_retained_rejection(&mut handle).await?;
 
-    let command_id = Uuid::now_v7();
-    let command = EventEnvelope::new(
-        command_id,
-        "mosquitto-test-sender",
-        1_725_000_000_000,
-        EventKind::SendDirect,
-        serde_json::json!({"destination": "alice", "text": "broker roundtrip"}),
-    )?;
     observer
         .publish(
             topics.outbound_send(),
             QoS::AtLeastOnce,
             false,
-            command.encode()?,
+            command_payload,
         )
         .await?;
     let accepted = wait_for_gateway_command(&mut handle).await?;
@@ -228,11 +308,10 @@ async fn run_roundtrip(protocol: MqttProtocol) -> TestResult {
 
     let telemetry_id = handle
         .publisher()
-        .publish(Publication::Telemetry(TelemetryData {
-            source: Some("integration-test".to_owned()),
-            values: [("battery".to_owned(), serde_json::json!(88))]
-                .into_iter()
-                .collect(),
+        .publish(Publication::Telemetry(TelemetryData::Battery {
+            level: 88,
+            used_kb: None,
+            total_kb: None,
         }))
         .await?;
     let telemetry = wait_for_event(
@@ -242,6 +321,8 @@ async fn run_roundtrip(protocol: MqttProtocol) -> TestResult {
     )
     .await?;
     assert_eq!(telemetry.event_id, telemetry_id);
+
+    clear_retained_send(&observer, &mut observer_receiver, &topics).await?;
 
     handle.cancel();
     tokio::time::timeout(Duration::from_secs(10), runner_task).await???;
@@ -295,6 +376,7 @@ async fn gateway_connects_within(
             if matches!(
                 notice,
                 GatewayNotice::BrokerState(ConnectionStatus::Connected)
+                    | GatewayNotice::CommandReady
             ) {
                 return true;
             }

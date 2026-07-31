@@ -9,8 +9,9 @@ real device completes the documented smoke suite; discovery alone is not a proto
 | --- | --- | --- | --- | --- | --- |
 | 2026-07-30 | No device available | — | BLE/serial | Linux development host | Not run: no USB companion exposed and Bluetooth D-Bus initialization failed. |
 
-TCP loopback and the virtual companion are software tests and are recorded in `STATUS.md`, not in
-this physical matrix.
+TCP loopback and the virtual companion are software tests recorded in the
+[live repository status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md), not in this
+physical matrix.
 
 ## Required smoke record
 

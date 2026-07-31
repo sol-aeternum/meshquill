@@ -22,9 +22,29 @@ $ meshquill --config ./field.toml --non-interactive init --name field --serial /
 $ meshquill --config ./field.toml config show
 ```
 
-Configuration and history writes use a same-directory temporary file followed by an atomic replace.
-On Unix, newly created configuration directories are mode `0700` and files/backups are mode `0600`.
-Do not treat those permissions as encryption.
+Each configuration or history write uses a temporary file in its own destination directory followed
+by an atomic replace. On Unix, newly created directories are mode `0700` and files/backups are mode
+`0600`. Stable private `.lock` sidecars serialize each complete read/modify/write transaction across
+processes; a process that cannot acquire the lock within ten seconds exits with configuration status
+instead of overwriting a concurrent update. Do not treat those permissions as encryption.
+
+Platform directory environment variables must resolve to nonempty absolute paths. Empty or relative
+values are rejected rather than turning the current working directory into implicit persistent
+storage. On Windows, configuration uses `%LOCALAPPDATA%` when `%APPDATA%` is unavailable.
+
+## Locate or override application data
+
+History and future non-configuration state use a separate application-data root:
+
+| Platform | Default data root |
+| --- | --- |
+| Linux | `$XDG_DATA_HOME/meshquill`, or `$HOME/.local/share/meshquill` |
+| macOS | `$HOME/Library/Application Support/meshquill` |
+| Windows | `%LOCALAPPDATA%\meshquill`, falling back to `%APPDATA%\meshquill` |
+
+`--data-dir PATH` or `MESHQUILL_DATA_DIR` selects the exact data root without changing the
+configuration path. A relative explicit data root is resolved to an absolute path at process start;
+use the same stable override on every invocation.
 
 ## Select a profile
 
@@ -32,11 +52,30 @@ Profile selection uses this order:
 
 1. `--profile NAME`, or its `MESHQUILL_PROFILE` environment binding.
 2. The effective `default_profile`, which `MESHQUILL_DEFAULT_PROFILE` may override temporarily.
+3. The sole stored profile, when exactly one exists.
 
-If neither exists, a device command fails before connecting. Use `meshquill config show` to list
-profiles. `init` never overwrites a profile, and the first profile becomes the default. This RC has
-no general profile rename/delete command or command to select an existing profile as the persisted
-default; edit TOML carefully for those changes.
+With multiple profiles and no default, a device command fails before connecting; pass `--profile`
+or persist a choice. `init` never overwrites a profile and makes the new profile the default whenever
+no persisted default exists. `--set-default` explicitly replaces an existing default.
+
+Manage stored profiles without editing TOML:
+
+```console
+$ meshquill profiles list
+$ meshquill profiles reconfigure field --serial /dev/ttyACM0
+$ meshquill --yes profiles rename field field_unit
+$ meshquill --yes profiles delete field_unit
+$ meshquill profiles set-default gateway
+```
+
+`reconfigure` replaces only the transport, preserving that profile's timeout override and secret
+reference. Rename requires confirmation, updates a matching default and migrates retained history;
+it refuses to merge an existing destination history, which must first be inspected and explicitly
+cleared. External remote-credential hashes are identity-keyed and cannot be renamed automatically. Delete
+also requires confirmation and clears a matching default, but intentionally retains history and
+external credentials for recovery. Profile mutations require a current v1 configuration; migrate a
+versionless file first. `profile`, `edit`, and `remove` are convenience aliases for the canonical
+plural commands.
 
 ## Create profiles
 
@@ -45,6 +84,11 @@ Interactive setup prompts for a profile name and one transport:
 ```console
 $ meshquill init
 ```
+
+Choosing BLE or serial runs bounded five-second discovery, displays sorted reusable candidates, and
+accepts either a candidate number or a manual target. Discovery failure or an empty result falls
+back to manual entry rather than silently selecting a device. TCP remains explicit because the CLI
+does not scan the network for endpoints.
 
 Non-interactive setup requires `--name` and exactly one of `--ble`, `--serial`, `--tcp`, or
 `--demo`:
@@ -56,8 +100,9 @@ $ meshquill --non-interactive init --name gateway --tcp mesh.example:5000
 $ meshquill --non-interactive init --name demo --demo
 ```
 
-Names created by `init` start with an ASCII letter or `_` and contain only ASCII letters, digits,
-and `_`. The underlying schema also accepts `-` in manually authored names.
+Names are at most 64 ASCII bytes, start with an ASCII letter or `_`, and contain only ASCII letters,
+digits, `_`, and `-`. A leading `-` is rejected so a stored name cannot be confused with a
+command-line option.
 
 ## Minimal schema
 
@@ -145,14 +190,28 @@ max_messages = 256
 ```
 
 To retain full message text locally, set `enabled = true`. `max_messages` must be from 1 through
-100000. Entries are plaintext JSONL at `history/<profile>.jsonl` beside the selected config file.
-Disabling history stops new persistence but does not delete an existing file; inspect or remove it
+100000. With the platform-default configuration, entries are plaintext JSONL at
+`<data-root>/history/<profile>.jsonl`. Supplying the exact platform-default configuration path
+explicitly uses that same namespace. Any other `--config` or `MESHQUILL_CONFIG` path uses
+`<data-root>/history/<config-path-sha256>/<profile>.jsonl`, preventing unrelated configuration files
+from colliding. The digest is a namespace, not a security boundary. `history list --output json`
+reports the resolved canonical path.
+
+On first access, Meshquill reconciles an older config-adjacent history file with the canonical file
+under independent bounds, lets the canonical record win duplicate local UUIDs, durably writes the
+merged result, and only then removes the legacy file. Profile rename migrates history even when
+persistence is disabled; profile deletion intentionally retains it. Disabling history stops new
+persistence but does not delete an existing file; inspect or remove both canonical and legacy state
 with:
 
 ```console
 $ meshquill --profile field history list --limit 20
 $ meshquill --profile field --yes history clear
 ```
+
+Lowering `max_messages` immediately retains and rewrites only the newest permitted records on the
+next read. History reads have independent global line-size and entry-count bounds, so a previously
+larger file cannot force unbounded allocation.
 
 See [messaging and chat](messaging-and-chat.md#plaintext-local-history) for the recorded fields and
 status behavior.
@@ -175,14 +234,17 @@ Boolean overrides accept case-insensitive `1`, `true`, `yes`, or `on`, and `0`, 
 fails the command. Configuration-writing commands load the on-disk values without transient
 overrides, preventing an environment value from being written accidentally.
 
-`MESHQUILL_CONFIG` and `MESHQUILL_PROFILE` are global CLI bindings rather than TOML field overrides.
+`MESHQUILL_CONFIG`, `MESHQUILL_DATA_DIR`, and `MESHQUILL_PROFILE` are global CLI bindings rather
+than TOML field overrides.
 
 ## Hooks, MQTT, queues, and secrets
 
 The v1 schema also contains `hook`, `mqtt`, and `queues` sections. Hooks and MQTT are disabled by
 default; outbound MQTT sends are separately disabled by default. Use `meshquill mqtt configure` for
-broker settings so password input can go to the operating-system credential store instead of TOML
-or process arguments. Use `meshquill hooks validate` after manually enabling a trusted local hook.
+broker settings. `--password-stdin` stores a supplied password in the operating-system credential
+store; `--password-env NAME` stores only a validated environment-variable reference for later
+processes. Neither writes the password to TOML or argv. Use `meshquill hooks validate` after
+manually enabling a trusted local hook.
 
 Profile and MQTT secret fields store references (`credential_store`, `environment`, or `prompt`),
 not an intended place for plaintext secrets. `config show` reports only redacted secret status.

@@ -1,26 +1,635 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sol-aeternum/meshquill/schemas/meshquill-cli-v1.schema.json",
   "title": "Meshquill CLI v1 envelope",
-  "description": "The stable envelope shared by finite JSON results and JSONL stream records.",
+  "description": "Stable finite-result and JSONL record contract. Known record families validate their principal fields; additive data fields and unknown extension record types remain forward-compatible.",
   "type": "object",
-  "required": [
-    "schema",
-    "type",
-    "data"
-  ],
+  "required": ["schema", "type", "data"],
   "additionalProperties": false,
   "properties": {
-    "schema": {
-      "const": "meshquill.cli/v1"
-    },
+    "schema": { "const": "meshquill.cli/v1" },
     "type": {
       "type": "string",
       "minLength": 1,
       "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
     },
-    "data": {
+    "data": { "type": "object", "additionalProperties": true }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "advertise",
+              "batch_contacts",
+              "channel",
+              "channel_remove",
+              "channel_set",
+              "channels",
+              "contact",
+              "contact_export",
+              "contact_import",
+              "contact_path",
+              "contact_path_discovery",
+              "contact_path_reset",
+              "contact_path_set",
+              "contact_remove",
+              "contact_update",
+              "contacts",
+              "device",
+              "device_clock",
+              "device_reboot",
+              "firmware",
+              "history",
+              "history_cleared",
+              "inbox",
+              "network_discovery",
+              "network_scope",
+              "network_trace",
+              "remote_clock",
+              "remote_command",
+              "remote_credential_forgotten",
+              "remote_login",
+              "remote_logout",
+              "remote_neighbours",
+              "remote_owner",
+              "remote_regions",
+              "remote_status",
+              "sensor_acl",
+              "sensor_summary",
+              "sensor_telemetry",
+              "telemetry"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": { "data": { "$ref": "#/$defs/profile_data" } }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "configuration_initialized" } } },
+      "then": {
+        "properties": { "data": { "$ref": "#/$defs/configuration_initialized_data" } }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "status" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/status_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "connection" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/connection_data" } } }
+    },
+    {
+      "if": {
+        "properties": { "type": { "enum": ["device", "firmware"] } }
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/device_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "contacts" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/contacts_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "contact" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/contact_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "send" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/send_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "inbox" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/inbox_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "history" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/history_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "network_discovery" } } },
+      "then": {
+        "properties": { "data": { "$ref": "#/$defs/network_discovery_data" } }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "batch_contacts" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/batch_contacts_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "configuration" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/configuration_data" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "enum": ["configuration_migration", "configuration_repair"] }
+        }
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/configuration_change_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "legacy_configuration_import" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/legacy_import_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "profiles" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/profiles_data" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "profile_default_set",
+              "profile_deleted",
+              "profile_reconfigured"
+            ]
+          }
+        }
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/profile_mutation_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "profile_renamed" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/profile_renamed_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "profile_reconfigured" } } },
+      "then": {
+        "properties": { "data": { "$ref": "#/$defs/profile_reconfigured_data" } }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "profile_deleted" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/profile_deleted_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "devices" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/devices_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "doctor" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/doctor_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "batch_run" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/batch_run_data" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "enum": ["hook_status", "hook_test", "hook_validation"] }
+        }
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/nonempty_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "hook_status" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/hook_status_data" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "enum": ["mqtt_configuration", "mqtt_status", "mqtt_test"] }
+        }
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/mqtt_result_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "mqtt_status" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/mqtt_status_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "event" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/event_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "chat" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/chat_data" } } }
+    },
+    {
+      "if": {
+        "properties": { "type": { "enum": ["meshcore_event", "mqtt_connection"] } }
+      },
+      "then": { "properties": { "data": { "$ref": "#/$defs/nonempty_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "mqtt_command" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/mqtt_command_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "mqtt_command_rejected" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/mqtt_rejection_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "mqtt_diagnostic" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/mqtt_diagnostic_data" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "manpages" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/files_data" } } }
+    }
+  ],
+  "$defs": {
+    "nonempty_data": {
       "type": "object",
+      "minProperties": 1,
       "additionalProperties": true
+    },
+    "profile_data": {
+      "type": "object",
+      "required": ["profile"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "configuration_initialized_data": {
+      "type": "object",
+      "required": ["profile", "config_path", "default", "transport"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "config_path": { "type": "string", "minLength": 1 },
+        "default": { "type": "boolean" },
+        "transport": { "type": "string", "minLength": 1 }
+      }
+    },
+    "status_data": {
+      "type": "object",
+      "required": ["profile", "config_path", "transport", "needs_migration"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "config_path": { "type": "string", "minLength": 1 },
+        "transport": { "type": "string", "minLength": 1 },
+        "needs_migration": { "type": "boolean" }
+      }
+    },
+    "connection_data": {
+      "type": "object",
+      "required": ["profile", "transport", "connected", "self_info"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "transport": { "type": "string", "minLength": 1 },
+        "connected": { "type": "boolean" },
+        "self_info": { "type": "object" }
+      }
+    },
+    "device_data": {
+      "type": "object",
+      "required": ["profile", "self_info", "device_info"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "self_info": { "type": "object" },
+        "device_info": { "type": "object" }
+      }
+    },
+    "contacts_data": {
+      "type": "object",
+      "required": ["profile", "refreshed", "refresh_requested", "contacts"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "refreshed": { "const": true },
+        "refresh_requested": { "type": "boolean" },
+        "contacts": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "contact_data": {
+      "type": "object",
+      "required": [
+        "profile",
+        "name",
+        "public_key",
+        "kind",
+        "flags",
+        "route",
+        "path",
+        "last_advert",
+        "lastmod"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "public_key": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "kind": { "type": "string", "minLength": 1 },
+        "flags": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "route": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "pattern": "^(?:[0-9a-f]{2})*$" },
+        "last_advert": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "lastmod": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "send_data": {
+      "type": "object",
+      "required": [
+        "destination",
+        "channel",
+        "queued",
+        "ack_code",
+        "acknowledged",
+        "trip_time_ms"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "destination": { "type": "string", "minLength": 1 },
+        "channel": { "type": ["integer", "null"], "minimum": 0, "maximum": 255 },
+        "queued": { "type": "boolean" },
+        "ack_code": { "type": ["string", "null"], "pattern": "^[0-9a-f]{8}$" },
+        "acknowledged": { "type": "boolean" },
+        "trip_time_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "inbox_data": {
+      "type": "object",
+      "required": ["profile", "messages", "drained"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "messages": { "type": "array", "items": { "type": "object" } },
+        "drained": { "type": "boolean" }
+      }
+    },
+    "history_data": {
+      "type": "object",
+      "required": ["profile", "enabled", "storage", "path", "entries"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "enabled": { "type": "boolean" },
+        "storage": { "const": "plaintext_opt_in" },
+        "path": { "type": "string", "minLength": 1 },
+        "entries": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "network_discovery_data": {
+      "type": "object",
+      "required": ["profile", "filter", "scope", "timeout_ms", "nodes"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "filter": { "type": "string", "minLength": 1 },
+        "scope": { "type": ["string", "null"] },
+        "timeout_ms": { "type": "integer", "minimum": 0 },
+        "nodes": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "batch_contacts_data": {
+      "type": "object",
+      "required": ["profile", "operation", "dry_run", "target_count", "targets"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "dry_run": { "type": "boolean" },
+        "target_count": { "type": "integer", "minimum": 0 },
+        "targets": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "configuration_data": {
+      "type": "object",
+      "required": ["path", "needs_migration", "effective"],
+      "additionalProperties": true,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "needs_migration": { "type": "boolean" },
+        "effective": { "type": "object" }
+      }
+    },
+    "configuration_change_data": {
+      "type": "object",
+      "required": ["path", "changed"],
+      "additionalProperties": true,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "changed": { "type": "boolean" },
+        "backup_path": { "type": ["string", "null"] }
+      }
+    },
+    "legacy_import_data": {
+      "type": "object",
+      "required": ["source", "config_path", "profile", "default", "transport"],
+      "additionalProperties": true,
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "config_path": { "type": "string", "minLength": 1 },
+        "profile": { "type": "string", "minLength": 1 },
+        "default": { "type": "boolean" },
+        "transport": { "type": "string", "minLength": 1 }
+      }
+    },
+    "profiles_data": {
+      "type": "object",
+      "required": ["profiles", "default_profile"],
+      "additionalProperties": true,
+      "properties": {
+        "profiles": { "type": "array", "items": { "type": "object" } },
+        "default_profile": { "type": ["string", "null"] }
+      }
+    },
+    "profile_mutation_data": {
+      "type": "object",
+      "required": ["profile"],
+      "additionalProperties": true,
+      "properties": { "profile": { "type": "string", "minLength": 1 } }
+    },
+    "profile_renamed_data": {
+      "type": "object",
+      "required": ["old", "new", "default", "history_migrated", "warning"],
+      "additionalProperties": true,
+      "properties": {
+        "old": { "type": "string", "minLength": 1 },
+        "new": { "type": "string", "minLength": 1 },
+        "default": { "type": "boolean" },
+        "history_migrated": { "type": "boolean" },
+        "warning": { "type": "string", "minLength": 1 }
+      }
+    },
+    "profile_reconfigured_data": {
+      "type": "object",
+      "required": ["profile", "transport", "default"],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "transport": { "type": "string", "minLength": 1 },
+        "default": { "type": "boolean" }
+      }
+    },
+    "profile_deleted_data": {
+      "type": "object",
+      "required": [
+        "profile",
+        "default_cleared",
+        "history_retained",
+        "credentials_retained"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "profile": { "type": "string", "minLength": 1 },
+        "default_cleared": { "type": "boolean" },
+        "history_retained": { "type": "boolean" },
+        "credentials_retained": { "type": "boolean" }
+      }
+    },
+    "devices_data": {
+      "type": "object",
+      "required": ["devices", "mock_profiles", "diagnostics"],
+      "additionalProperties": true,
+      "properties": {
+        "devices": { "type": "array" },
+        "mock_profiles": { "type": "array", "items": { "type": "string" } },
+        "diagnostics": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "doctor_data": {
+      "type": "object",
+      "required": ["healthy", "repaired", "checks"],
+      "additionalProperties": true,
+      "properties": {
+        "healthy": { "type": "boolean" },
+        "repaired": { "type": "boolean" },
+        "checks": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "batch_run_data": {
+      "type": "object",
+      "required": ["file", "command_count", "results"],
+      "additionalProperties": true,
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "command_count": { "type": "integer", "minimum": 0 },
+        "results": { "type": "array" }
+      }
+    },
+    "mqtt_result_data": {
+      "type": "object",
+      "required": ["schema", "host", "port"],
+      "additionalProperties": true,
+      "properties": {
+        "schema": { "const": "meshquill.mqtt/v1" },
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "hook_status_data": {
+      "type": "object",
+      "required": [
+        "protocol",
+        "enabled",
+        "configured",
+        "observational_failure",
+        "before_send_failure"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "protocol": { "const": "meshquill.hook/v1" },
+        "enabled": { "type": "boolean" },
+        "configured": { "type": "boolean" },
+        "observational_failure": { "enum": ["open", "closed"] },
+        "before_send_failure": { "enum": ["open", "closed"] }
+      }
+    },
+    "mqtt_status_data": {
+      "type": "object",
+      "required": [
+        "schema",
+        "enabled",
+        "configured",
+        "host",
+        "port",
+        "protocol",
+        "qos",
+        "tls",
+        "custom_ca",
+        "client_identity",
+        "authentication",
+        "topic_prefix",
+        "allow_send",
+        "broker_state"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "schema": { "const": "meshquill.mqtt/v1" },
+        "enabled": { "type": "boolean" },
+        "configured": { "type": "boolean" },
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "protocol": { "enum": ["3.1.1", "5"] },
+        "qos": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "tls": { "type": "boolean" },
+        "custom_ca": { "type": "boolean" },
+        "client_identity": { "type": "boolean" },
+        "authentication": { "type": "boolean" },
+        "topic_prefix": { "type": "string", "minLength": 1 },
+        "allow_send": { "type": "boolean" },
+        "broker_state": { "type": "string", "minLength": 1 }
+      }
+    },
+    "event_data": {
+      "type": "object",
+      "required": ["event", "data"],
+      "additionalProperties": true,
+      "properties": {
+        "event": { "type": "string", "minLength": 1 },
+        "data": { "type": "object" }
+      }
+    },
+    "chat_data": {
+      "type": "object",
+      "required": ["state"],
+      "additionalProperties": true,
+      "properties": {
+        "state": { "type": "string", "minLength": 1 },
+        "destination": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "text": { "type": "string" },
+        "message_id": { "type": "string", "format": "uuid" }
+      },
+      "if": { "properties": { "state": { "const": "incoming" } } },
+      "then": { "required": ["source", "text", "message_id"] },
+      "else": { "required": ["destination"] }
+    },
+    "mqtt_command_data": {
+      "type": "object",
+      "required": ["event_id", "command", "queued"],
+      "additionalProperties": true,
+      "properties": {
+        "event_id": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "queued": { "type": "boolean" }
+      }
+    },
+    "mqtt_rejection_data": {
+      "type": "object",
+      "required": ["accepted", "reason"],
+      "additionalProperties": true,
+      "properties": {
+        "accepted": { "const": false },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "mqtt_diagnostic_data": {
+      "type": "object",
+      "required": ["reason"],
+      "additionalProperties": true,
+      "properties": { "reason": { "type": "string", "minLength": 1 } }
+    },
+    "files_data": {
+      "type": "object",
+      "required": ["files"],
+      "additionalProperties": true,
+      "properties": { "files": { "type": "array", "items": { "type": "string" } } }
     }
   }
 }

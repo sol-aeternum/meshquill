@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "release tags must be semantic versions such as v0.1.0-rc.2" >&2
+            echo "release tags must be semantic versions such as v1.2.3-rc.1" >&2
             exit 2
           fi
           expected=${GITHUB_REF_NAME#v}
@@ -100,9 +100,16 @@ jobs:
           test -s "$root/LICENSE-APACHE"
           test -s "$root/docs/getting-started.md"
           test -s "$root/schemas/meshquill-cli-v1.schema.json"
+          test -s "$root/schemas/meshquill-hook-v1.schema.json"
+          test -s "$root/schemas/meshquill-mqtt-v1.schema.json"
           test -s "$root/schemas/compat/cli-v1-result.json"
+          test -s "$root/schemas/compat/cli-v1-known.jsonl"
           test -s "$root/schemas/compat/cli-v1-stream.jsonl"
+          test -s "$root/schemas/compat/hook-v1-valid.jsonl"
+          test -s "$root/schemas/compat/mqtt-v1-valid.jsonl"
+          test -s "$root/schemas/compat/mqtt-v1-invalid.jsonl"
           test -s "$root/share/completions/meshquill.bash"
+          test "$(find "$root/share/man/man1" -maxdepth 1 -type f -name '*.1' | wc -l)" -eq 83
           grep -Fq "${GITHUB_REF_NAME#v}" "$root/share/man/man1/meshquill-send.1"
           "$binary" --config "$smoke/config.toml" --non-interactive init --name demo --demo --set-default
           "$binary" --config "$smoke/config.toml" device info
@@ -122,11 +129,12 @@ jobs:
           $binary = Join-Path $root "bin/meshquill.exe"
           $version = ($env:GITHUB_REF_NAME).Substring(1)
           if ((& $binary --version) -ne "meshquill $version") { throw "version mismatch" }
-          foreach ($required in @("LICENSE-MIT", "LICENSE-APACHE", "docs/getting-started.md", "schemas/meshquill-cli-v1.schema.json", "schemas/compat/cli-v1-result.json", "schemas/compat/cli-v1-stream.jsonl", "share/completions/_meshquill.ps1", "share/man/man1/meshquill-send.1")) {
+          foreach ($required in @("LICENSE-MIT", "LICENSE-APACHE", "docs/getting-started.md", "schemas/meshquill-cli-v1.schema.json", "schemas/meshquill-hook-v1.schema.json", "schemas/meshquill-mqtt-v1.schema.json", "schemas/compat/cli-v1-result.json", "schemas/compat/cli-v1-known.jsonl", "schemas/compat/cli-v1-stream.jsonl", "schemas/compat/hook-v1-valid.jsonl", "schemas/compat/mqtt-v1-valid.jsonl", "schemas/compat/mqtt-v1-invalid.jsonl", "share/completions/_meshquill.ps1", "share/man/man1/meshquill-send.1")) {
             $requiredPath = Join-Path $root $required
             if (!(Test-Path -LiteralPath $requiredPath -PathType Leaf)) { throw "missing $required" }
             if ((Get-Item -LiteralPath $requiredPath).Length -eq 0) { throw "empty $required" }
           }
+          if ((Get-ChildItem -LiteralPath (Join-Path $root "share/man/man1") -Filter "*.1" -File).Count -ne 83) { throw "manpage count mismatch" }
           if (!(Select-String -SimpleMatch $version -Path (Join-Path $root "share/man/man1/meshquill-send.1") -Quiet)) { throw "manpage version mismatch" }
           $config = Join-Path $smoke "config.toml"
           & $binary --config $config --non-interactive init --name demo --demo --set-default

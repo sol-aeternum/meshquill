@@ -255,4 +255,30 @@ mod tests {
         ));
         assert!(bytes.is_empty());
     }
+
+    #[test]
+    fn decoder_retains_the_defensive_300_byte_declared_frame_bound() {
+        let accepted_length = u16::try_from(MAX_OUTER_PAYLOAD)
+            .expect("test length")
+            .to_le_bytes();
+        let mut accepted = vec![DEVICE_FRAME_PREFIX, accepted_length[0], accepted_length[1]];
+        accepted.extend_from_slice(&[0_u8; MAX_OUTER_PAYLOAD]);
+        let frames = decode_frames(&accepted).expect("300-byte declared frame remains decodable");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.len(), MAX_OUTER_PAYLOAD);
+
+        let rejected_len = MAX_OUTER_PAYLOAD + 1;
+        let length = u16::try_from(rejected_len)
+            .expect("test length")
+            .to_le_bytes();
+        let mut rejected = vec![DEVICE_FRAME_PREFIX, length[0], length[1]];
+        rejected.extend_from_slice(&[0_u8; MAX_OUTER_PAYLOAD + 1]);
+        assert!(matches!(
+            decode_frames(&rejected),
+            Err(CoreError::Parse(ParseError::OversizedPacketPayload {
+                actual,
+                maximum: MAX_OUTER_PAYLOAD,
+            })) if actual == rejected_len
+        ));
+    }
 }

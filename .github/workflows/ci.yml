@@ -170,6 +170,7 @@ jobs:
         if: matrix.python == '3.14'
         working-directory: crates/meshquill-python
         run: |
+          cargo build --locked --package meshquill --bin meshquill
           python -m pytest
           python examples/quickstart.py
           python examples/streaming.py
@@ -269,6 +270,7 @@ jobs:
           cargo test --locked --package meshquill-mqtt --test mosquitto -- --ignored --exact mosquitto_v5_roundtrip_uses_real_subscription_and_publication
           cargo test --locked --package meshquill-mqtt --test mosquitto -- --ignored --exact mosquitto_tls_auth_and_mtls_enforce_all_peer_checks
           cargo test --locked --package meshquill --test mqtt_bridge -- --ignored --exact mqtt_bridge_with_real_broker_roundtrip_send_direct_to_demo_destination
+          cargo test --locked --package meshquill --test mqtt_bridge -- --ignored --exact persisted_cli_tls_mtls_and_environment_secret_connect_in_a_fresh_process
       - name: Stop disposable brokers
         if: always()
         run: |

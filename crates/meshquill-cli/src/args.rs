@@ -26,6 +26,10 @@ pub struct Cli {
     #[arg(long, global = true, env = "MESHQUILL_CONFIG")]
     pub config: Option<PathBuf>,
 
+    /// Application data directory override for local history and other non-config state.
+    #[arg(long, global = true, env = "MESHQUILL_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+
     /// Output contract. Streams require jsonl rather than json.
     #[arg(long, global = true, value_enum, default_value_t = OutputMode::Human)]
     pub output: OutputMode,
@@ -136,6 +140,9 @@ pub enum Command {
         after_help = "Examples:\n  meshquill init\n  meshquill init --non-interactive --name field --tcp 192.0.2.10:5000 --set-default"
     )]
     Init(InitArgs),
+    /// List and manage stored device profiles.
+    #[command(subcommand, visible_alias = "profile")]
+    Profiles(ProfileCommand),
     /// Discover BLE and serial devices, or list configured TCP profiles.
     #[command(
         after_help = "Examples:\n  meshquill devices\n  meshquill devices --transport ble --scan-timeout 8s\n  meshquill devices --output json"
@@ -245,6 +252,70 @@ pub struct InitArgs {
     /// Select this profile as the default.
     #[arg(long)]
     pub set_default: bool,
+}
+
+/// Stored profile operations.
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommand {
+    /// List stored profiles without applying environment overrides.
+    List,
+    /// Replace one profile's transport while preserving its local settings and secret reference.
+    #[command(visible_alias = "edit")]
+    Reconfigure(ProfileReconfigureArgs),
+    /// Rename a profile and migrate its local history.
+    Rename {
+        /// Existing profile name.
+        old: String,
+        /// New profile name.
+        new: String,
+    },
+    /// Delete a profile while retaining its history and credentials for recovery.
+    #[command(visible_alias = "remove")]
+    Delete {
+        /// Profile to remove.
+        name: String,
+    },
+    /// Select the named profile as the default.
+    SetDefault {
+        /// Existing profile name.
+        name: String,
+    },
+}
+
+/// Replacement transport for `profiles reconfigure`.
+#[derive(Debug, Args)]
+#[group(skip)]
+pub struct ProfileReconfigureArgs {
+    /// Profile to update.
+    pub name: String,
+    /// BLE device identifier or address.
+    #[arg(
+        long,
+        required_unless_present_any = ["serial", "tcp", "demo"],
+        conflicts_with_all = ["serial", "tcp", "demo"]
+    )]
+    pub ble: Option<String>,
+    /// Serial port path or Windows COM name.
+    #[arg(
+        long,
+        required_unless_present_any = ["ble", "tcp", "demo"],
+        conflicts_with_all = ["ble", "tcp", "demo"]
+    )]
+    pub serial: Option<String>,
+    /// TCP endpoint in HOST:PORT form.
+    #[arg(
+        long,
+        required_unless_present_any = ["ble", "serial", "demo"],
+        conflicts_with_all = ["ble", "serial", "demo"]
+    )]
+    pub tcp: Option<String>,
+    /// Select the deterministic demo transport.
+    #[arg(
+        long,
+        required_unless_present_any = ["ble", "serial", "tcp"],
+        conflicts_with_all = ["ble", "serial", "tcp"]
+    )]
+    pub demo: bool,
 }
 
 /// Device discovery inputs.
@@ -826,10 +897,25 @@ pub struct MqttConfigureArgs {
     #[arg(long, conflicts_with = "clear_auth")]
     pub username: Option<String>,
     /// Read one bounded password from stdin instead of exposing it in argv.
-    #[arg(long, requires = "username", conflicts_with = "clear_auth")]
+    #[arg(
+        long,
+        requires = "username",
+        conflicts_with_all = ["password_env", "clear_auth"]
+    )]
     pub password_stdin: bool,
+    /// Resolve the broker password from a named environment variable at runtime.
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "username",
+        conflicts_with_all = ["password_stdin", "clear_auth"]
+    )]
+    pub password_env: Option<String>,
     /// Remove configured broker authentication and its managed credential.
-    #[arg(long, conflicts_with_all = ["username", "password_stdin"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["username", "password_stdin", "password_env"]
+    )]
     pub clear_auth: bool,
     /// Prefix to prepend to broker topics.
     #[arg(long, default_value = "meshquill")]
@@ -875,11 +961,11 @@ fn parse_hash_bytes(value: &str) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, ColorMode, Command, OutputMode};
+    use super::{Cli, ColorMode, Command, OutputMode, ProfileCommand, ProfileReconfigureArgs};
 
     #[test]
     fn command_definition_is_internally_consistent() {
@@ -940,6 +1026,76 @@ mod tests {
             "localhost:5000",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_profile_commands_aliases_and_data_directory() {
+        let list = Cli::try_parse_from([
+            "meshquill",
+            "--data-dir",
+            "/tmp/meshquill-data",
+            "profile",
+            "list",
+        ])
+        .expect("visible profile alias");
+        assert_eq!(list.data_dir, Some(PathBuf::from("/tmp/meshquill-data")));
+        assert!(matches!(
+            list.command,
+            Command::Profiles(ProfileCommand::List)
+        ));
+
+        let edit = Cli::try_parse_from([
+            "meshquill",
+            "profiles",
+            "edit",
+            "field",
+            "--tcp",
+            "localhost:5000",
+        ])
+        .expect("visible edit alias");
+        assert!(matches!(
+            edit.command,
+            Command::Profiles(ProfileCommand::Reconfigure(ProfileReconfigureArgs {
+                name,
+                tcp: Some(_),
+                ..
+            })) if name == "field"
+        ));
+
+        let remove = Cli::try_parse_from(["meshquill", "profiles", "remove", "field"])
+            .expect("visible remove alias");
+        assert!(matches!(
+            remove.command,
+            Command::Profiles(ProfileCommand::Delete { name }) if name == "field"
+        ));
+    }
+
+    #[test]
+    fn profile_reconfigure_requires_exactly_one_transport() {
+        assert!(Cli::try_parse_from(["meshquill", "profiles", "reconfigure", "field"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "meshquill",
+                "profiles",
+                "reconfigure",
+                "field",
+                "--demo",
+                "--serial",
+                "/dev/ttyUSB0",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "meshquill",
+                "profiles",
+                "reconfigure",
+                "field",
+                "--ble",
+                "selector",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

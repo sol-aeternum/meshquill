@@ -146,6 +146,11 @@ impl From<StoreError> for CliError {
                 "the platform configuration directory could not be resolved",
             )
             .with_hint("Set --config (or MESHQUILL_CONFIG) to an explicit file path."),
+            StoreError::LockTimeout { path } => Self::new(
+                ExitStatus::Configuration,
+                format!("another process is still updating {}", path.display()),
+            )
+            .with_hint("Wait for the other Meshquill process to finish, then retry."),
             StoreError::PromptRequired => Self::new(
                 ExitStatus::Authentication,
                 "a credential requires an interactive prompt",

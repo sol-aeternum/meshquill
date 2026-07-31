@@ -16,6 +16,7 @@ mod interrupt;
 mod mqtt_cli;
 /// Stable output serialization and exit-code contracts.
 pub mod output;
+mod profiles;
 mod reconnect;
 mod remote_cli;
 mod runtime;

@@ -8,14 +8,14 @@ use zeroize::Zeroizing;
 
 use crate::domain::{
     Ack, AdvertPath, AutoAddConfig, BatteryInfo, BinaryResponse, ChannelInfo, CommandTracking,
-    Contact, ContactRoute, ContactUri, CustomVariables, DefaultFloodScope, DeviceInfo, DeviceStats,
-    Event, FloodScope, FrequencyRange, LoginSession, Message, Path, PathDiscovery,
-    PrivateKeyMaterial, RadioParams, RemoteStatus, SelfInfo, Signature, StatsType,
+    Contact, ContactRoute, ContactSnapshot, ContactUri, CustomVariables, DefaultFloodScope,
+    DeviceInfo, DeviceStats, Event, FloodScope, FrequencyRange, LoginSession, Message, Path,
+    PathDiscovery, PrivateKeyMaterial, RadioParams, RemoteStatus, SelfInfo, Signature, StatsType,
     TelemetryResponse, TuningParams,
 };
 use crate::error::{CoreError, TransportError};
 use crate::protocol::{Command, MAX_INNER_PAYLOAD, Packet};
-use crate::transport::{ReconnectableTransport, Transport};
+use crate::transport::{ReadyRead, ReconnectableTransport, Transport};
 
 /// Default request timeout used when waiting for companion replies.
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +26,7 @@ pub const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 const CLIENT_COMPLETED_ACK_CAPACITY: usize = 256;
 const CLIENT_PENDING_ACK_CAPACITY: usize = 256;
+const CLIENT_SYNC_READY_DRAIN_CAPACITY: usize = 256;
 const MAX_REMOTE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNING_CHUNK_BYTES: usize = 120;
 
@@ -33,6 +34,23 @@ enum PacketWait<T> {
     Ready(T),
     Continue(Packet),
     Fail(CoreError),
+}
+
+enum ReadySync {
+    Message(Message),
+    NoMoreMessages,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncState {
+    Idle,
+    AwaitingResponse,
+}
+
+struct ContactCollection {
+    contacts: Vec<Contact>,
+    lastmod: Option<u32>,
 }
 
 /// Core client state machine for companion operations.
@@ -45,6 +63,9 @@ pub struct Client<T: Transport> {
     pending_ack_order: VecDeque<[u8; 4]>,
     completed_acks: HashMap<[u8; 4], Ack>,
     completed_ack_order: VecDeque<[u8; 4]>,
+    next_message_observation_id: u64,
+    sync_state: SyncState,
+    deferred_sync: Option<ReadySync>,
 }
 
 impl<T> Client<T>
@@ -76,6 +97,9 @@ where
             pending_ack_order: VecDeque::new(),
             completed_acks: HashMap::new(),
             completed_ack_order: VecDeque::new(),
+            next_message_observation_id: 1,
+            sync_state: SyncState::Idle,
+            deferred_sync: None,
         }
     }
 
@@ -109,6 +133,7 @@ where
     /// unexpectedly.
     pub async fn connect(&mut self) -> Result<SelfInfo, CoreError> {
         self.clear_tracking();
+        self.clear_sync_tracking();
         self.transport.connect().await?;
         self.connected = true;
         match self.init().await {
@@ -205,6 +230,7 @@ where
     pub async fn next_event(&mut self) -> Result<Option<Event>, CoreError> {
         self.ensure_connected()?;
         let packet = self.read_next_packet().await?;
+        self.retain_sync_response(&packet);
         self.update_tracking(&packet);
         let Some(event) = packet.into_event() else {
             return Ok(None);
@@ -215,11 +241,44 @@ where
 
     /// Lists contacts from firmware.
     ///
+    /// This compatibility helper discards the response-level last-modified
+    /// marker. Call [`Self::list_contacts_snapshot`] when that marker is needed.
+    ///
     /// # Errors
     /// Returns `CoreError::Disconnected` when transport is unavailable, `CoreError::Timeout` when no
     /// complete response arrives in time, `CoreError::ProtocolInvariant` for firmware error packets, or
     /// `CoreError::Parse` when packet decoding fails.
     pub async fn list_contacts(&mut self, lastmod: Option<u32>) -> Result<Vec<Contact>, CoreError> {
+        Ok(self.collect_contacts(lastmod).await?.contacts)
+    }
+
+    /// Lists contacts and preserves the firmware snapshot sequence marker.
+    ///
+    /// # Errors
+    /// Returns `CoreError::Disconnected` when transport is unavailable, `CoreError::Timeout` when no
+    /// complete response arrives in time, `CoreError::ProtocolInvariant` when the firmware does not
+    /// terminate the response with a marker or returns an error packet, or `CoreError::Parse` when
+    /// packet decoding fails.
+    pub async fn list_contacts_snapshot(
+        &mut self,
+        lastmod: Option<u32>,
+    ) -> Result<ContactSnapshot, CoreError> {
+        let collection = self.collect_contacts(lastmod).await?;
+        let Some(lastmod) = collection.lastmod else {
+            return Err(CoreError::ProtocolInvariant(
+                "contact snapshot ended without a last-modified marker",
+            ));
+        };
+        Ok(ContactSnapshot {
+            contacts: collection.contacts,
+            lastmod,
+        })
+    }
+
+    async fn collect_contacts(
+        &mut self,
+        lastmod: Option<u32>,
+    ) -> Result<ContactCollection, CoreError> {
         self.ensure_connected()?;
         self.send_only(Command::get_contacts(lastmod)).await?;
 
@@ -228,7 +287,18 @@ where
             let packet = self.read_next_packet_with_timeout().await?;
             match packet {
                 Packet::Contact(contact) => contacts.push(contact),
-                Packet::ContactEnd { .. } | Packet::NoMoreMsgs => return Ok(contacts),
+                Packet::ContactEnd { lastmod } => {
+                    return Ok(ContactCollection {
+                        contacts,
+                        lastmod: Some(lastmod),
+                    });
+                }
+                Packet::NoMoreMsgs => {
+                    return Ok(ContactCollection {
+                        contacts,
+                        lastmod: None,
+                    });
+                }
                 Packet::Error(_code) => {
                     return Err(CoreError::ProtocolInvariant(
                         "contact request returned an error",
@@ -1114,20 +1184,44 @@ where
     /// `CoreError::Parse` when packet decoding fails.
     pub async fn sync_next_message(&mut self) -> Result<Option<Message>, CoreError> {
         self.ensure_connected()?;
-        self.send_only(Command::sync_next_message()).await?;
+        if let Some(ready) = self.deferred_sync.take() {
+            return Self::ready_sync_result(ready);
+        }
+        if let Some(ready) = self.drain_ready_packets_before_sync()? {
+            return Self::ready_sync_result(ready);
+        }
+        if self.sync_state == SyncState::AwaitingResponse {
+            return self.wait_for_sync_response().await;
+        }
+
+        // Set the state before awaiting the transport write. Dropping this future after the write
+        // may otherwise leave an untracked response that a later command could misattribute.
+        self.sync_state = SyncState::AwaitingResponse;
+        self.write_raw(Command::sync_next_message().into_encoded())
+            .await?;
+        self.wait_for_sync_response().await
+    }
+
+    async fn wait_for_sync_response(&mut self) -> Result<Option<Message>, CoreError> {
         loop {
             let packet = self.read_next_packet_with_timeout().await?;
             match packet {
                 Packet::ContactMsg(message) => {
+                    self.sync_state = SyncState::Idle;
                     self.publish_event(&Packet::ContactMsg(message.clone()));
                     return Ok(Some(message));
                 }
                 Packet::ChannelMsg(message) => {
+                    self.sync_state = SyncState::Idle;
                     self.publish_event(&Packet::ChannelMsg(message.clone()));
                     return Ok(Some(message));
                 }
-                Packet::NoMoreMsgs => return Ok(None),
+                Packet::NoMoreMsgs => {
+                    self.sync_state = SyncState::Idle;
+                    return Ok(None);
+                }
                 Packet::Error(_code) => {
+                    self.sync_state = SyncState::Idle;
                     return Err(CoreError::ProtocolInvariant(
                         "sync next message returned an error",
                     ));
@@ -1317,6 +1411,15 @@ where
     }
 
     async fn send_raw(&mut self, payload: Vec<u8>) -> Result<(), CoreError> {
+        if self.sync_state == SyncState::AwaitingResponse {
+            return Err(CoreError::ProtocolInvariant(
+                "a prior inbox synchronization response must be reconciled before another command",
+            ));
+        }
+        self.write_raw(payload).await
+    }
+
+    async fn write_raw(&mut self, payload: Vec<u8>) -> Result<(), CoreError> {
         let payload = Zeroizing::new(payload);
         if payload.is_empty() {
             return Err(CoreError::ProtocolInvariant(
@@ -1404,7 +1507,100 @@ where
             }
         };
 
-        Packet::parse(&raw).map_err(CoreError::Parse)
+        self.parse_packet(&raw)
+    }
+
+    fn drain_ready_packets_before_sync(&mut self) -> Result<Option<ReadySync>, CoreError> {
+        // Valid asynchronous PUSH_CODE packets are published before a fresh command. A ready
+        // message or terminal packet is conservatively treated as a late response to an earlier
+        // cancelled or timed-out sync, because response packets have no request tag.
+        for index in 0..=CLIENT_SYNC_READY_DRAIN_CAPACITY {
+            let raw = match self.transport.try_read() {
+                Ok(ReadyRead::Pending) => return Ok(None),
+                Ok(ReadyRead::Closed) => {
+                    self.mark_disconnected();
+                    return Err(CoreError::Disconnected);
+                }
+                Ok(ReadyRead::Packet(raw)) => raw,
+                Err(error) => {
+                    if is_disconnect_error(&error) {
+                        self.mark_disconnected();
+                    }
+                    return Err(CoreError::Transport(error));
+                }
+            };
+            let packet = self.parse_packet(&raw)?;
+            match packet {
+                Packet::ContactMsg(message) => {
+                    self.sync_state = SyncState::Idle;
+                    self.publish_event(&Packet::ContactMsg(message.clone()));
+                    return Ok(Some(ReadySync::Message(message)));
+                }
+                Packet::ChannelMsg(message) => {
+                    self.sync_state = SyncState::Idle;
+                    self.publish_event(&Packet::ChannelMsg(message.clone()));
+                    return Ok(Some(ReadySync::Message(message)));
+                }
+                Packet::NoMoreMsgs => {
+                    self.sync_state = SyncState::Idle;
+                    return Ok(Some(ReadySync::NoMoreMessages));
+                }
+                Packet::Error(_code) => {
+                    self.sync_state = SyncState::Idle;
+                    return Ok(Some(ReadySync::Error));
+                }
+                other => {
+                    self.publish_event(&other);
+                    self.update_tracking(&other);
+                }
+            }
+            if index == CLIENT_SYNC_READY_DRAIN_CAPACITY {
+                return Err(CoreError::ProtocolInvariant(
+                    "too many buffered packets before inbox synchronization",
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    fn retain_sync_response(&mut self, packet: &Packet) {
+        if self.sync_state != SyncState::AwaitingResponse {
+            return;
+        }
+        let ready = match packet {
+            Packet::ContactMsg(message) | Packet::ChannelMsg(message) => {
+                Some(ReadySync::Message(message.clone()))
+            }
+            Packet::NoMoreMsgs => Some(ReadySync::NoMoreMessages),
+            Packet::Error(_) => Some(ReadySync::Error),
+            _ => None,
+        };
+        if let Some(ready) = ready {
+            self.deferred_sync = Some(ready);
+            self.sync_state = SyncState::Idle;
+        }
+    }
+
+    fn ready_sync_result(ready: ReadySync) -> Result<Option<Message>, CoreError> {
+        match ready {
+            ReadySync::Message(message) => Ok(Some(message)),
+            ReadySync::NoMoreMessages => Ok(None),
+            ReadySync::Error => Err(CoreError::ProtocolInvariant(
+                "sync next message returned an error",
+            )),
+        }
+    }
+
+    fn parse_packet(&mut self, raw: &[u8]) -> Result<Packet, CoreError> {
+        let mut packet = Packet::parse(raw).map_err(CoreError::Parse)?;
+        if let Packet::ContactMsg(message) | Packet::ChannelMsg(message) = &mut packet {
+            message.observation_id = Some(self.next_message_observation_id);
+            self.next_message_observation_id = self.next_message_observation_id.wrapping_add(1);
+            if self.next_message_observation_id == 0 {
+                self.next_message_observation_id = 1;
+            }
+        }
+        Ok(packet)
     }
 
     async fn read_next_packet_with_timeout(&mut self) -> Result<Packet, CoreError> {
@@ -1413,7 +1609,8 @@ where
             .map_err(|_| CoreError::Timeout)?
     }
 
-    fn publish_event(&self, packet: &Packet) {
+    fn publish_event(&mut self, packet: &Packet) {
+        self.retain_sync_response(packet);
         if let Some(event) = packet.clone().into_event() {
             self.publish_domain_event(&event);
         }
@@ -1445,6 +1642,7 @@ where
 
     fn mark_disconnected(&mut self) {
         self.clear_tracking();
+        self.clear_sync_tracking();
         if std::mem::replace(&mut self.connected, false) {
             let _ = self.event_tx.send(Event::Disconnected);
         }
@@ -1455,6 +1653,11 @@ where
         self.pending_ack_order.clear();
         self.completed_acks.clear();
         self.completed_ack_order.clear();
+    }
+
+    fn clear_sync_tracking(&mut self) {
+        self.sync_state = SyncState::Idle;
+        self.deferred_sync = None;
     }
 
     fn remember_pending_ack(&mut self, tracking: CommandTracking) {
@@ -1640,11 +1843,53 @@ mod tests {
         raw
     }
 
+    fn contact_end_packet(lastmod: u32) -> Vec<u8> {
+        let mut raw = vec![PacketCode::ContactEnd.to_u8()];
+        raw.extend_from_slice(&lastmod.to_le_bytes());
+        raw
+    }
+
     struct ReadErrorTransport {
         kind: io::ErrorKind,
     }
 
     struct BlockingReadTransport;
+
+    struct SyncResponseTransport {
+        inbound: VecDeque<Vec<u8>>,
+        writes: usize,
+        preexisting_notification: bool,
+        respond_on_write: bool,
+    }
+
+    impl SyncResponseTransport {
+        fn new() -> Self {
+            Self {
+                inbound: VecDeque::new(),
+                writes: 0,
+                preexisting_notification: false,
+                respond_on_write: true,
+            }
+        }
+
+        fn with_preexisting_notification() -> Self {
+            Self {
+                inbound: VecDeque::from([vec![PacketCode::MessagesWaiting.to_u8()]]),
+                writes: 0,
+                preexisting_notification: true,
+                respond_on_write: true,
+            }
+        }
+
+        fn delayed() -> Self {
+            Self {
+                inbound: VecDeque::new(),
+                writes: 0,
+                preexisting_notification: false,
+                respond_on_write: false,
+            }
+        }
+    }
 
     #[async_trait]
     impl Transport for ReadErrorTransport {
@@ -1692,6 +1937,53 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Transport for SyncResponseTransport {
+        fn kind(&self) -> TransportKind {
+            TransportKind::Scripted
+        }
+
+        async fn connect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn write(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+            assert_eq!(payload, Command::sync_next_message().encode());
+            self.writes = self.writes.saturating_add(1);
+            if self.respond_on_write {
+                if self.writes == 1 {
+                    if !self.preexisting_notification {
+                        self.inbound
+                            .push_back(vec![PacketCode::MessagesWaiting.to_u8()]);
+                    }
+                    self.inbound
+                        .push_back(contact_message_packet(u8::MAX, 42, "queued response"));
+                } else {
+                    self.inbound.push_back(vec![PacketCode::NoMoreMsgs.to_u8()]);
+                }
+            }
+            Ok(())
+        }
+
+        async fn read(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+            match self.inbound.pop_front() {
+                Some(packet) => Ok(Some(packet)),
+                None => pending().await,
+            }
+        }
+
+        fn try_read(&mut self) -> Result<ReadyRead, TransportError> {
+            Ok(self
+                .inbound
+                .pop_front()
+                .map_or(ReadyRead::Pending, ReadyRead::Packet))
+        }
+    }
+
     #[test]
     fn destination_prefix_is_exactly_six_bytes() {
         assert!(validate_destination_prefix(&[0_u8; 6]).is_ok());
@@ -1734,6 +2026,55 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn contact_snapshot_preserves_terminating_lastmod() {
+        let expected_lastmod = 0x7856_3412;
+        let mut client = Client::new(ScriptedTransport::with_inbound_frames([
+            contact_end_packet(expected_lastmod),
+        ]));
+        client.connected = true;
+
+        let snapshot = client
+            .list_contacts_snapshot(None)
+            .await
+            .unwrap_or_else(|error| panic!("contact snapshot failed: {error}"));
+        assert!(snapshot.contacts.is_empty());
+        assert_eq!(snapshot.lastmod, expected_lastmod);
+        assert_eq!(
+            client.transport.outbound_frames(),
+            vec![Command::get_contacts(None).encode()]
+        );
+    }
+
+    #[tokio::test]
+    async fn contact_snapshot_does_not_invent_a_marker() {
+        let mut client = Client::new(ScriptedTransport::with_inbound_frames([vec![
+            PacketCode::NoMoreMsgs.to_u8(),
+        ]]));
+        client.connected = true;
+
+        assert!(matches!(
+            client.list_contacts_snapshot(None).await,
+            Err(CoreError::ProtocolInvariant(
+                "contact snapshot ended without a last-modified marker"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_contact_list_accepts_no_more_messages_without_a_marker() {
+        let mut client = Client::new(ScriptedTransport::with_inbound_frames([vec![
+            PacketCode::NoMoreMsgs.to_u8(),
+        ]]));
+        client.connected = true;
+
+        let contacts = client
+            .list_contacts(None)
+            .await
+            .unwrap_or_else(|error| panic!("legacy contact list failed: {error}"));
+        assert!(contacts.is_empty());
     }
 
     #[tokio::test]
@@ -1798,9 +2139,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prior_live_delivery_never_causes_an_extra_sync_command() {
+    async fn prior_message_waiting_notification_does_not_satisfy_sync() {
         let frames = [
-            contact_message_packet(u8::MAX, 42, "same payload"),
+            vec![PacketCode::MessagesWaiting.to_u8()],
             contact_message_packet(u8::MAX, 42, "same payload"),
         ];
         let mut client = Client::new(ScriptedTransport::with_inbound_frames(frames));
@@ -1808,10 +2149,87 @@ mod tests {
 
         assert!(matches!(
             client.next_event().await,
-            Ok(Some(Event::Message(_)))
+            Ok(Some(Event::MessagesWaiting))
         ));
         assert!(matches!(client.sync_next_message().await, Ok(Some(_))));
         assert_eq!(client.transport.outbound_frames().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn valid_push_during_sync_write_is_published_before_the_single_response() {
+        let mut client = Client::new(SyncResponseTransport::new());
+        client.connected = true;
+        let mut events = client.subscribe();
+
+        let returned = client
+            .sync_next_message()
+            .await
+            .expect("sync")
+            .expect("queued response");
+        assert_eq!(returned.text, "queued response");
+        assert_eq!(client.transport.writes, 1);
+
+        assert!(matches!(client.sync_next_message().await, Ok(None)));
+        assert_eq!(client.transport.writes, 2);
+        assert!(matches!(events.try_recv(), Ok(Event::MessagesWaiting)));
+        let Event::Message(event) = events.try_recv().expect("sync response event") else {
+            panic!("sync response was not published as a message");
+        };
+        assert_eq!(event.observation_id, returned.observation_id);
+    }
+
+    #[tokio::test]
+    async fn preexisting_valid_push_is_published_before_one_fresh_sync_response() {
+        let mut client = Client::new(SyncResponseTransport::with_preexisting_notification());
+        client.connected = true;
+        let mut events = client.subscribe();
+
+        let returned = client
+            .sync_next_message()
+            .await
+            .expect("sync")
+            .expect("queued response");
+        assert_eq!(returned.text, "queued response");
+        assert_eq!(client.transport.writes, 1);
+
+        assert!(matches!(events.try_recv(), Ok(Event::MessagesWaiting)));
+        let Event::Message(queued) = events.try_recv().expect("sync response event") else {
+            panic!("sync response was not published as a message");
+        };
+        assert_eq!(queued.observation_id, returned.observation_id);
+    }
+
+    #[tokio::test]
+    async fn cancelled_sync_response_is_reconciled_before_any_second_command() {
+        let mut client = Client::new(SyncResponseTransport::delayed());
+        client.connected = true;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), client.sync_next_message())
+                .await
+                .is_err(),
+            "outer timeout must cancel the in-flight sync"
+        );
+        assert_eq!(client.transport.writes, 1);
+        assert!(matches!(
+            client.query_device_info().await,
+            Err(CoreError::ProtocolInvariant(
+                "a prior inbox synchronization response must be reconciled before another command"
+            ))
+        ));
+        assert_eq!(client.transport.writes, 1);
+
+        client
+            .transport
+            .inbound
+            .push_back(contact_message_packet(u8::MAX, 43, "late response"));
+        let reconciled = client
+            .sync_next_message()
+            .await
+            .expect("reconcile sync")
+            .expect("late response");
+        assert_eq!(reconciled.text, "late response");
+        assert_eq!(client.transport.writes, 1);
     }
 
     #[tokio::test]

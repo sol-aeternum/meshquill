@@ -2,19 +2,20 @@
 
 use std::{
     collections::VecDeque,
+    fs,
     io::{self, IsTerminal, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use meshquill_core::{CoreError, Event, MAX_OPERATION_TIMEOUT, ManagedClient};
 use meshquill_mqtt::{
-    AcceptedCommand, CommandError, ConfigError as MqttConfigError, ConnectionStatus, GatewayError,
-    GatewayHandle, GatewayNotice, GatewayRunner, MqttPassword, MqttProtocol, MqttQos, Publication,
-    SendCommand,
+    AcceptedCommand, CommandError, CommandLimits, ConfigError as MqttConfigError, ConnectionStatus,
+    GatewayError, GatewayHandle, GatewayNotice, GatewayRunner, MAX_MQTT_PASSWORD_BYTES,
+    MqttPassword, MqttProtocol, MqttQos, Publication, SendCommand, validate_send_command,
 };
 use meshquill_store::{
-    Config as StoreConfig, ConfigStore, LoadOutcome, MqttSettings, SecretRef, SystemSecretResolver,
+    Config as StoreConfig, LoadOutcome, MqttSettings, SecretRef, SystemSecretResolver,
 };
 use secrecy::SecretString;
 use serde::Serialize;
@@ -26,7 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     args::{Cli, MqttCommand, MqttConfigureArgs, MqttProtocolChoice, MqttQosChoice},
-    config::{config_store, load_optional, load_unmodified, select_profile},
+    config::{config_store, load_optional, load_unmodified_locked, select_profile},
     error::CliError,
     output::{ExitStatus, OutputWriter},
     runtime::{make_client, resolve_contact, watch_human, watch_record},
@@ -35,9 +36,9 @@ use crate::{
 
 const MQTT_SCHEMA: &str = "meshquill.mqtt/v1";
 const CREDENTIAL_SERVICE: &str = "meshquill";
-const MAX_PASSWORD_BYTES: usize = 4096;
 const GATEWAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_ACKS: usize = 256;
+const CONTACT_RESYNC_DEBOUNCE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Serialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -107,6 +108,52 @@ struct BrokerRejectionReport {
     reason: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct SnapshotDiagnosticReport {
+    publication: &'static str,
+    published: bool,
+    reason: &'static str,
+}
+
+#[derive(Default)]
+struct ContactResyncDebounce {
+    deadline: Option<Instant>,
+}
+
+impl ContactResyncDebounce {
+    fn observe(&mut self, event: &Event, now: Instant) -> bool {
+        let Event::UnknownPacket { code, .. } = event else {
+            return false;
+        };
+        if !matches!(*code, 0x8a | 0x8f | 0x90) {
+            return false;
+        }
+
+        // These firmware notifications are intentionally opaque. Their payload
+        // layout is not stable enough to parse; the only safe response is a
+        // bounded, authoritative directory query after a quiet period.
+        self.deadline = Some(now + CONTACT_RESYNC_DEBOUNCE);
+        true
+    }
+
+    const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn clear(&mut self) {
+        self.deadline = None;
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            self.clear();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct PendingBrokerAck {
     record: OutgoingRecord,
     message_id: String,
@@ -118,6 +165,59 @@ struct PendingBrokerAck {
 struct BrokerCommandOutcome {
     report: BrokerCommandReport,
     pending: Option<PendingBrokerAck>,
+}
+
+enum AuthenticationUpdate {
+    Clear,
+    Replace {
+        username: String,
+        reference: SecretRef,
+    },
+    PreserveForUsername(String),
+    Preserve,
+}
+
+async fn prepare_authentication(
+    config_path: &Path,
+    args: &MqttConfigureArgs,
+) -> Result<(AuthenticationUpdate, Option<(String, String)>), CliError> {
+    let requested_username = args.username.as_deref().map(str::trim).map(str::to_owned);
+    if requested_username.as_deref() == Some("") {
+        return Err(CliError::new(
+            ExitStatus::Usage,
+            "MQTT username must not be empty",
+        ));
+    }
+
+    let mut fresh_credential = None;
+    let authentication = if args.clear_auth {
+        AuthenticationUpdate::Clear
+    } else if let Some(username) = requested_username {
+        if args.password_stdin {
+            let password = read_password_stdin()?;
+            let account = credential_account(config_path, &username)?;
+            let reference = SecretRef::CredentialStore {
+                service: CREDENTIAL_SERVICE.to_owned(),
+                account: account.clone(),
+            };
+            store_credential(account, password).await?;
+            fresh_credential = credential_target(&reference);
+            AuthenticationUpdate::Replace {
+                username,
+                reference,
+            }
+        } else if let Some(name) = &args.password_env {
+            AuthenticationUpdate::Replace {
+                username,
+                reference: SecretRef::environment(name.clone()).map_err(CliError::from)?,
+            }
+        } else {
+            AuthenticationUpdate::PreserveForUsername(username)
+        }
+    } else {
+        AuthenticationUpdate::Preserve
+    };
+    Ok((authentication, fresh_credential))
 }
 
 pub(crate) async fn mqtt<W: Write>(
@@ -158,89 +258,93 @@ async fn mqtt_configure<W: Write>(
     args: &MqttConfigureArgs,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let (store, mut config) = load_config_for_mqtt_update(cli)?;
+    let store = config_store(cli)?;
+    let ca_path = canonical_tls_path(args.ca_file.as_deref(), "CA")?;
+    let client_certificate_path =
+        canonical_tls_path(args.client_certificate.as_deref(), "client certificate")?;
+    let client_private_key_path =
+        canonical_tls_path(args.client_key.as_deref(), "client private key")?;
+    let (authentication, fresh_credential) = prepare_authentication(store.path(), args).await?;
 
-    let old_reference = config.mqtt.password.clone();
-    let old_username = config.mqtt.gateway.username.clone();
-    let mut gateway = config.mqtt.gateway.clone();
-    gateway.host = args.host.trim().to_owned();
-    gateway.port = args.port;
-    gateway.protocol = protocol_from_choice(args.protocol);
-    gateway.qos = qos_from_choice(args.qos);
-    gateway.tls.enabled = !args.no_tls;
-    gateway.tls.verify_server_certificate = true;
-    gateway.tls.ca_path.clone_from(&args.ca_file);
-    gateway
-        .tls
-        .client_certificate_path
-        .clone_from(&args.client_certificate);
-    gateway
-        .tls
-        .client_private_key_path
-        .clone_from(&args.client_key);
-    gateway.topic_prefix = args.topic_prefix.trim().to_owned();
-    gateway.allow_send = args.allow_send;
-
-    let password = if args.clear_auth {
-        gateway.username = None;
-        None
-    } else if let Some(username) = &args.username {
-        let username = username.trim().to_owned();
-        if username.is_empty() {
-            return Err(CliError::new(
-                ExitStatus::Usage,
-                "MQTT username must not be empty",
-            ));
-        }
-        gateway.username = Some(username.clone());
-        if args.password_stdin {
-            Some(read_password_stdin()?)
-        } else if old_username.as_deref() == Some(username.as_str()) {
-            None
-        } else {
-            return Err(CliError::new(
-                ExitStatus::Usage,
-                "a new MQTT username requires --password-stdin",
-            ));
-        }
-    } else {
-        gateway.username.clone_from(&old_username);
-        None
-    };
-
-    gateway
-        .validate()
-        .map_err(|error| mqtt_config_error(&error))?;
-
-    let mut fresh_credential = None;
-    let password_reference = if let Some(password) = password {
-        let account = credential_account(store.path(), gateway.username.as_deref().unwrap_or(""))?;
-        let reference = SecretRef::CredentialStore {
-            service: CREDENTIAL_SERVICE.to_owned(),
-            account: account.clone(),
+    let update_result = (|| {
+        let locked = store.lock_exclusive().map_err(CliError::from)?;
+        let mut config = match load_unmodified_locked(&locked)? {
+            LoadOutcome::Missing => StoreConfig::default(),
+            LoadOutcome::Loaded(config) => config,
+            LoadOutcome::NeedsMigration(_) => {
+                return Err(CliError::new(
+                    ExitStatus::Configuration,
+                    "configuration must be migrated before changing MQTT settings",
+                )
+                .with_hint("Run `meshquill config migrate` first; it preserves a backup."));
+            }
         };
-        store_credential(account, password).await?;
-        fresh_credential = credential_target(&reference);
-        Some(reference)
-    } else if args.clear_auth {
-        None
-    } else {
-        old_reference.clone()
-    };
+        let old_reference = config.mqtt.password.clone();
+        let mut gateway = config.mqtt.gateway.clone();
+        args.host.trim().clone_into(&mut gateway.host);
+        gateway.port = args.port;
+        gateway.protocol = protocol_from_choice(args.protocol);
+        gateway.qos = qos_from_choice(args.qos);
+        gateway.tls.enabled = !args.no_tls;
+        gateway.tls.verify_server_certificate = true;
+        gateway.tls.ca_path.clone_from(&ca_path);
+        gateway
+            .tls
+            .client_certificate_path
+            .clone_from(&client_certificate_path);
+        gateway
+            .tls
+            .client_private_key_path
+            .clone_from(&client_private_key_path);
+        args.topic_prefix
+            .trim()
+            .clone_into(&mut gateway.topic_prefix);
+        gateway.allow_send = args.allow_send;
 
-    config.mqtt = MqttSettings {
-        enabled: true,
-        gateway,
-        password: password_reference,
+        let password_reference = match &authentication {
+            AuthenticationUpdate::Clear => {
+                gateway.username = None;
+                None
+            }
+            AuthenticationUpdate::Replace {
+                username,
+                reference,
+            } => {
+                gateway.username = Some(username.clone());
+                Some(reference.clone())
+            }
+            AuthenticationUpdate::PreserveForUsername(username) => {
+                if gateway.username.as_deref() != Some(username.as_str()) {
+                    return Err(CliError::new(
+                        ExitStatus::Usage,
+                        "a new MQTT username requires --password-stdin or --password-env NAME",
+                    ));
+                }
+                old_reference.clone()
+            }
+            AuthenticationUpdate::Preserve => old_reference.clone(),
+        };
+
+        gateway
+            .validate()
+            .map_err(|error| mqtt_config_error(&error))?;
+        config.mqtt = MqttSettings {
+            enabled: true,
+            gateway,
+            password: password_reference,
+        };
+        config.validate().map_err(CliError::from)?;
+        locked.save(&config).map_err(CliError::from)?;
+        Ok((config, old_reference))
+    })();
+
+    let (config, old_reference) = match update_result {
+        Ok(result) => result,
+        Err(error) => {
+            cleanup_credential(fresh_credential).await;
+            return Err(error);
+        }
     };
-    if let Err(error) = config.validate() {
-        cleanup_credential(fresh_credential).await;
-        return Err(CliError::from(error));
-    }
-    if let Err(error) = store.save(&config) {
-        cleanup_credential(fresh_credential).await;
-        return Err(CliError::from(error));
-    }
 
     if old_reference != config.mqtt.password {
         cleanup_credential(credential_target_opt(old_reference.as_ref())).await;
@@ -256,6 +360,21 @@ async fn mqtt_configure<W: Write>(
         .map_err(CliError::from)
 }
 
+fn canonical_tls_path(
+    path: Option<&Path>,
+    field: &'static str,
+) -> Result<Option<PathBuf>, CliError> {
+    path.map(|path| {
+        fs::canonicalize(path).map_err(|_| {
+            CliError::new(
+                ExitStatus::Mqtt,
+                format!("configured MQTT TLS {field} file is unavailable or invalid"),
+            )
+        })
+    })
+    .transpose()
+}
+
 async fn mqtt_test<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Result<(), CliError> {
     let settings = load_enabled_settings(cli)?;
     let password = resolve_password(cli, &settings).await?;
@@ -266,12 +385,21 @@ async fn mqtt_test<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Result<
             .map_err(mqtt_gateway_error)?;
     let task = tokio::spawn(runner.run());
 
+    let command_readiness_required = settings.gateway.allow_send;
     let connected = tokio::time::timeout(cli.timeout, async {
+        let mut broker_connected = false;
         loop {
             match handle.recv_notice().await {
-                Some(GatewayNotice::BrokerState(ConnectionStatus::Connected)) => return Ok(()),
+                Some(GatewayNotice::BrokerState(ConnectionStatus::Connected)) => {
+                    broker_connected = true;
+                    if !command_readiness_required {
+                        return Ok(());
+                    }
+                }
+                Some(GatewayNotice::CommandReady) if broker_connected => return Ok(()),
                 Some(
-                    GatewayNotice::BrokerState(ConnectionStatus::Disconnected)
+                    GatewayNotice::CommandReady
+                    | GatewayNotice::BrokerState(ConnectionStatus::Disconnected)
                     | GatewayNotice::Rejected(_)
                     | GatewayNotice::Command(_),
                 ) => {}
@@ -328,6 +456,7 @@ async fn mqtt_bridge<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Resul
     let workflow = WorkflowServices::from_selected(&selected)?;
     let client = make_client(&selected)?;
     let settings = selected.config.mqtt.clone();
+    let command_limits = settings.gateway.command_limits;
     let password = resolve_password(cli, &settings).await?;
     let cancellation = CancellationToken::new();
     let (mut gateway, runner) =
@@ -347,13 +476,42 @@ async fn mqtt_bridge<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Resul
     };
     if let Err(error) = workflow.connected(&info.name).await {
         gateway.cancel();
+        if workflow
+            .disconnected(Some("MQTT bridge connection hook failed"))
+            .await
+            .is_err()
+        {
+            tracing::warn!("secondary MQTT disconnect hook failure; details omitted");
+        }
         let _ = client.shutdown().await;
         let _ = join_gateway(gateway_task).await;
         return Err(error);
     }
 
-    let result = bridge_loop(&client, &workflow, &mut gateway, &mut events, writer).await;
+    let result = match publish_full_device_snapshot(&client, &gateway, writer).await {
+        Ok(()) => {
+            bridge_loop(
+                &client,
+                &workflow,
+                &mut gateway,
+                &mut events,
+                command_limits,
+                writer,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     gateway.cancel();
+    if let Err(error) = &result
+        && !matches!(error.status(), ExitStatus::Hook | ExitStatus::Interrupted)
+        && workflow
+            .error("mqtt bridge", "MQTT bridge operation failed")
+            .await
+            .is_err()
+    {
+        tracing::warn!("secondary MQTT error hook failure; details omitted");
+    }
     let disconnect_result = workflow
         .disconnected(Some(if result.is_ok() {
             "MQTT bridge completed"
@@ -364,6 +522,15 @@ async fn mqtt_bridge<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Resul
     let core_shutdown = client.shutdown().await;
     let gateway_shutdown = join_gateway(gateway_task).await;
     if let Err(error) = result {
+        if disconnect_result.is_err() {
+            tracing::warn!("secondary MQTT disconnect hook failure; details omitted");
+        }
+        if core_shutdown.is_err() {
+            tracing::warn!("secondary MQTT client shutdown failure; details omitted");
+        }
+        if gateway_shutdown.is_err() {
+            tracing::warn!("secondary MQTT gateway shutdown failure; details omitted");
+        }
         Err(error)
     } else {
         disconnect_result?;
@@ -377,12 +544,19 @@ async fn bridge_loop<W: Write>(
     workflow: &WorkflowServices,
     gateway: &mut GatewayHandle,
     events: &mut broadcast::Receiver<Event>,
+    command_limits: CommandLimits,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
     let mut pending = VecDeque::new();
+    let mut contact_resync = ContactResyncDebounce::default();
+    // A snapshot is refreshed only after an observed broker disconnect/connect pair.
+    // This remains correct if the initial Connected notification is delayed or
+    // absent and avoids treating a duplicate Connected notification as replay.
+    let mut reconnect_pending = false;
     let mut timeout_tick = tokio::time::interval(Duration::from_millis(250));
     timeout_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        let contact_resync_deadline = contact_resync.deadline();
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|_| CliError::new(
@@ -394,15 +568,38 @@ async fn bridge_loop<W: Write>(
             _ = timeout_tick.tick() => {
                 expire_pending_acks(workflow, &mut pending).await?;
             }
+            () = wait_for_contact_resync(contact_resync_deadline) => {
+                if contact_resync.take_due(Instant::now()) {
+                    publish_contact_snapshot(
+                        client,
+                        gateway,
+                        writer,
+                        "contact_resync_query_failed",
+                    ).await?;
+                }
+            }
             event = events.recv() => {
                 match event {
-                    Ok(event) => publish_core_event(
-                        workflow,
-                        &mut pending,
-                        gateway,
-                        event,
-                        writer,
-                    ).await?,
+                    Ok(event) => {
+                        let disconnected = matches!(&event, Event::Disconnected);
+                        contact_resync.observe(&event, Instant::now());
+                        publish_core_event(
+                            workflow,
+                            &mut pending,
+                            gateway,
+                            event,
+                            writer,
+                        ).await?;
+                        if disconnected {
+                            while let Some(mut item) = pending.pop_front() {
+                                record_failed_send(workflow, &mut item.record).await;
+                            }
+                            return Err(CliError::new(
+                                ExitStatus::Connection,
+                                "the MeshCore companion disconnected while the MQTT bridge was running",
+                            ).with_hint("Restart the bridge after restoring the device connection."));
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         let report = BrokerRejectionReport {
                             accepted: false,
@@ -423,10 +620,148 @@ async fn bridge_loop<W: Write>(
                 }
             }
             notice = gateway.recv_notice() => {
-                handle_gateway_notice(client, workflow, &mut pending, notice, writer).await?;
+                let reconnect_snapshot = broker_reconnect_requires_snapshot(
+                    notice.as_ref(),
+                    &mut reconnect_pending,
+                );
+                handle_gateway_notice(
+                    client,
+                    workflow,
+                    &mut pending,
+                    notice,
+                    command_limits,
+                    writer,
+                ).await?;
+                if reconnect_snapshot {
+                    contact_resync.clear();
+                    // Re-query current device state. Outgoing messages are never synthesized or
+                    // replayed during broker reconnect synchronization.
+                    publish_full_device_snapshot(client, gateway, writer).await?;
+                }
             }
         }
     }
+}
+
+fn broker_reconnect_requires_snapshot(
+    notice: Option<&GatewayNotice>,
+    reconnect_pending: &mut bool,
+) -> bool {
+    match notice {
+        Some(GatewayNotice::BrokerState(ConnectionStatus::Disconnected)) => {
+            *reconnect_pending = true;
+            false
+        }
+        Some(GatewayNotice::BrokerState(ConnectionStatus::Connected)) if *reconnect_pending => {
+            *reconnect_pending = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn wait_for_contact_resync(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn publish_full_device_snapshot<W: Write>(
+    client: &ManagedClient,
+    gateway: &GatewayHandle,
+    writer: &mut OutputWriter<W>,
+) -> Result<(), CliError> {
+    for publication in collect_full_device_snapshot(client, writer).await? {
+        gateway
+            .publish(publication)
+            .await
+            .map_err(mqtt_gateway_error)?;
+    }
+    Ok(())
+}
+
+async fn collect_full_device_snapshot<W: Write>(
+    client: &ManagedClient,
+    writer: &mut OutputWriter<W>,
+) -> Result<Vec<Publication>, CliError> {
+    let mut publications = Vec::with_capacity(3);
+    if let Some(contacts) =
+        collect_contact_snapshot(client, writer, "contact_snapshot_query_failed").await?
+    {
+        publications.push(contacts);
+    }
+
+    // Managed core queries inherit the profile's validated finite request
+    // timeout. A failed query emits a static diagnostic and contributes no fake
+    // sample or placeholder value.
+    match client.get_battery().await {
+        Ok(info) => publications.push(Publication::battery(info)),
+        Err(_) => write_snapshot_diagnostic(
+            writer,
+            "battery",
+            "battery_snapshot_query_failed",
+            "Skipped MQTT battery snapshot because the bounded device query failed.",
+        )?,
+    }
+    match client.get_self_telemetry().await {
+        Ok(response) => publications.push(Publication::raw_telemetry(response)),
+        Err(_) => write_snapshot_diagnostic(
+            writer,
+            "raw_cayenne_lpp",
+            "self_telemetry_snapshot_query_failed",
+            "Skipped MQTT raw telemetry snapshot because the bounded device query failed.",
+        )?,
+    }
+    Ok(publications)
+}
+
+async fn publish_contact_snapshot<W: Write>(
+    client: &ManagedClient,
+    gateway: &GatewayHandle,
+    writer: &mut OutputWriter<W>,
+    failure_reason: &'static str,
+) -> Result<(), CliError> {
+    if let Some(publication) = collect_contact_snapshot(client, writer, failure_reason).await? {
+        gateway
+            .publish(publication)
+            .await
+            .map_err(mqtt_gateway_error)?;
+    }
+    Ok(())
+}
+
+async fn collect_contact_snapshot<W: Write>(
+    client: &ManagedClient,
+    writer: &mut OutputWriter<W>,
+    failure_reason: &'static str,
+) -> Result<Option<Publication>, CliError> {
+    let Ok(snapshot) = client.list_contacts_snapshot(None).await else {
+        write_snapshot_diagnostic(
+            writer,
+            "contacts",
+            failure_reason,
+            "Skipped MQTT contact snapshot because no authoritative directory marker was available.",
+        )?;
+        return Ok(None);
+    };
+    Ok(Some(Publication::contacts(snapshot)))
+}
+
+fn write_snapshot_diagnostic<W: Write>(
+    writer: &mut OutputWriter<W>,
+    publication: &'static str,
+    reason: &'static str,
+    human: &'static str,
+) -> Result<(), CliError> {
+    let report = SnapshotDiagnosticReport {
+        publication,
+        published: false,
+        reason,
+    };
+    writer
+        .event("mqtt_diagnostic", &report, human)
+        .map_err(CliError::from)
 }
 
 async fn handle_gateway_notice<W: Write>(
@@ -434,6 +769,7 @@ async fn handle_gateway_notice<W: Write>(
     workflow: &WorkflowServices,
     pending: &mut VecDeque<PendingBrokerAck>,
     notice: Option<GatewayNotice>,
+    command_limits: CommandLimits,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
     match notice {
@@ -463,8 +799,11 @@ async fn handle_gateway_notice<W: Write>(
                 )
                 .map_err(CliError::from)
         }
+        Some(GatewayNotice::CommandReady) => Ok(()),
         Some(GatewayNotice::Command(command)) => {
-            let outcome = execute_command_once(client, workflow, command, pending.len()).await;
+            let outcome =
+                execute_command_once(client, workflow, command, pending.len(), command_limits)
+                    .await;
             if let Some(item) = outcome.pending {
                 pending.push_back(item);
             }
@@ -569,15 +908,24 @@ async fn execute_command_once(
     workflow: &WorkflowServices,
     accepted: AcceptedCommand,
     pending_count: usize,
+    command_limits: CommandLimits,
 ) -> BrokerCommandOutcome {
     let event_id = accepted.event_id.to_string();
     match accepted.command {
         SendCommand::Direct { destination, text } => {
-            execute_direct_command(client, workflow, event_id, destination, text, pending_count)
-                .await
+            execute_direct_command(
+                client,
+                workflow,
+                event_id,
+                destination,
+                text,
+                pending_count,
+                command_limits,
+            )
+            .await
         }
         SendCommand::Channel { channel, text } => {
-            execute_channel_command(client, workflow, event_id, channel, text).await
+            execute_channel_command(client, workflow, event_id, channel, text, command_limits).await
         }
     }
 }
@@ -589,6 +937,7 @@ async fn execute_direct_command(
     destination: String,
     text: String,
     pending_count: usize,
+    command_limits: CommandLimits,
 ) -> BrokerCommandOutcome {
     if pending_count >= MAX_PENDING_ACKS {
         return rejected_command(event_id, "direct_send", "local_pending_limit");
@@ -600,6 +949,17 @@ async fn execute_direct_command(
             return rejected_command(event_id, "direct_send", "before_send_rejected");
         }
     };
+    if validate_send_command(
+        &SendCommand::Direct {
+            destination: prepared.destination.clone(),
+            text: prepared.text.clone(),
+        },
+        command_limits,
+    )
+    .is_err()
+    {
+        return rejected_command(event_id, "direct_send", "before_send_out_of_bounds");
+    }
     let mut outgoing = match workflow
         .begin_outgoing(&prepared.destination, None, &prepared.text)
         .await
@@ -656,7 +1016,7 @@ async fn execute_direct_command(
             event_id,
             "direct_send",
             true,
-            Some("after_send_hook_failed"),
+            Some("post_send_workflow_failed"),
             Some(pending),
         );
     }
@@ -669,6 +1029,7 @@ async fn execute_channel_command(
     event_id: String,
     channel: u8,
     text: String,
+    command_limits: CommandLimits,
 ) -> BrokerCommandOutcome {
     let prepared = match workflow.prepare_send(channel.to_string(), text).await {
         Ok(prepared) => prepared,
@@ -680,6 +1041,17 @@ async fn execute_channel_command(
     let Ok(prepared_channel) = prepared.destination.parse::<u8>() else {
         return rejected_command(event_id, "channel_send", "before_send_rejected");
     };
+    if validate_send_command(
+        &SendCommand::Channel {
+            channel: prepared_channel,
+            text: prepared.text.clone(),
+        },
+        command_limits,
+    )
+    .is_err()
+    {
+        return rejected_command(event_id, "channel_send", "before_send_out_of_bounds");
+    }
     let mut outgoing = match workflow
         .begin_outgoing(
             &prepared.destination,
@@ -718,7 +1090,7 @@ async fn execute_channel_command(
             event_id,
             "channel_send",
             true,
-            Some("after_send_hook_failed"),
+            Some("post_send_workflow_failed"),
             None,
         );
     }
@@ -803,7 +1175,7 @@ async fn resolve_password(
 }
 
 fn read_password_stdin() -> Result<SecretString, CliError> {
-    let maximum = u64::try_from(MAX_PASSWORD_BYTES + 1).unwrap_or(u64::MAX);
+    let maximum = u64::try_from(MAX_MQTT_PASSWORD_BYTES + 1).unwrap_or(u64::MAX);
     let mut input = io::stdin().lock().take(maximum);
     let mut bytes = Zeroizing::new(Vec::with_capacity(128));
     input.read_to_end(&mut bytes).map_err(|_| {
@@ -812,10 +1184,10 @@ fn read_password_stdin() -> Result<SecretString, CliError> {
             "could not read the MQTT password from stdin",
         )
     })?;
-    if bytes.len() > MAX_PASSWORD_BYTES {
+    if bytes.len() > MAX_MQTT_PASSWORD_BYTES {
         return Err(CliError::new(
             ExitStatus::Usage,
-            format!("MQTT password exceeds the {MAX_PASSWORD_BYTES}-byte limit"),
+            format!("MQTT password exceeds the {MAX_MQTT_PASSWORD_BYTES}-byte limit"),
         ));
     }
     if bytes.last() == Some(&b'\n') {
@@ -830,19 +1202,23 @@ fn read_password_stdin() -> Result<SecretString, CliError> {
             "MQTT password from stdin must not be empty",
         ));
     }
-    let password = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|_| {
-        CliError::new(
-            ExitStatus::Usage,
-            "MQTT password from stdin must be valid UTF-8",
-        )
-    })?;
+    let mut password = match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(password) => Zeroizing::new(password),
+        Err(error) => {
+            let _invalid_password = Zeroizing::new(error.into_bytes());
+            return Err(CliError::new(
+                ExitStatus::Usage,
+                "MQTT password from stdin must be valid UTF-8",
+            ));
+        }
+    };
     if password.contains('\0') {
         return Err(CliError::new(
             ExitStatus::Usage,
             "MQTT password from stdin must not contain NUL",
         ));
     }
-    Ok(SecretString::from(password))
+    Ok(SecretString::from(std::mem::take(&mut *password)))
 }
 
 async fn store_credential(account: String, password: SecretString) -> Result<(), CliError> {
@@ -945,22 +1321,6 @@ fn status_report(settings: &MqttSettings) -> MqttStatusReport {
     }
 }
 
-fn load_config_for_mqtt_update(cli: &Cli) -> Result<(ConfigStore, StoreConfig), CliError> {
-    let store = config_store(cli)?;
-    let config = match load_unmodified(&store)? {
-        LoadOutcome::Missing => StoreConfig::default(),
-        LoadOutcome::Loaded(config) => config,
-        LoadOutcome::NeedsMigration(_) => {
-            return Err(CliError::new(
-                ExitStatus::Configuration,
-                "configuration must be migrated before changing MQTT settings",
-            )
-            .with_hint("Run `meshquill config migrate` first; it preserves a backup."));
-        }
-    };
-    Ok((store, config))
-}
-
 fn configure_report(settings: &MqttSettings) -> MqttConfigureReport {
     MqttConfigureReport {
         schema: MQTT_SCHEMA,
@@ -1023,6 +1383,7 @@ const fn rejection_code(error: &CommandError) -> &'static str {
         CommandError::SendDisabled => "outbound_send_disabled",
         CommandError::UnexpectedTopic => "unexpected_topic",
         CommandError::InvalidTopicEncoding => "invalid_topic_encoding",
+        CommandError::RetainedCommand => "retained_command",
         CommandError::EmptyPayload => "empty_payload",
         CommandError::PayloadTooLarge { .. } => "payload_too_large",
         CommandError::InvalidJson(_) => "invalid_json",
@@ -1082,6 +1443,11 @@ fn mqtt_gateway_error(error: GatewayError) -> CliError {
             ExitStatus::Mqtt,
             "MQTT broker operation exceeded its configured timeout",
         ),
+        GatewayError::CommandSubscriptionRejected => CliError::new(
+            ExitStatus::Mqtt,
+            "MQTT broker rejected the outbound-command subscription",
+        )
+        .with_hint("Check broker ACLs for the configured v1 outbound topic."),
         GatewayError::ClockBeforeUnixEpoch | GatewayError::TimestampOverflow => CliError::new(
             ExitStatus::Mqtt,
             "system clock cannot represent an MQTT event timestamp",
@@ -1122,6 +1488,10 @@ fn credential_worker_error() -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::OutputMode;
+    use meshquill_core::Client;
+    use meshquill_mqtt::{ContactTypeData, TelemetryData};
+    use meshquill_test_support::{ContactFixture, VirtualCompanion, make_contact_row};
 
     #[test]
     fn status_never_serializes_secret_reference_details_or_tls_paths() {
@@ -1167,5 +1537,145 @@ mod tests {
         );
         assert_eq!(protocol_name(MqttProtocol::V311), "3.1.1");
         assert_eq!(qos_number(MqttQos::AtMostOnce), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_snapshot_collects_contacts_battery_and_raw_telemetry() {
+        let companion = VirtualCompanion::new();
+        let row = make_contact_row(&ContactFixture {
+            public_key: [0xab; 32],
+            contact_type: 3,
+            route: 0x02,
+            path: &[0x12, 0x34],
+            adv_name: "sensor",
+            last_advert: 7,
+            adv_lat: 0.5,
+            adv_lon: -0.25,
+            lastmod: 8,
+        })
+        .expect("valid contact row");
+        companion
+            .set_contacts([row])
+            .expect("configure contact fixture");
+        let client = ManagedClient::spawn(
+            Client::with_timeout(companion, Duration::from_secs(1)).expect("valid request timeout"),
+        );
+        client.connect().await.expect("connect virtual companion");
+        let mut writer = OutputWriter::new(OutputMode::Jsonl, Vec::new());
+
+        let publications = collect_full_device_snapshot(&client, &mut writer)
+            .await
+            .expect("collect startup snapshot");
+        assert_eq!(publications.len(), 3);
+        match &publications[0] {
+            Publication::Contacts(data) => {
+                assert_eq!(data.lastmod, 0);
+                assert_eq!(data.contacts.len(), 1);
+                assert_eq!(data.contacts[0].public_key, "ab".repeat(32));
+                assert_eq!(data.contacts[0].out_path, "1234");
+                assert_eq!(data.contacts[0].contact_type, ContactTypeData::Sensor);
+            }
+            other => panic!("expected contacts publication, got {other:?}"),
+        }
+        assert!(matches!(
+            publications[1],
+            Publication::Telemetry(TelemetryData::Battery { .. })
+        ));
+        match &publications[2] {
+            Publication::Telemetry(TelemetryData::RawCayenneLpp {
+                source_pubkey_prefix,
+                payload,
+            }) => {
+                assert_eq!(source_pubkey_prefix.len(), 12);
+                assert!(
+                    source_pubkey_prefix
+                        .bytes()
+                        .all(|byte| { byte.is_ascii_digit() || matches!(byte, b'a'..=b'f') })
+                );
+                assert!(!payload.is_empty());
+            }
+            other => panic!("expected raw telemetry publication, got {other:?}"),
+        }
+        assert!(writer.into_inner().is_empty());
+        client.shutdown().await.expect("shutdown virtual companion");
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_queries_are_nonfatal_and_never_create_samples() {
+        let client = ManagedClient::spawn(
+            Client::with_timeout(VirtualCompanion::new(), Duration::from_millis(20))
+                .expect("valid request timeout"),
+        );
+        let mut writer = OutputWriter::new(OutputMode::Jsonl, Vec::new());
+
+        let publications = collect_full_device_snapshot(&client, &mut writer)
+            .await
+            .expect("query failures should remain nonfatal");
+        assert!(publications.is_empty());
+
+        let output = String::from_utf8(writer.into_inner()).expect("diagnostics are UTF-8");
+        assert_eq!(output.lines().count(), 3);
+        assert!(output.contains("\"published\":false"));
+        assert!(!output.contains("\"published\":true"));
+        assert!(!output.contains("public_key"));
+        assert!(!output.contains("payload"));
+        client.shutdown().await.expect("shutdown virtual companion");
+    }
+
+    #[test]
+    fn opaque_contact_notifications_debounce_one_authoritative_resync() {
+        let start = Instant::now();
+        let mut debounce = ContactResyncDebounce::default();
+        assert!(!debounce.observe(
+            &Event::UnknownPacket {
+                code: 0x89,
+                payload: vec![0xff],
+            },
+            start,
+        ));
+
+        for (offset, code) in [(0, 0x8a), (100, 0x8f), (200, 0x90)] {
+            assert!(debounce.observe(
+                &Event::UnknownPacket {
+                    code,
+                    // Deliberately malformed/opaque: scheduling must not inspect it.
+                    payload: vec![0xff, 0x00, 0x80],
+                },
+                start + Duration::from_millis(offset),
+            ));
+        }
+        let deadline = debounce.deadline().expect("resync scheduled");
+        assert_eq!(
+            deadline,
+            start + Duration::from_millis(200) + CONTACT_RESYNC_DEBOUNCE
+        );
+        assert!(!debounce.take_due(deadline - Duration::from_millis(1)));
+        assert!(debounce.take_due(deadline));
+        assert!(!debounce.take_due(deadline));
+    }
+
+    #[test]
+    fn only_broker_disconnect_then_connect_requests_another_full_snapshot() {
+        let mut reconnect_pending = false;
+        assert!(!broker_reconnect_requires_snapshot(
+            Some(&GatewayNotice::BrokerState(ConnectionStatus::Connected)),
+            &mut reconnect_pending,
+        ));
+        assert!(!broker_reconnect_requires_snapshot(
+            Some(&GatewayNotice::BrokerState(ConnectionStatus::Disconnected,)),
+            &mut reconnect_pending,
+        ));
+        assert!(broker_reconnect_requires_snapshot(
+            Some(&GatewayNotice::BrokerState(ConnectionStatus::Connected)),
+            &mut reconnect_pending,
+        ));
+        assert!(!broker_reconnect_requires_snapshot(
+            Some(&GatewayNotice::BrokerState(ConnectionStatus::Connected)),
+            &mut reconnect_pending,
+        ));
+        assert!(!broker_reconnect_requires_snapshot(
+            Some(&GatewayNotice::CommandReady),
+            &mut reconnect_pending,
+        ));
     }
 }

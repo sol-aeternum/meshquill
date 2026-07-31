@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sol-aeternum/meshquill/schemas/meshquill-hook-v1.schema.json",
+  "title": "Meshquill trusted-local-hook v1 event envelope",
+  "description": "Events delivered to configured trusted local Python hook handlers.",
+  "oneOf": [
+    { "$ref": "#/$defs/on_connect" },
+    { "$ref": "#/$defs/on_disconnect" },
+    { "$ref": "#/$defs/on_message" },
+    { "$ref": "#/$defs/before_send" },
+    { "$ref": "#/$defs/after_send" },
+    { "$ref": "#/$defs/on_ack" },
+    { "$ref": "#/$defs/on_timeout" },
+    { "$ref": "#/$defs/on_contact_update" },
+    { "$ref": "#/$defs/on_error" }
+  ],
+  "$defs": {
+    "envelope": {
+      "type": "object",
+      "required": ["schema", "event_id", "timestamp", "event", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "const": "meshquill.hook/v1" },
+        "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "timestamp": { "type": "integer", "minimum": 0 },
+        "event": {
+          "enum": [
+            "on_connect",
+            "on_disconnect",
+            "on_message",
+            "before_send",
+            "after_send",
+            "on_ack",
+            "on_timeout",
+            "on_contact_update",
+            "on_error"
+          ]
+        },
+        "payload": { "type": "object" }
+      }
+    },
+    "on_connect": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "on_connect" },
+            "payload": { "$ref": "#/$defs/connect_payload" }
+          }
+        }
+      ]
+    },
+    "on_disconnect": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "on_disconnect" },
+            "payload": { "$ref": "#/$defs/disconnect_payload" }
+          }
+        }
+      ]
+    },
+    "on_message": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "on_message" },
+            "payload": { "$ref": "#/$defs/message_payload" }
+          }
+        }
+      ]
+    },
+    "before_send": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "before_send" },
+            "payload": { "$ref": "#/$defs/send_payload" }
+          }
+        }
+      ]
+    },
+    "after_send": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "after_send" },
+            "payload": { "$ref": "#/$defs/after_send_payload" }
+          }
+        }
+      ]
+    },
+    "on_ack": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "on_ack" },
+            "payload": { "$ref": "#/$defs/ack_payload" }
+          }
+        }
+      ]
+    },
+    "on_timeout": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "on_timeout" },
+            "payload": { "$ref": "#/$defs/timeout_payload" }
+          }
+        }
+      ]
+    },
+    "on_contact_update": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "on_contact_update" },
+            "payload": { "$ref": "#/$defs/contact_payload" }
+          }
+        }
+      ]
+    },
+    "on_error": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "properties": {
+            "event": { "const": "on_error" },
+            "payload": { "$ref": "#/$defs/error_payload" }
+          }
+        }
+      ]
+    },
+    "connect_payload": {
+      "type": "object",
+      "required": ["transport", "peer"],
+      "additionalProperties": true,
+      "properties": {
+        "transport": { "type": "string", "minLength": 1 },
+        "peer": { "type": ["string", "null"] }
+      }
+    },
+    "disconnect_payload": {
+      "type": "object",
+      "required": ["transport", "reason"],
+      "additionalProperties": true,
+      "properties": {
+        "transport": { "type": "string", "minLength": 1 },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "message_payload": {
+      "type": "object",
+      "required": ["source", "text", "message_id"],
+      "additionalProperties": true,
+      "properties": {
+        "source": { "type": "string" },
+        "text": { "type": "string" },
+        "message_id": { "type": ["string", "null"] }
+      }
+    },
+    "send_payload": {
+      "type": "object",
+      "required": ["destination", "text"],
+      "additionalProperties": true,
+      "properties": {
+        "destination": { "type": "string", "minLength": 1 },
+        "text": { "type": "string" }
+      }
+    },
+    "after_send_payload": {
+      "type": "object",
+      "required": ["destination", "text", "message_id"],
+      "additionalProperties": true,
+      "properties": {
+        "destination": { "type": "string", "minLength": 1 },
+        "text": { "type": "string" },
+        "message_id": { "type": ["string", "null"] }
+      }
+    },
+    "ack_payload": {
+      "type": "object",
+      "required": ["message_id", "source", "round_trip_ms"],
+      "additionalProperties": true,
+      "properties": {
+        "message_id": { "type": "string", "minLength": 1 },
+        "source": { "type": ["string", "null"] },
+        "round_trip_ms": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "timeout_payload": {
+      "type": "object",
+      "required": ["operation", "message_id"],
+      "additionalProperties": true,
+      "properties": {
+        "operation": { "type": "string", "minLength": 1 },
+        "message_id": { "type": ["string", "null"] }
+      }
+    },
+    "contact_payload": {
+      "type": "object",
+      "required": ["contact_id", "display_name", "change"],
+      "additionalProperties": true,
+      "properties": {
+        "contact_id": { "type": "string", "minLength": 1 },
+        "display_name": { "type": ["string", "null"] },
+        "change": { "enum": ["added", "updated", "removed"] }
+      }
+    },
+    "error_payload": {
+      "type": "object",
+      "required": ["operation", "message"],
+      "additionalProperties": true,
+      "properties": {
+        "operation": { "type": "string", "minLength": 1 },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

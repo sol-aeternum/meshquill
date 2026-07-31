@@ -1,0 +1,420 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sol-aeternum/meshquill/schemas/meshquill-mqtt-v1.schema.json",
+  "title": "Meshquill MQTT v1 envelope",
+  "description": "Stable application-event and allowlisted command contract for meshquill.mqtt/v1.",
+  "oneOf": [
+    { "$ref": "#/$defs/incoming_message_envelope" },
+    { "$ref": "#/$defs/ack_envelope" },
+    { "$ref": "#/$defs/connection_state_envelope" },
+    { "$ref": "#/$defs/contacts_envelope" },
+    { "$ref": "#/$defs/telemetry_envelope" },
+    { "$ref": "#/$defs/send_direct_envelope" },
+    { "$ref": "#/$defs/send_channel_envelope" }
+  ],
+  "$defs": {
+    "base_envelope": {
+      "type": "object",
+      "required": ["schema", "event_id", "origin", "timestamp", "type", "data"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "const": "meshquill.mqtt/v1" },
+        "event_id": {
+          "type": "string",
+          "format": "uuid",
+          "not": { "const": "00000000-0000-0000-0000-000000000000" }
+        },
+        "origin": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+        },
+        "timestamp": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "type": {
+          "enum": [
+            "incoming_message",
+            "ack",
+            "connection_state",
+            "contacts",
+            "telemetry",
+            "send_direct",
+            "send_channel"
+          ]
+        },
+        "data": { "type": "object" }
+      }
+    },
+    "incoming_message_envelope": {
+      "allOf": [
+        { "$ref": "#/$defs/base_envelope" },
+        {
+          "properties": {
+            "type": { "const": "incoming_message" },
+            "data": { "$ref": "#/$defs/incoming_message_data" }
+          }
+        }
+      ]
+    },
+    "ack_envelope": {
+      "allOf": [
+        { "$ref": "#/$defs/base_envelope" },
+        {
+          "properties": {
+            "type": { "const": "ack" },
+            "data": { "$ref": "#/$defs/ack_data" }
+          }
+        }
+      ]
+    },
+    "connection_state_envelope": {
+      "allOf": [
+        { "$ref": "#/$defs/base_envelope" },
+        {
+          "properties": {
+            "type": { "const": "connection_state" },
+            "data": { "$ref": "#/$defs/connection_state_data" }
+          }
+        }
+      ]
+    },
+    "contacts_envelope": {
+      "allOf": [
+        { "$ref": "#/$defs/base_envelope" },
+        {
+          "properties": {
+            "type": { "const": "contacts" },
+            "data": { "$ref": "#/$defs/contacts_data" }
+          }
+        }
+      ]
+    },
+    "telemetry_envelope": {
+      "allOf": [
+        { "$ref": "#/$defs/base_envelope" },
+        {
+          "properties": {
+            "type": { "const": "telemetry" },
+            "data": { "$ref": "#/$defs/telemetry_data" }
+          }
+        }
+      ]
+    },
+    "send_direct_envelope": {
+      "allOf": [
+        { "$ref": "#/$defs/base_envelope" },
+        {
+          "properties": {
+            "type": { "const": "send_direct" },
+            "data": { "$ref": "#/$defs/send_direct_data" }
+          }
+        }
+      ]
+    },
+    "send_channel_envelope": {
+      "allOf": [
+        { "$ref": "#/$defs/base_envelope" },
+        {
+          "properties": {
+            "type": { "const": "send_channel" },
+            "data": { "$ref": "#/$defs/send_channel_data" }
+          }
+        }
+      ]
+    },
+    "message_source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "pubkey_prefix"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "direct" },
+            "pubkey_prefix": { "type": "string", "pattern": "^[0-9a-f]{12}$" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "channel_idx"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "channel" },
+            "channel_idx": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        }
+      ]
+    },
+    "message_route": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "direct" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "hash_mode", "hop_count"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "path" },
+            "hash_mode": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "hop_count": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        }
+      ]
+    },
+    "message_status": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "enum": ["received", "queued", "acked"] } }
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "sent" },
+            "suggested_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "reason"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "failed" },
+            "reason": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "incoming_message_data": {
+      "type": "object",
+      "required": ["source", "route", "txt_type", "sender_timestamp", "text", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/message_source" },
+        "route": { "$ref": "#/$defs/message_route" },
+        "txt_type": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "sender_timestamp": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "signature": { "type": "string", "pattern": "^[0-9a-f]{8}$" },
+        "text": { "type": "string" },
+        "snr": { "type": "number" },
+        "status": { "$ref": "#/$defs/message_status" }
+      }
+    },
+    "ack_data": {
+      "type": "object",
+      "required": ["code"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string", "pattern": "^[0-9a-f]{8}$" },
+        "trip_time_ms": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "connection_state_data": {
+      "type": "object",
+      "required": ["component", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "component": { "enum": ["mesh_core", "mqtt_broker"] },
+        "status": { "enum": ["connected", "disconnected"] },
+        "reason": { "type": "string" }
+      }
+    },
+    "contact_type": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "enum": ["chat", "repeater", "room", "sensor"] } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "code"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "unknown" },
+            "code": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        }
+      ]
+    },
+    "contact_route": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "flood" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "hash_mode", "hop_count"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "path" },
+            "hash_mode": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "hop_count": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        }
+      ]
+    },
+    "contact": {
+      "type": "object",
+      "required": [
+        "public_key",
+        "contact_type",
+        "flags",
+        "route",
+        "out_path",
+        "adv_name",
+        "last_advert",
+        "adv_lat",
+        "adv_lon",
+        "lastmod"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "public_key": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "contact_type": { "$ref": "#/$defs/contact_type" },
+        "flags": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "route": { "$ref": "#/$defs/contact_route" },
+        "out_path": { "type": "string", "pattern": "^(?:[0-9a-f]{2}){0,128}$" },
+        "adv_name": { "type": "string" },
+        "last_advert": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "adv_lat": { "type": "number" },
+        "adv_lon": { "type": "number" },
+        "lastmod": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "contacts_data": {
+      "type": "object",
+      "required": ["contacts", "lastmod"],
+      "additionalProperties": false,
+      "properties": {
+        "contacts": { "type": "array", "items": { "$ref": "#/$defs/contact" } },
+        "lastmod": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "telemetry_data": {
+      "oneOf": [
+        { "$ref": "#/$defs/telemetry_battery" },
+        { "$ref": "#/$defs/telemetry_stats_core" },
+        { "$ref": "#/$defs/telemetry_stats_radio" },
+        { "$ref": "#/$defs/telemetry_stats_packets" },
+        { "$ref": "#/$defs/telemetry_raw_cayenne_lpp" }
+      ]
+    },
+    "telemetry_battery": {
+      "type": "object",
+      "required": ["kind", "level"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "battery" },
+        "level": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "used_kb": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "total_kb": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "telemetry_stats_core": {
+      "type": "object",
+      "required": ["kind", "battery_mv", "uptime_seconds", "errors", "queue_length"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "stats_core" },
+        "battery_mv": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "uptime_seconds": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "errors": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "queue_length": { "type": "integer", "minimum": 0, "maximum": 255 }
+      }
+    },
+    "telemetry_stats_radio": {
+      "type": "object",
+      "required": [
+        "kind",
+        "noise_floor",
+        "last_rssi",
+        "last_snr",
+        "tx_airtime_seconds",
+        "rx_airtime_seconds"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "stats_radio" },
+        "noise_floor": { "type": "integer", "minimum": -32768, "maximum": 32767 },
+        "last_rssi": { "type": "integer", "minimum": -128, "maximum": 127 },
+        "last_snr": { "type": "number" },
+        "tx_airtime_seconds": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "rx_airtime_seconds": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "telemetry_stats_packets": {
+      "type": "object",
+      "required": ["kind", "recv", "sent", "flood_recv", "flood_sent", "direct_recv", "direct_sent"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "stats_packets" },
+        "recv": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "sent": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "flood_recv": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "flood_sent": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "direct_recv": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "direct_sent": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "recv_errors": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "telemetry_raw_cayenne_lpp": {
+      "type": "object",
+      "required": ["kind", "source_pubkey_prefix", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "raw_cayenne_lpp" },
+        "source_pubkey_prefix": { "type": "string", "pattern": "^[0-9a-f]{12}$" },
+        "payload": { "type": "string", "pattern": "^(?:[0-9a-f]{2})*$" }
+      }
+    },
+    "send_direct_data": {
+      "type": "object",
+      "required": ["destination", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "destination": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^\\u0000]+$"
+        }
+      }
+    },
+    "send_channel_data": {
+      "type": "object",
+      "required": ["channel", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "channel": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^\\u0000]+$"
+        }
+      }
+    }
+  }
+}

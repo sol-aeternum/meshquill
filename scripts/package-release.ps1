@@ -28,7 +28,7 @@ try {
     $completionDirectory = Join-Path $stageRoot "share/completions"
     New-Item -ItemType Directory -Force -Path $binDirectory, $manDirectory, $completionDirectory | Out-Null
     Copy-Item $binary (Join-Path $binDirectory "meshquill.exe")
-    Copy-Item "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", "STATUS.md", "PLAN.md", "LICENSE-APACHE", "LICENSE-MIT" $stageRoot
+    Copy-Item "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", "LICENSE-APACHE", "LICENSE-MIT" $stageRoot
     Copy-Item "docs", "examples", "schemas" $stageRoot -Recurse
 
     $completionFiles = @{

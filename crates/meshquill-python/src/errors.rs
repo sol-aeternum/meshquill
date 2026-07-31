@@ -121,6 +121,10 @@ pub(crate) fn store_error(error: StoreError) -> PyErr {
                 "cannot locate the Meshquill configuration directory on {platform:?}: {context}"
             ))
         }
+        StoreError::LockTimeout { path } => ConfigurationError::new_err(format!(
+            "another Meshquill process is still updating '{}'; wait for it to finish, then retry",
+            path.display()
+        )),
         StoreError::Serde { .. } => ConfigurationError::new_err(
             "could not decode Meshquill configuration; check the TOML structure",
         ),

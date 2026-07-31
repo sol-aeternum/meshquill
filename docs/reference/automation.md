@@ -1,9 +1,9 @@
 # Automation contract
 
 Meshquill separates finite command results from live event streams. This page documents the
-`meshquill.cli/v1` contract implemented by the current `0.1.0-rc.2` source checkout. Until
-[status](../../STATUS.md) records a published RC2 prerelease, this is a source contract rather than
-a claim that released RC2 artifacts are available.
+`meshquill.cli/v1` contract implemented by the current `0.1.0-rc.3` source checkout. Until
+[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published RC3
+prerelease, this is a source contract rather than a claim that released RC3 artifacts are available.
 
 ## Output modes
 
@@ -39,11 +39,14 @@ paths, signatures, acknowledgement codes, or opaque payloads are generally lower
 Do not assume every byte-bearing field is a hex string: for example, the current `self_info`
 representation serializes its public key as a JSON byte array.
 
-The checked-in [Draft 2020-12 envelope schema](../../schemas/meshquill-cli-v1.schema.json) is the
-normative machine-readable contract. A [finite-result fixture](../../schemas/compat/cli-v1-result.json)
-and [JSONL stream fixture](../../schemas/compat/cli-v1-stream.jsonl) provide representative records
-for compatibility checks. The schema intentionally leaves fields under `data` open so compatible
-releases can add nested data without changing the envelope version.
+The checked-in [Draft 2020-12 schema](../../schemas/meshquill-cli-v1.schema.json) is the normative
+machine-readable contract. A [finite-result fixture](../../schemas/compat/cli-v1-result.json),
+[JSONL stream fixture](../../schemas/compat/cli-v1-stream.jsonl), and
+[exhaustive known-type corpus](../../schemas/compat/cli-v1-known.jsonl) provide executable
+compatibility records. The corpus contains one valid example for every declared first-party record
+type, and CI rejects schema/type drift. Known record families validate their principal fields.
+Fields under `data` remain open and unknown record types remain valid so compatible additions do
+not break older consumers; top-level envelope additions require a new schema version.
 
 ## Representative result types
 
@@ -58,6 +61,11 @@ contain additional fields.
 | `inbox` | `inbox` | `profile`, `messages`, `drained` |
 | `network_discovery` | `network discover` | `profile`, `filter`, `scope`, `timeout_ms`, `nodes` |
 | `history` | `history list` | `profile`, `enabled`, `storage`, `path`, `entries` |
+| `profiles` | `profiles list` | `profiles`, `default_profile` |
+| `profile_reconfigured` | `profiles reconfigure` | `profile`, `transport`, `default` |
+| `profile_renamed` | `profiles rename` | `old`, `new`, `default`, `history_migrated`, `warning` |
+| `profile_deleted` | `profiles delete` | `profile`, `default_cleared`, `history_retained`, `credentials_retained` |
+| `profile_default_set` | `profiles set-default` | `profile` |
 | `configuration` | `config show` | `path`, `needs_migration`, `effective` |
 | `hook_status` | `hooks status` | `protocol`, `enabled`, `configured`, hook failure policies |
 | `mqtt_status` | `mqtt status` | `schema`, connection settings, authentication flags, `topic_prefix`, `allow_send`, `broker_state` |
@@ -135,7 +143,8 @@ The runner:
 - accepts at most 1,000 commands and 4,096 bytes per line;
 - rejects invalid UTF-8 and NUL bytes;
 - ignores blank and comment-only lines;
-- inherits the outer profile, config path, timeout, confirmation, and verbosity settings;
+- inherits the outer profile, config path, data directory, timeout, confirmation, and verbosity
+  settings;
 - forces each nested command to non-interactive, quiet, colour-free JSON mode;
 - stops at the first failure and returns that command's exit status; and
 - returns successful nested envelopes in the outer `batch_run.data.results` array together with
@@ -143,9 +152,9 @@ The runner:
 
 Global options must appear on the outer invocation, not inside a command file. Nested `batch`,
 `init`, configuration mutation, `mqtt configure`, `watch`, `chat`, `mqtt bridge`, streaming
-`connect --watch`, completion generation, and manpage generation are rejected. `config show` is
-allowed. Destructive commands still require explicit outer `--yes`; there is no implicit batch-wide
-confirmation.
+`connect --watch`, completion generation, and manpage generation are rejected. `config show` and
+`profiles list` are allowed; profile mutations are rejected. Destructive commands still require
+explicit outer `--yes`; there is no implicit batch-wide confirmation.
 
 Filtered contact batching is a separate fixed-operation surface:
 

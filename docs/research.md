@@ -1,6 +1,6 @@
 # Authoritative research
 
-Research date: 2026-07-30 (Australia/Adelaide)
+Research date: 2026-07-31 (Australia/Adelaide)
 
 This file records the sources used to design behavior. Source commits are pinned because upstream
 is active. Protocol decisions must be rechecked before each release.
@@ -20,11 +20,26 @@ is active. Protocol decisions must be rechecked before each release.
 
 - BLE carries a raw companion packet per characteristic write/notification. The Nordic-UART-style
   service is `6e400001-b5a3-f393-e0a9-e50e24dcca9e`; app-to-device RX ends in `0002`, and
-  device-to-app TX ends in `0003`.
+  device-to-app TX ends in `0003`. A write with response may use the platform's ATT
+  Prepare/Execute long-write procedure, but it remains one characteristic write at the application
+  boundary. Splitting a packet into several application writes is invalid because firmware queues
+  each Nordic UART callback as a separate frame. Current `meshcore_py` likewise makes one
+  write-with-response call. The relevant pinned implementations are the firmware
+  [nRF52 receive path](https://github.com/meshcore-dev/MeshCore/blob/03b6ef4b0de98fc70b49ef10a6d0d61f8381fb7a/src/helpers/nrf52/SerialBLEInterface.cpp#L360-L398),
+  [nRF ATT long-write assembly](https://github.com/meshcore-dev/Adafruit_nRF52_Arduino/blob/d541301665b40959682252911e57b11df3ee651a/libraries/Bluefruit52Lib/src/BLECharacteristic.cpp#L454-L511),
+  and [Python BLE write](https://github.com/meshcore-dev/meshcore_py/blob/c487efbe187f4b000020afdfc0349c4cdf503c5a/src/meshcore/ble_cx.py#L220-L223).
+- Current firmware's logical companion-frame limit is 176 bytes, independent of transport. The
+  pinned firmware defines [`MAX_FRAME_SIZE`](https://github.com/meshcore-dev/MeshCore/blob/03b6ef4b0de98fc70b49ef10a6d0d61f8381fb7a/src/helpers/BaseSerialInterface.h#L5),
+  and its [ESP32 BLE path](https://github.com/meshcore-dev/MeshCore/blob/03b6ef4b0de98fc70b49ef10a6d0d61f8381fb7a/src/helpers/esp32/SerialBLEInterface.cpp#L115-L128)
+  rejects a larger callback. Meshquill therefore submits at most 176 bytes in one BLE provider
+  call. With-response writes may exceed `MTU - 3` through an ATT long write; without-response
+  writes remain limited to `MTU - 3` because ATT has no long write command.
 - USB serial and TCP add an outer frame. App-to-device is `0x3c` plus a two-byte little-endian
   payload length; device-to-app is `0x3e` plus the length. Current Python rejects declared frames
-  above 300 bytes. A streaming decoder must tolerate partial reads, reject oversized frames and
-  resynchronize without unbounded buffering.
+  above 300 bytes. That 300-byte value is a defensive declared-length parser bound, not firmware
+  send capacity. A streaming decoder must tolerate partial reads, reject declared lengths above
+  300, pass complete frames to the 176-byte companion-packet validator, and resynchronize without
+  unbounded buffering.
 - The inner packet starts with a one-byte command, response or push code. Most request/response
   pairs have no sequence identifier. Concurrent ordinary commands can therefore consume the wrong
   response if matched only by type. Meshquill serializes these commands; binary/anonymous flows may
@@ -97,4 +112,6 @@ These projects are UX/packaging references only and are not protocol sources.
 - A self-contained Rust 1.97.1 toolchain was installed under `/tmp` for development.
 - No USB serial node is exposed. USB enumeration cannot initialize. Bluetooth tooling exists, but
   D-Bus access fails in this container. These facts prohibit a physical-test claim.
-- GitHub CLI's stored credential for `sol-aeternum` is expired. Publication remains a final gate.
+- GitHub CLI authentication was refreshed during release preparation. Registry publication still
+  depends on separate crates.io/PyPI credentials and GitHub release publication remains an explicit
+  final disclosure gate.

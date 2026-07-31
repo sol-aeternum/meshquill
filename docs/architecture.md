@@ -46,12 +46,21 @@ Queues and broadcasts are bounded; a slow subscriber receives an explicit lag er
 causing unbounded memory growth.
 
 Receive packets have no protocol-wide unique message ID. The core publishes every representable
-message and never uses a payload fingerprint as permanent identity. At the CLI workflow boundary,
-fresh UUIDv7 IDs identify accepted local observations. Matching fingerprints pair only opposite-path
-live/queued observations within five seconds, 256 retained entries, and one connection. Each match
-consumes one entry, preserving multiplicity, while same-path repeats remain distinct. This heuristic
-identifies only a likely duplicate delivery observation: distinct identical opposite-path
-occurrences within the window can collide. Reconnection clears the correlation state.
+message and never uses a payload fingerprint as identity. Each decoded message receives an
+ephemeral, non-serialized client-local observation ID; the returned inbox value and its event-bus
+clone carry the same ID. The CLI coalesces only that exact pair. Separately decoded packets always
+receive distinct IDs, so identical direct or channel payloads remain distinct. Fresh UUIDv7 IDs
+identify accepted local workflow/history observations. Reconnection clears the bounded correlation
+state.
+
+`SYNC_NEXT_MESSAGE` responses have no request tag. Live radio arrivals produce the distinct
+`MESSAGES_WAITING` notification; each sync command then returns exactly one message or terminal
+response. Before issuing that command, the core non-blockingly drains already-buffered asynchronous
+notifications through the ordinary event path, with a fixed bound. A ready message or terminal
+packet is conservatively reconciled as a late response to an earlier cancelled or timed-out sync,
+without another write. The client records the outstanding response before awaiting the transport
+write, publishes valid push packets while waiting, and blocks later commands until that one response
+is consumed or reconnect clears the ambiguous session state.
 
 Transport writes are never automatically replayed. A cancellation or disconnect after a write can
 be ambiguous, and callers must reconcile before choosing another explicit send. Core reconnect is
@@ -73,9 +82,10 @@ timestamp, route, SNR and signature are not retained.
 ## Untrusted-input policy
 
 - Inner companion packets and serial/TCP frames are decoded separately.
-- The outer payload cap is 300 bytes; the configuration input cap is one MiB, line input is 4096
-  bytes, operation timeouts are at most 24 hours, and command strings, paths, broker payloads, hook
-  I/O and queue sizes have independent bounds.
+- The firmware-derived logical companion-packet cap is 176 bytes and the independent defensive
+  outer-frame cap is 300 bytes; the configuration input cap is one MiB, line input is 4096 bytes,
+  operation timeouts are at most 24 hours, and command strings, paths, broker payloads, hook I/O and
+  queue sizes have independent bounds.
 - Lengths are checked before indexing/allocation; invalid UTF-8 returns a typed parse error and
   opaque bytes remain bytes.
 - Unknown/future packets are bounded and observable instead of guessed into a typed model.
@@ -94,9 +104,10 @@ Secrets are stored as credential-store, environment or explicit prompt reference
 and diagnostics expose only redacted status. MQTT/remote passwords are read from a secure terminal
 or an explicit stdin option, never a password argv flag. See [configuration](configuration.md).
 
-History is disabled by default. When enabled it stores bounded plaintext JSONL under
-`history/<profile>.jsonl` beside the configuration. Retention, permissions, contents and deletion
-are documented in [messaging and chat](messaging-and-chat.md).
+History is disabled by default. When enabled it stores bounded plaintext JSONL under the platform
+application-data root, with a digest namespace for explicit config paths and bounded one-way
+reconciliation from the previous config-adjacent location. Retention, permissions, contents and
+deletion are documented in [messaging and chat](messaging-and-chat.md).
 
 ## Output and automation
 

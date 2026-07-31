@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::{
     args::{
         BatchCommand, BatchContactsArgs, Cli, ColorMode, Command, ConfigCommand, MqttCommand,
-        OutputMode,
+        OutputMode, ProfileCommand,
     },
     config::select_profile,
     error::CliError,
@@ -465,6 +465,7 @@ fn has_line_global_option(words: &[String]) -> bool {
     const LONG_GLOBALS: &[&str] = &[
         "--profile",
         "--config",
+        "--data-dir",
         "--output",
         "--non-interactive",
         "--yes",
@@ -496,8 +497,9 @@ fn validate_nested_command(command: &Command) -> Result<(), &'static str> {
     match command {
         Command::Batch(_) => Err("nested batch commands are not allowed"),
         Command::Init(_) => Err("init is not allowed inside a batch file"),
-        Command::Config(ConfigCommand::Show) => Ok(()),
+        Command::Config(ConfigCommand::Show) | Command::Profiles(ProfileCommand::List) => Ok(()),
         Command::Config(_) => Err("configuration mutation is not allowed inside a batch file"),
+        Command::Profiles(_) => Err("profile mutation is not allowed inside a batch file"),
         Command::Watch(_) | Command::Chat(_) | Command::Mqtt(MqttCommand::Bridge) => {
             Err("streaming commands are not allowed inside a batch file")
         }
@@ -517,6 +519,7 @@ fn validate_nested_command(command: &Command) -> Result<(), &'static str> {
 fn inherit_globals(parent: &Cli, nested: &mut Cli) {
     nested.profile.clone_from(&parent.profile);
     nested.config.clone_from(&parent.config);
+    nested.data_dir.clone_from(&parent.data_dir);
     nested.timeout = parent.timeout;
     nested.yes = parent.yes;
     nested.verbose = parent.verbose;
@@ -797,5 +800,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("status fixture did not parse: {error}"));
         assert!(matches!(&status.command, Command::Status));
         assert!(validate_nested_command(&status.command).is_ok());
+
+        let profiles = Cli::try_parse_from(["meshquill", "profiles", "list"])
+            .unwrap_or_else(|error| panic!("profiles list fixture did not parse: {error}"));
+        assert!(validate_nested_command(&profiles.command).is_ok());
+        let mutation = Cli::try_parse_from(["meshquill", "profiles", "set-default", "field"])
+            .unwrap_or_else(|error| panic!("profile mutation fixture did not parse: {error}"));
+        assert!(validate_nested_command(&mutation.command).is_err());
     }
 }

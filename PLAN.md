@@ -34,8 +34,8 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
       retained unconfirmed draft with explicit resend/discard handling. A full-screen TUI was
       deliberately deferred because it is not required for a usable keyboard-only RC and would add
       terminal-state risk without hardware evidence.
-- [x] Doctor checks, completions, 77 man pages, examples, command suggestions, output contracts,
-      redaction, and stable exit statuses.
+- [x] Doctor checks, completions, generated command-tree man pages, examples, command suggestions,
+      output contracts, redaction, and stable exit statuses.
 
 ## Phase 3 — automation integrations
 
@@ -52,6 +52,9 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
 
 ## Phase 4 — hardening and local delivery
 
+The completed gates in the first part of this phase record the RC1/RC2 baseline. RC3 has its own
+fresh candidate-specific gates below; prior-candidate results are not carried forward.
+
 - [x] Bounded-input, no-replay, secret-redaction, no-unsafe, and no-placeholder review.
 - [x] Rust, Python, docs, workflow, fuzz, MQTT, dependency-audit, and licence-policy local gates.
 - [x] Demonstrate all 20 acceptance scenarios locally or record the exact unavailable physical/
@@ -67,13 +70,20 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
 - [x] Harden RC2 reconnect/no-replay behavior, bounded live/queued correlation with documented
       collision limits, SIGINT cleanup, line chat, input/timeout/config bounds, output schemas,
       remote/MQTT fuzzing, real-broker security cases, and exact Python tool pins.
-- [ ] Run RC2 pre-tag CI and supply-chain gates, push the annotated `v0.1.0-rc.2` tag, then run its
-      tagged Linux x86-64/ARM64, macOS Intel/ARM64, and Windows x86-64 artifact matrix; inspect all
-      five archives and five wheels without moving or replacing the tag.
+- [x] Run RC2 pre-tag CI and supply-chain gates, push the annotated `v0.1.0-rc.2` tag, then run its
+      tagged Linux x86-64/ARM64, macOS Intel/ARM64, and Windows x86-64 artifact matrix. Preserve the
+      immutable private draft as superseded after its packaged status documentation proved stale.
+- [x] Prepare RC3 profile lifecycle and selection, platform data roots/history reconciliation,
+      firmware-derived BLE bounds, exact incoming-observation correlation, balanced hook lifecycle,
+      MQTT startup feeds/environment secrets, and executable CLI/hook/MQTT schemas.
+- [x] Complete the fresh RC3 local gates, clean-room/PTY/artifact review, and all 20 acceptance
+      scenarios, explicitly recording the unavailable physical-radio portion rather than claiming
+      deterministic coverage as hardware evidence.
+- [ ] Push the exact RC3 candidate through CI and supply-chain gates, create immutable annotated
+      `v0.1.0-rc.3`, and inspect all five archives, five wheels, checksums, and packaged docs.
 - [ ] Run the separate physical-hardware suite and add actual device/firmware/transport rows.
-- [ ] Inspect the RC2 draft artifacts, publish registry packages in dependency order when
-      credentials exist, and publish the GitHub prerelease regardless of independent registry
-      credential availability.
+- [ ] Publish registry packages in dependency order when credentials exist, and request explicit
+      maintainer approval before changing the tested RC3 GitHub draft to a public prerelease.
 
 ## Current blockers
 
@@ -83,6 +93,6 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
    repository. This blocks only those two registry uploads; it does not block the tagged artifacts
    or public GitHub prerelease.
 
-The GitHub repository and RC1 draft exist, authentication is active, and the corrected RC2 source
-is being gated. Artifact and publication work proceeds in the exact order kept in
+The GitHub repository and superseded RC1/RC2 drafts exist, authentication is active, and RC3 is
+being gated. Artifact and publication work proceeds in the exact order kept in
 [the release runbook](docs/release.md).

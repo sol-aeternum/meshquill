@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use meshquill_core::{ReconnectableTransport, Transport, TransportError, TransportKind};
+use meshquill_core::{ReadyRead, ReconnectableTransport, Transport, TransportError, TransportKind};
 use meshquill_test_support::{
     ContactFixture, VirtualCompanion, VirtualCompanionCapacities, VirtualCompanionError,
     make_channel_message_packet, make_contact_row,
@@ -76,6 +76,10 @@ impl Transport for DemoTransport {
             }
             result => result,
         }
+    }
+
+    fn try_read(&mut self) -> Result<ReadyRead, TransportError> {
+        self.companion.try_read()
     }
 }
 

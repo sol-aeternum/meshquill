@@ -1,0 +1,9 @@
+{"schema":"meshquill.hook/v1","event_id":"fixture-1","timestamp":1725000000001,"event":"on_connect","payload":{"transport":"demo","peer":"Meshquill Demo"}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-2","timestamp":1725000000002,"event":"on_disconnect","payload":{"transport":"demo","reason":null}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-3","timestamp":1725000000003,"event":"on_message","payload":{"source":"Alice","text":"hello","message_id":"019ad1d5-9d22-7b11-83a7-6f58d6054ad6"}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-4","timestamp":1725000000004,"event":"before_send","payload":{"destination":"Alice","text":"hello"}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-5","timestamp":1725000000005,"event":"after_send","payload":{"destination":"Alice","text":"hello","message_id":"019ad1d5-9d22-7b11-83a7-6f58d6054ad6"}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-6","timestamp":1725000000006,"event":"on_ack","payload":{"message_id":"019ad1d5-9d22-7b11-83a7-6f58d6054ad6","source":null,"round_trip_ms":42}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-7","timestamp":1725000000007,"event":"on_timeout","payload":{"operation":"send","message_id":null}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-8","timestamp":1725000000008,"event":"on_contact_update","payload":{"contact_id":"a1b2c3d4e5f6","display_name":"Alice","change":"updated"}}
+{"schema":"meshquill.hook/v1","event_id":"fixture-9","timestamp":1725000000009,"event":"on_error","payload":{"operation":"contacts","message":"request failed"}}

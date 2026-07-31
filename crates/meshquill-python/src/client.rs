@@ -8,7 +8,10 @@ use meshquill_core::{
     Client as CoreClient, Contact, CoreError, MANAGED_CLIENT_COMMAND_CAPACITY, ManagedClient,
     ReconnectableTransport, SelfInfo, StatsType,
 };
-use meshquill_store::{Config, ConfigStore, LoadOutcome, Platform, TransportConfig};
+use meshquill_store::{
+    Config, ConfigStore, LoadOutcome, Platform, ProfileSelectionError, TransportConfig,
+    resolve_profile as resolve_stored_profile,
+};
 use meshquill_transport::{BleTransport, SerialTransport, TcpTransport};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
@@ -776,19 +779,20 @@ fn load_auto_selection(
 }
 
 fn select_profile(config: &Config, explicit_profile: Option<&str>) -> PyResult<AutoSelection> {
-    let profile_name = explicit_profile
-        .map(str::to_owned)
-        .or_else(|| config.default_profile.clone())
-        .ok_or_else(|| {
-            ConfigurationError::new_err(
-                "Meshquill configuration has no default_profile; select one in config or pass profile=",
-            )
-        })?;
-    let profile = config.device_profiles.get(&profile_name).ok_or_else(|| {
-        ConfigurationError::new_err(format!(
-            "Meshquill profile {profile_name:?} does not exist in device_profiles"
-        ))
+    let resolved = resolve_stored_profile(config, explicit_profile).map_err(|error| match error {
+        ProfileSelectionError::NoneConfigured => ConfigurationError::new_err(
+            "Meshquill configuration has no device profiles; create one with `meshquill init`",
+        ),
+        ProfileSelectionError::Ambiguous { profiles } => ConfigurationError::new_err(format!(
+            "Meshquill configuration has multiple profiles without a default ({}); run `meshquill profiles set-default NAME` or pass profile=",
+            profiles.join(", ")
+        )),
+        ProfileSelectionError::NotFound { name } => ConfigurationError::new_err(format!(
+            "Meshquill profile {name:?} does not exist in device_profiles"
+        )),
     })?;
+    let profile_name = resolved.name.to_owned();
+    let profile = resolved.profile;
     let transport = match &profile.transport {
         TransportConfig::Ble { id, .. } => SelectedTransport::Ble {
             selector: id.clone(),
@@ -975,6 +979,30 @@ mod tests {
             SelectedTransport::Serial { ref port, baud } if port == "/dev/backup" && baud == 9_600
         ));
         assert_eq!(selected.request_timeout, Duration::from_millis(456));
+    }
+
+    #[test]
+    fn auto_uses_the_sole_profile_without_a_default() {
+        let mut config = config_with_profiles();
+        config.default_profile = None;
+        config
+            .device_profiles
+            .retain(|name, _profile| name == "backup");
+        let selected = select_profile(&config, None).expect("sole profile selection");
+        assert_eq!(selected.profile_name, "backup");
+    }
+
+    #[test]
+    fn auto_rejects_ambiguous_profiles_with_default_command_hint() {
+        Python::initialize();
+        let mut config = config_with_profiles();
+        config.default_profile = None;
+        let Err(error) = select_profile(&config, None) else {
+            panic!("ambiguous profiles must fail");
+        };
+        let message = error.to_string();
+        assert!(message.contains("multiple profiles without a default"));
+        assert!(message.contains("meshquill profiles set-default NAME"));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! Compatibility tests for the versioned machine-readable CLI envelope.
 
-use std::process::Command;
+use std::{collections::HashSet, process::Command};
 
 use meshquill::{
     args::OutputMode,
@@ -22,6 +22,10 @@ const RESULT_FIXTURE: &str = include_str!(concat!(
 const STREAM_FIXTURE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schemas/compat/cli-v1-stream.jsonl"
+));
+const KNOWN_TYPES_FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../schemas/compat/cli-v1-known.jsonl"
 ));
 
 fn parse_json(label: &str, input: &str) -> Value {
@@ -115,6 +119,22 @@ fn checked_in_compatibility_fixtures_match_the_exact_envelope() {
         assert!(!line.trim().is_empty(), "JSONL fixture line is empty");
         let record = parse_json(&format!("JSONL fixture line {}", index + 1), line);
         assert_valid_envelope(&format!("JSONL fixture line {}", index + 1), &record);
+    }
+
+    let known_records: Vec<_> = KNOWN_TYPES_FIXTURE.lines().collect();
+    assert_eq!(known_records.len(), 69);
+    let mut known_types = HashSet::with_capacity(known_records.len());
+    for (index, line) in known_records.into_iter().enumerate() {
+        assert!(!line.trim().is_empty(), "known-type fixture line is empty");
+        let record = parse_json(&format!("known-type fixture line {}", index + 1), line);
+        assert_valid_envelope(&format!("known-type fixture line {}", index + 1), &record);
+        let record_type = record["type"]
+            .as_str()
+            .unwrap_or_else(|| panic!("known-type fixture line {} has no type", index + 1));
+        assert!(
+            known_types.insert(record_type.to_owned()),
+            "known-type fixture repeats {record_type}"
+        );
     }
 }
 

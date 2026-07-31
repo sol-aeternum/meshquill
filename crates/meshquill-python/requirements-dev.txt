@@ -2,6 +2,8 @@
 # Python 3.9 compatibility jobs install only the exact Maturin build tool below.
 # Transitive dependencies are resolved and vulnerability-audited by the supply-chain job.
 maturin==1.11.5
+jsonschema==4.26.0
+types-jsonschema==4.26.0.20260518
 mypy==1.20.2
 pip-audit==2.10.0
 pytest==9.1.1

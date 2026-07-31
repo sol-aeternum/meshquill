@@ -786,6 +786,19 @@ pub struct Contact {
     pub lastmod: u32,
 }
 
+/// Complete contact-directory response and its firmware sequence marker.
+///
+/// The marker belongs to the response as a whole and is taken verbatim from the
+/// terminating `CONTACT_END` packet. It must not be inferred from individual
+/// contact rows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContactSnapshot {
+    /// Contact entries returned by the companion.
+    pub contacts: Vec<Contact>,
+    /// Last-modified sequence reported by the terminating packet.
+    pub lastmod: u32,
+}
+
 impl fmt::Debug for Contact {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Contact")
@@ -986,6 +999,12 @@ impl fmt::Debug for MessageSource {
 /// A parsed inbound message packet.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Ephemeral client-local identifier for clones of one decoded packet.
+    ///
+    /// This value is not serialized, is not stable across clients or process restarts, and is not
+    /// a `MeshCore` message identity. Parser-only or caller-constructed values may leave it unset.
+    #[serde(skip)]
+    pub observation_id: Option<u64>,
     /// Where the message originated.
     pub source: MessageSource,
     /// Routing path metadata.
@@ -1005,21 +1024,18 @@ pub struct Message {
 }
 
 impl Message {
-    /// Returns a payload fingerprint for bounded correlation of likely duplicate delivery
-    /// observations.
+    /// Returns a deterministic digest of selected payload fields for diagnostics and tests.
     ///
     /// The fingerprint covers the logical sender/channel, message type, sender timestamp,
     /// optional signature, and text. It deliberately excludes route, signal strength, and local
     /// delivery status because firmware can report the same radio payload through multiple paths.
     /// `MeshCore` exposes no globally unique message identifier: channel packets omit sender identity,
-    /// and timestamps have one-second resolution. Equal fingerprints therefore do not prove the
-    /// same occurrence or a retransmission; a distinct identical opposite-path occurrence inside
-    /// the correlation window can collide.
+    /// and timestamps have one-second resolution. Equal digests therefore do not prove the same
+    /// occurrence or a retransmission and must never be used to suppress delivery.
     ///
-    /// The CLI pairs only opposite live/queued paths within one connection, five seconds, and 256
-    /// retained entries. Each match consumes one entry, preserving multiplicity, and same-path
-    /// repeats remain distinct. This value is neither an authentication token nor a permanent
-    /// identity or unbounded deduplication key.
+    /// This value is neither an authentication token nor a message identity or deduplication key.
+    /// Use [`Self::observation_id`] to correlate clones produced by one client-side packet
+    /// observation.
     #[must_use]
     pub fn delivery_fingerprint(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -1056,6 +1072,7 @@ impl Message {
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Message")
+            .field("observation_id", &self.observation_id)
             .field("source", &self.source)
             .field("route", &self.route)
             .field("txt_type", &self.txt_type)

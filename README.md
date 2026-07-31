@@ -5,36 +5,39 @@ companion devices. It provides BLE, USB serial and TCP transports, clear interac
 interfaces, trusted local Python hooks, and an optional application-level MQTT gateway. The native
 CLI does not require Python.
 
-The current source checkout identifies as `0.1.0-rc.2`; no corresponding tag or public RC2
-prerelease is claimed until [status and evidence](STATUS.md) records it. Its protocol model is based
-on MeshCore companion firmware v1.16.0, `meshcore_py` v2.3.8 and current upstream source pinned on
-2026-07-30. No physical radio was available in the build environment, so BLE/serial/TCP code is
+This source tree identifies as `0.1.0-rc.3`. Tag, artifact, and public-prerelease availability are
+reported only by [live status and evidence](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md);
+a source checkout or packaged documentation snapshot does not itself prove publication. Its
+protocol model is based on MeshCore companion firmware v1.16.0, `meshcore_py`
+v2.3.8, and the upstream research snapshot dated 2026-07-31. No physical radio was available in the
+build environment, so BLE/serial/TCP code is
 simulated and host-tested but **not claimed as hardware-verified**. See the
 [hardware matrix](docs/hardware-testing.md).
 
 ## Install
 
-The currently available installation path is the source checkout:
+Source installation is always available from a checkout:
 
 ```console
 cargo install --path crates/meshquill-cli --locked
 ```
 
-After [status](STATUS.md) records a published `v0.1.0-rc.2` prerelease, its archives will contain
+When [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published
+`v0.1.0-rc.3` prerelease, its archives contain
 the binary, four shell completions, man pages and licences. Each checksum is a separate sibling
 `.sha256` release asset; `SHA256SUMS` is another release asset covering the native archives and
-Python wheels. The tagged-source installation will then be:
+Python wheels. The corresponding tagged-source installation is:
 
 ```console
 cargo install --locked --git https://github.com/sol-aeternum/meshquill \
-  --tag v0.1.0-rc.2 meshquill
+  --tag v0.1.0-rc.3 meshquill
 ```
 
 Linux source builds need a C compiler, `pkg-config`, D-Bus development headers and libudev
 development headers. Enabling libudev keeps serial enumeration fallible instead of relying on an
 upstream `/sys` fallback that can panic in restricted containers. Debian/Ubuntu uses
 `libdbus-1-dev libudev-dev pkg-config`.
-The RC2 workflow is configured to build release binaries for Linux x86-64/ARM64, macOS
+The release workflow is configured to build release binaries for Linux x86-64/ARM64, macOS
 Intel/Apple Silicon and Windows x86-64; the exact runtime baselines and conditional clean-install
 procedure are in [installation](docs/installation.md).
 
@@ -55,7 +58,10 @@ meshquill watch
 ```
 
 Profiles are named. Use `--profile field` on any operation, or make one the default during `init`.
-`doctor` checks configuration and host transport support. Add `--connect` to attempt a protocol
+With one stored profile it is selected automatically; multiple profiles without a default require
+an explicit selection. Use `meshquill profiles list`, `reconfigure`, `rename`, `delete`, and
+`set-default` for lifecycle management. `doctor` checks configuration and host transport support.
+Add `--connect` to attempt a protocol
 handshake and classify the documented `DEVICE_INFO` layout; this bounded check does not replace
 firmware-side or physical-radio troubleshooting:
 
@@ -92,9 +98,9 @@ waiting for input, supports contact switching/search and filtered history, and r
 destination-bound unconfirmed draft across a recoverable reconnect. It is not a full-screen TUI in
 this RC.
 
-Local message history is disabled by default. Enabling it writes bounded **plaintext JSONL** beside
-the selected configuration; use `meshquill history clear --yes` to delete it. Details are in
-[Messaging and chat](docs/messaging-and-chat.md).
+Local message history is disabled by default. Enabling it writes bounded **plaintext JSONL** under
+the platform application-data root; `--data-dir`/`MESHQUILL_DATA_DIR` overrides that location. Use
+`meshquill history clear --yes` to delete it. Details are in [Messaging and chat](docs/messaging-and-chat.md).
 
 ## Automation
 
@@ -149,7 +155,7 @@ the stable CPython 3.9+ ABI and do not depend on the old Python MeshCore impleme
 
 Meshquill distinguishes local device commands from operations sent to a selected repeater, room or
 sensor. Passwords come from a secure prompt, explicit stdin or the OS credential store. Destructive
-contact/path/history operations require confirmation or `--yes`. Network discovery supports node
+contact/path/history and profile rename/delete operations require confirmation or `--yes`. Network discovery supports node
 kind and flood-scope filters; scope changes used by one command are restored afterward. See
 [Remote administration](docs/remote-administration.md) and the
 [capability matrix](docs/capability-matrix.md).
@@ -175,9 +181,10 @@ kind and flood-scope filters; scope changes used by one command are restored aft
   safe one-shot CLI cannot reconstruct firmware advertisement state it never observed.
 - `watch` and line chat make at most three companion reconnect attempts with bounded delay; finite
   mutations do not retry. Meshquill never guesses whether an ambiguous radio send should be replayed.
-- The source checkout is the current RC2 delivery. GitHub archives become the primary RC
-  distribution only after [status](STATUS.md) records a published prerelease; crates.io and PyPI
-  commands likewise remain unavailable unless their separate publication is recorded there.
+- GitHub archives are the primary RC distribution only while
+  [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published
+  prerelease; crates.io and PyPI commands likewise remain unavailable unless their separate
+  publication is recorded there.
 
 Meshquill is independent community software and is not an official MeshCore package. It is dual
 licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

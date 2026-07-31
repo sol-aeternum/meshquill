@@ -1,11 +1,7 @@
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, ops::Deref, sync::Arc};
 
 use crate::config::SelectedProfile;
-use meshquill_core::{Message, domain::MessageSource};
+use meshquill_core::{ManagedClient, Message, SelfInfo, domain::MessageSource};
 use meshquill_hooks::{
     AfterSendPayload, BeforeSendInput, ContactChange, HookEvent, HookRuntime, OnAckPayload,
     OnConnectPayload, OnContactUpdatePayload, OnDisconnectPayload, OnErrorPayload,
@@ -27,8 +23,17 @@ pub(crate) struct WorkflowServices {
     profile_name: String,
 }
 
+/// One ordinary, non-streaming companion connection with a balanced hook lifecycle.
+///
+/// Streaming and reconnecting commands keep their explicit state machines; this wrapper is for
+/// commands whose device work fits inside one successful handshake and one terminal result.
+pub(crate) struct CompanionSession {
+    client: ManagedClient,
+    workflow: WorkflowServices,
+    operation: &'static str,
+}
+
 const INCOMING_CORRELATION_CAPACITY: usize = 256;
-const INCOMING_CORRELATION_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IncomingOrigin {
@@ -38,9 +43,8 @@ pub(crate) enum IncomingOrigin {
 
 #[derive(Debug)]
 struct IncomingOccurrence {
-    fingerprint: [u8; 32],
+    observation_id: u64,
     origin: IncomingOrigin,
-    observed_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -49,17 +53,12 @@ struct IncomingTracker {
 }
 
 impl IncomingTracker {
-    fn observe(&mut self, fingerprint: [u8; 32], origin: IncomingOrigin) -> bool {
-        self.observe_at(fingerprint, origin, Instant::now())
-    }
-
-    fn observe_at(&mut self, fingerprint: [u8; 32], origin: IncomingOrigin, now: Instant) -> bool {
-        self.occurrences.retain(|occurrence| {
-            now.saturating_duration_since(occurrence.observed_at) <= INCOMING_CORRELATION_WINDOW
-        });
-
+    fn observe(&mut self, observation_id: Option<u64>, origin: IncomingOrigin) -> bool {
+        let Some(observation_id) = observation_id else {
+            return true;
+        };
         if let Some(position) = self.occurrences.iter().position(|occurrence| {
-            occurrence.fingerprint == fingerprint && occurrence.origin != origin
+            occurrence.observation_id == observation_id && occurrence.origin != origin
         }) {
             self.occurrences.remove(position);
             return false;
@@ -69,9 +68,8 @@ impl IncomingTracker {
             self.occurrences.pop_front();
         }
         self.occurrences.push_back(IncomingOccurrence {
-            fingerprint,
+            observation_id,
             origin,
-            observed_at: now,
         });
         true
     }
@@ -103,6 +101,123 @@ impl OutgoingRecord {
     }
 }
 
+impl CompanionSession {
+    /// Initialize workflow services, complete the handshake, and then emit `on_connect`.
+    pub(crate) async fn connect(
+        selected: &SelectedProfile,
+        client: ManagedClient,
+        operation: &'static str,
+    ) -> Result<(Self, SelfInfo), CliError> {
+        let workflow = WorkflowServices::from_selected(selected)?;
+        let info = match client.connect().await {
+            Ok(info) => info,
+            Err(error) => {
+                let _ = client.shutdown().await;
+                return Err(CliError::from(error));
+            }
+        };
+
+        if let Err(primary) = workflow.connected(&info.name).await {
+            if workflow
+                .disconnected(Some("connection hook failed"))
+                .await
+                .is_err()
+            {
+                tracing::warn!("secondary disconnect hook failure; details omitted");
+            }
+            if client.shutdown().await.is_err() {
+                tracing::warn!("secondary client shutdown failure; details omitted");
+            }
+            return Err(primary);
+        }
+
+        Ok((
+            Self {
+                client,
+                workflow,
+                operation,
+            },
+            info,
+        ))
+    }
+
+    pub(crate) const fn client(&self) -> &ManagedClient {
+        &self.client
+    }
+
+    pub(crate) const fn workflow(&self) -> &WorkflowServices {
+        &self.workflow
+    }
+
+    /// Finish a post-connect result without allowing hook or shutdown cleanup to mask it.
+    pub(crate) async fn finish<T>(&self, operation: Result<T, CliError>) -> Result<T, CliError> {
+        let mut primary = operation;
+
+        if let Err(error) = &primary {
+            self.emit_primary_error(error).await;
+        }
+
+        let shutdown = self.client.shutdown().await.map_err(CliError::from);
+        match (&primary, shutdown) {
+            (Err(_), Err(_)) => {
+                tracing::warn!("secondary client shutdown failure; details omitted");
+            }
+            (Ok(_), Err(error)) => {
+                self.emit_primary_error(&error).await;
+                primary = Err(error);
+            }
+            (_, Ok(())) => {}
+        }
+
+        let reason = match &primary {
+            Ok(_) => "command completed",
+            Err(error) if error.status() == ExitStatus::Interrupted => "command interrupted",
+            Err(_) => "command failed",
+        };
+        let disconnected = self.workflow.disconnected(Some(reason)).await;
+
+        match primary {
+            Err(error) => {
+                if disconnected.is_err() {
+                    tracing::warn!("secondary disconnect hook failure; details omitted");
+                }
+                Err(error)
+            }
+            Ok(value) => {
+                disconnected?;
+                Ok(value)
+            }
+        }
+    }
+
+    async fn emit_primary_error(&self, error: &CliError) {
+        if should_emit_error(error.status())
+            && self
+                .workflow
+                .error(self.operation, error.message())
+                .await
+                .is_err()
+        {
+            tracing::warn!("secondary error hook failure; details omitted");
+        }
+    }
+}
+
+impl Deref for CompanionSession {
+    type Target = ManagedClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+const fn should_emit_error(status: ExitStatus) -> bool {
+    !matches!(
+        status,
+        ExitStatus::Success | ExitStatus::Hook | ExitStatus::Mqtt | ExitStatus::Interrupted
+    )
+}
+
 impl WorkflowServices {
     pub(crate) fn from_selected(selected: &SelectedProfile) -> Result<Self, CliError> {
         let hook_runtime = selected
@@ -113,14 +228,7 @@ impl WorkflowServices {
             .map(|config| HookRuntime::new(config).map_err(CliError::from))
             .transpose()?;
         let history_store = if selected.config.history.enabled {
-            Some(Arc::new(
-                meshquill_store::HistoryStore::for_config(
-                    &selected.path,
-                    &selected.name,
-                    selected.config.history.max_messages,
-                )
-                .map_err(CliError::from)?,
-            ))
+            Some(Arc::new(selected.history_store()?))
         } else {
             None
         };
@@ -335,14 +443,12 @@ impl WorkflowServices {
         Ok(())
     }
 
-    /// Records one incoming-message observation unless heuristically coalesced with a likely
-    /// duplicate delivery observation from the opposite path.
+    /// Records one incoming-message observation unless it is the exact broadcast/return clone
+    /// already consumed through the opposite path.
     ///
-    /// A matching payload fingerprint pairs only one live and one queued observation within the
-    /// current connection, five seconds, and 256 retained entries. Each match consumes one entry,
-    /// preserving multiplicity; same-path repeats remain distinct. Because `MeshCore` supplies no
-    /// globally unique message ID, a distinct identical opposite-path occurrence can collide. A
-    /// match is not proof of the same occurrence or a retransmission.
+    /// Correlation uses the ephemeral observation ID assigned by the core client to clones of one
+    /// decoded packet. Payload equality is never used, so distinct identical messages remain
+    /// distinct. Parser-only values without an observation ID are always accepted.
     pub(crate) async fn incoming(
         &self,
         message: &Message,
@@ -352,7 +458,7 @@ impl WorkflowServices {
             .incoming_tracker
             .lock()
             .await
-            .observe(message.delivery_fingerprint(), origin);
+            .observe(message.observation_id, origin);
         if !is_new {
             return Ok(None);
         }
@@ -498,14 +604,7 @@ pub(crate) fn history_store_for_selected(
         return Ok(None);
     }
 
-    HistoryStore::for_config(
-        &selected.path,
-        &selected.name,
-        selected.config.history.max_messages,
-    )
-    .map(Arc::new)
-    .map(Some)
-    .map_err(CliError::from)
+    selected.history_store().map(Arc::new).map(Some)
 }
 
 #[cfg(test)]
@@ -517,8 +616,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        INCOMING_CORRELATION_CAPACITY, INCOMING_CORRELATION_WINDOW, IncomingOrigin,
-        IncomingTracker, WorkflowServices, history_store_for_selected,
+        INCOMING_CORRELATION_CAPACITY, IncomingOrigin, IncomingTracker, WorkflowServices,
+        history_store_for_selected,
     };
     use crate::config::SelectedProfile;
 
@@ -541,6 +640,8 @@ mod tests {
             profile,
             path: dir.path().join("config.toml"),
             needs_migration: false,
+            data_dir: Some(dir.path().join("data")),
+            namespaced_history: true,
         };
 
         (dir, selected)
@@ -574,6 +675,7 @@ mod tests {
         let services = WorkflowServices::from_selected(&selected).expect("service");
 
         let message = meshquill_core::Message {
+            observation_id: Some(1),
             source: meshquill_core::domain::MessageSource::Direct {
                 pubkey_prefix: "peer123".to_owned(),
             },
@@ -614,6 +716,7 @@ mod tests {
         let (_dir, selected) = selected_profile(true);
         let services = WorkflowServices::from_selected(&selected).expect("service");
         let direct = meshquill_core::Message {
+            observation_id: Some(1),
             source: meshquill_core::domain::MessageSource::Direct {
                 pubkey_prefix: "peer123".to_owned(),
             },
@@ -652,10 +755,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_payloads_with_distinct_observation_ids_are_both_preserved() {
+        let (_dir, selected) = selected_profile(true);
+        let services = WorkflowServices::from_selected(&selected).expect("service");
+        let live = meshquill_core::Message {
+            observation_id: Some(10),
+            source: meshquill_core::domain::MessageSource::Channel { channel_idx: 1 },
+            route: MessageRoute::Direct,
+            txt_type: 0,
+            sender_timestamp: 9,
+            signature: None,
+            text: "same text".to_owned(),
+            snr: None,
+            status: MessageStatus::Received,
+        };
+        let queued = meshquill_core::Message {
+            observation_id: Some(11),
+            ..live.clone()
+        };
+
+        assert!(
+            services
+                .incoming(&live, IncomingOrigin::Live)
+                .await
+                .expect("live message")
+                .is_some()
+        );
+        assert!(
+            services
+                .incoming(&queued, IncomingOrigin::Queue)
+                .await
+                .expect("queued message")
+                .is_some()
+        );
+
+        let store = history_store_for_selected(&selected, true)
+            .expect("history configuration")
+            .expect("history");
+        assert_eq!(store.load().expect("load history").len(), 2);
+    }
+
+    #[tokio::test]
     async fn reconnect_starts_a_fresh_incoming_correlation_scope() {
         let (_dir, selected) = selected_profile(true);
         let services = WorkflowServices::from_selected(&selected).expect("service");
         let message = meshquill_core::Message {
+            observation_id: Some(1),
             source: meshquill_core::domain::MessageSource::Channel { channel_idx: 1 },
             route: MessageRoute::Direct,
             txt_type: 0,
@@ -687,39 +832,34 @@ mod tests {
     }
 
     #[test]
-    fn incoming_tracker_pairs_only_opposite_origin_occurrences() {
+    fn incoming_tracker_pairs_only_exact_opposite_origin_observations() {
         let mut tracker = IncomingTracker::default();
-        let first = [0x11; 32];
-        assert!(tracker.observe(first, IncomingOrigin::Queue));
-        assert!(!tracker.observe(first, IncomingOrigin::Live));
+        assert!(tracker.observe(Some(0x11), IncomingOrigin::Queue));
+        assert!(!tracker.observe(Some(0x11), IncomingOrigin::Live));
 
-        let repeated = [0x22; 32];
-        assert!(tracker.observe(repeated, IncomingOrigin::Live));
-        assert!(tracker.observe(repeated, IncomingOrigin::Live));
-        assert!(!tracker.observe(repeated, IncomingOrigin::Queue));
-        assert!(!tracker.observe(repeated, IncomingOrigin::Queue));
+        assert!(tracker.observe(Some(0x22), IncomingOrigin::Live));
+        assert!(tracker.observe(Some(0x22), IncomingOrigin::Live));
+        assert!(!tracker.observe(Some(0x22), IncomingOrigin::Queue));
+        assert!(!tracker.observe(Some(0x22), IncomingOrigin::Queue));
+        assert!(tracker.observe(None, IncomingOrigin::Live));
+        assert!(tracker.observe(None, IncomingOrigin::Queue));
     }
 
     #[test]
-    fn incoming_tracker_expires_and_evicts_bounded_correlation_state() {
+    fn incoming_tracker_preserves_distinct_ids_and_evicts_bounded_state() {
         let mut tracker = IncomingTracker::default();
-        let start = std::time::Instant::now();
-        let expired = [0x33; 32];
-        assert!(tracker.observe_at(expired, IncomingOrigin::Live, start));
-        assert!(tracker.observe_at(
-            expired,
-            IncomingOrigin::Queue,
-            start + INCOMING_CORRELATION_WINDOW + std::time::Duration::from_nanos(1),
-        ));
+        assert!(tracker.observe(Some(0x33), IncomingOrigin::Live));
+        assert!(tracker.observe(Some(0x34), IncomingOrigin::Queue));
 
         tracker.clear();
         for value in 0..=INCOMING_CORRELATION_CAPACITY {
-            let mut fingerprint = [0_u8; 32];
-            fingerprint[..8].copy_from_slice(&value.to_le_bytes());
-            assert!(tracker.observe(fingerprint, IncomingOrigin::Live));
+            assert!(tracker.observe(
+                Some(u64::try_from(value).expect("test value fits u64")),
+                IncomingOrigin::Live
+            ));
         }
         assert_eq!(tracker.occurrences.len(), INCOMING_CORRELATION_CAPACITY);
-        assert!(tracker.observe([0_u8; 32], IncomingOrigin::Queue));
+        assert!(tracker.observe(Some(0), IncomingOrigin::Queue));
     }
 
     #[tokio::test]

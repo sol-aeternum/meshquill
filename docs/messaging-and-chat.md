@@ -38,6 +38,12 @@ and global `--timeout`.
 The finite `send` command does not reconnect or retry after a transport failure. This avoids an
 ambiguous write being transmitted twice; inspect the result and decide whether to send again.
 
+Once the companion accepts a send, a later fail-closed `after_send`/`on_ack` hook or cleanup failure
+does not erase that fact. Machine output writes the authoritative `send` result first with
+`queued: true`, then the process exits with the secondary failure and a “do not retry
+automatically” hint. This ordering prevents automation from treating an accepted radio write as a
+known-unsent operation.
+
 Message limits are measured in UTF-8 bytes, not characters. Meshquill rejects empty or oversized
 payloads and never splits one input into multiple radio messages. A transport's negotiated payload
 limit can be lower than the protocol-wide bound.
@@ -86,13 +92,18 @@ $ meshquill inbox --limit 10
 In JSON output, `drained` is `true` only when the companion's empty marker was reached. It is
 normally `false` when `--limit` stopped the loop first.
 
-MeshCore receive packets do not provide a globally unique message identifier. Meshquill therefore
-uses a payload fingerprint only for bounded, connection-local heuristic correlation. One matching
-live observation and one queued observation may be paired within five seconds while at most 256
-unmatched observations are retained. A match consumes one observation from each path, preserving
-multiplicity; same-path repeats stay distinct. This only identifies a likely duplicate delivery
-observation, not proof of the same occurrence or a retransmission. Distinct identical occurrences
-seen on opposite paths within the window can collide. Reconnecting clears the correlation state.
+MeshCore receive packets do not provide a globally unique message identifier. Meshquill assigns an
+ephemeral, non-serialized observation ID to each decoded packet and coalesces only the returned inbox
+value with its exact event-bus clone. Separately decoded occurrences always receive different IDs,
+so identical direct or channel messages remain distinct. This is local delivery bookkeeping, not a
+durable MeshCore message or retransmission identity; reconnecting clears the bounded correlation
+state. Live radio arrivals produce a `MESSAGES_WAITING` notification; one `SYNC_NEXT_MESSAGE` then
+returns exactly one message or terminal response. Before each inbox sync, already-buffered
+asynchronous notifications are drained through the ordinary event path. A ready message or terminal
+packet is conservatively reconciled as a late response to an earlier cancelled or timed-out sync,
+without another write. The core records the outstanding response before awaiting the transport
+write, publishes valid push packets while waiting, and blocks later commands until the response is
+consumed or reconnect clears the ambiguous session state.
 
 ## Watch live events
 
@@ -161,6 +172,10 @@ ACK and reports `acknowledged` or `timed_out`. The deadline is the smaller of th
 suggestion and global `--timeout`. An ACK timeout keeps the chat loop alive without retransmitting
 the message. Numeric channel chat has no direct ACK tracking and reports only `sent`.
 
+As with finite send, fail-closed `after_send` and `on_ack` failures are deferred until chat has
+emitted the accepted `sent` and, when observed, `acknowledged` state. Chat then exits rather than
+continuing or retrying the accepted message.
+
 ### Bounded reconnect without automatic resend
 
 Chat never automatically resends. It uses the same three-attempt companion reconnect policy as
@@ -196,11 +211,13 @@ max_messages = 256
 
 The equivalent temporary overrides are `MESHQUILL_HISTORY_ENABLED=true` and
 `MESHQUILL_HISTORY_MAX_MESSAGES=256`. When enabled, Meshquill writes
-`history/<profile>.jsonl` beside the selected configuration. Each versioned record can contain the
-peer/source label, channel, full message text, local direction and status, local-host record time,
-and acknowledgement correlation. Incoming records do not retain the sender timestamp, route, SNR,
-or signature. The stable `id` identifies only that local history record, not a MeshCore protocol
-message or event.
+`history/<profile>.jsonl` under the platform application-data root. Explicit config files receive a
+config-path digest namespace; `--data-dir`/`MESHQUILL_DATA_DIR` overrides the root. Each versioned
+record can contain the peer/source label, channel, full message text, local direction and status,
+local-host record time, and acknowledgement correlation. Incoming records do not retain the sender
+timestamp, route, SNR, or signature. The stable `id` identifies only that local history record, not
+a MeshCore protocol message or event. See [configuration](configuration.md#locate-or-override-application-data)
+for exact platform paths and legacy reconciliation.
 
 Directions and statuses are local bookkeeping, not wire truth. `outgoing` means a local outgoing
 attempt, `pending` means no terminal local result was recorded, and `failed` means a local failure

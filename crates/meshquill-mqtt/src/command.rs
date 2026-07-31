@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::config::{CommandLimits, MAX_DEDUPE_CAPACITY, MAX_DEDUPE_TTL_SECS, MqttConfig};
-use crate::schema::validate_origin;
+use crate::schema::{deserialize_canonical_uuid, validate_origin};
 use crate::topics::{SCHEMA_VERSION, TopicSet};
 
 /// An allowlisted application command accepted from MQTT.
@@ -312,8 +312,6 @@ impl CommandProcessor {
             "send_direct" => {
                 let data: DirectData = serde_json::from_value(envelope.data)
                     .map_err(CommandError::InvalidCommandData)?;
-                validate_destination(&data.destination, self.limits.max_destination_bytes)?;
-                validate_text(&data.text, self.limits.max_text_bytes)?;
                 SendCommand::Direct {
                     destination: data.destination,
                     text: data.text,
@@ -322,13 +320,6 @@ impl CommandProcessor {
             "send_channel" => {
                 let data: ChannelData = serde_json::from_value(envelope.data)
                     .map_err(CommandError::InvalidCommandData)?;
-                if data.channel > self.limits.max_channel {
-                    return Err(CommandError::ChannelOutOfRange {
-                        channel: data.channel,
-                        maximum: self.limits.max_channel,
-                    });
-                }
-                validate_text(&data.text, self.limits.max_text_bytes)?;
                 SendCommand::Channel {
                     channel: data.channel,
                     text: data.text,
@@ -336,6 +327,7 @@ impl CommandProcessor {
             }
             _ => return Err(CommandError::UnsupportedCommand),
         };
+        validate_send_command(&command, self.limits)?;
 
         if self.dedupe.check_and_insert_at(envelope.event_id, now) == DedupeDecision::Duplicate {
             return Err(CommandError::DuplicateEvent);
@@ -350,10 +342,39 @@ impl CommandProcessor {
     }
 }
 
+/// Revalidate a send command against the configured MQTT application limits.
+///
+/// Callers must use this again after any trusted local hook modifies an accepted command and
+/// before performing radio I/O.
+///
+/// # Errors
+/// Returns [`CommandError`] when the destination, channel, or text violates `limits`.
+pub fn validate_send_command(
+    command: &SendCommand,
+    limits: CommandLimits,
+) -> Result<(), CommandError> {
+    match command {
+        SendCommand::Direct { destination, text } => {
+            validate_destination(destination, limits.max_destination_bytes)?;
+            validate_text(text, limits.max_text_bytes)
+        }
+        SendCommand::Channel { channel, text } => {
+            if *channel > limits.max_channel {
+                return Err(CommandError::ChannelOutOfRange {
+                    channel: *channel,
+                    maximum: limits.max_channel,
+                });
+            }
+            validate_text(text, limits.max_text_bytes)
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandEnvelope {
     schema: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     event_id: Uuid,
     origin: String,
     timestamp: u64,
@@ -423,6 +444,9 @@ pub enum CommandError {
     /// MQTT topics must be valid UTF-8.
     #[error("MQTT command topic is not valid UTF-8")]
     InvalidTopicEncoding,
+    /// Retained publications are replayable across fresh sessions and are never commands.
+    #[error("retained MQTT publications are not accepted as commands")]
+    RetainedCommand,
     /// Empty application payloads are invalid.
     #[error("MQTT command payload is empty")]
     EmptyPayload,
@@ -536,6 +560,43 @@ mod tests {
             enabled.subscription_topic(),
             Some("meshquill/meshquill.mqtt/v1/outbound/send")
         );
+    }
+
+    #[test]
+    fn command_event_ids_require_canonical_hyphenated_uuid_spelling() {
+        let config = enabled_config();
+        let topic = TopicSet::new(&config.topic_prefix)
+            .expect("valid topics")
+            .outbound_send()
+            .to_owned();
+        let payload = |event_id: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": SCHEMA_VERSION,
+                "event_id": event_id,
+                "origin": "remote",
+                "timestamp": 42,
+                "type": "send_channel",
+                "data": {"channel": 1, "text": "hello"}
+            }))
+            .expect("serialize UUID fixture")
+        };
+        let canonical = "018f0f65-9b50-7cc2-a6e9-3b8b3a7f3101";
+
+        for accepted in [canonical.to_owned(), canonical.to_uppercase()] {
+            let mut processor = CommandProcessor::new(&config).expect("valid processor");
+            assert!(processor.process(&topic, &payload(&accepted)).is_ok());
+        }
+        for noncanonical in [
+            "018f0f659b507cc2a6e93b8b3a7f3101",
+            "{018f0f65-9b50-7cc2-a6e9-3b8b3a7f3101}",
+            "urn:uuid:018f0f65-9b50-7cc2-a6e9-3b8b3a7f3101",
+        ] {
+            let mut processor = CommandProcessor::new(&config).expect("valid processor");
+            assert!(matches!(
+                processor.process(&topic, &payload(noncanonical)),
+                Err(CommandError::InvalidJson(_))
+            ));
+        }
     }
 
     #[test]

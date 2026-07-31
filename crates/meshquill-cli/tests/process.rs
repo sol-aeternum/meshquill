@@ -146,6 +146,28 @@ fn invoke_with_env(arguments: &[&str], name: &str, value: &str) -> std::process:
         .unwrap_or_else(|error| panic!("failed to run meshquill: {error}"))
 }
 
+fn invoke_with_envs(arguments: &[&str], environment: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_meshquill"));
+    command
+        .args(arguments)
+        .env_remove("MESHQUILL_CONFIG")
+        .env_remove("MESHQUILL_DATA_DIR");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run meshquill: {error}"))
+}
+
+fn invoke_in_dir(arguments: &[&str], directory: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_meshquill"))
+        .args(arguments)
+        .current_dir(directory)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run meshquill: {error}"))
+}
+
 fn invoke_with_env_timeout(
     arguments: &[&str],
     name: &str,
@@ -299,6 +321,21 @@ fn config_path(directory: &TempDir) -> String {
     directory.path().join("config.toml").display().to_string()
 }
 
+fn data_dir_path(directory: &TempDir) -> String {
+    directory.path().join("data").display().to_string()
+}
+
+fn history_path(directory: &TempDir, config: &str, profile: &str) -> std::path::PathBuf {
+    meshquill_store::history_paths(
+        &directory.path().join("data"),
+        Path::new(config),
+        true,
+        profile,
+    )
+    .expect("isolated history paths")
+    .canonical
+}
+
 fn hook_fixture(name: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../meshquill-hooks/tests/fixtures")
@@ -333,6 +370,87 @@ fn add_hook_config(path: &str, script: &str, python_executable: Option<&str>) {
     fs::write(path, config).expect("write configuration with hook section");
 }
 
+fn add_recording_hook(directory: &TempDir, config: &str) -> std::path::PathBuf {
+    let script = directory.path().join("record_hook.py");
+    fs::write(
+        &script,
+        concat!(
+            "import json\n",
+            "from pathlib import Path\n",
+            "\n",
+            "def _record(event):\n",
+            "    marker = Path(__file__).with_suffix('.jsonl')\n",
+            "    with marker.open('a', encoding='utf-8') as stream:\n",
+            "        stream.write(json.dumps(event, sort_keys=True) + '\\n')\n",
+            "\n",
+            "def on_connect(event):\n",
+            "    _record(event)\n",
+            "\n",
+            "def on_disconnect(event):\n",
+            "    _record(event)\n",
+            "\n",
+            "def on_message(event):\n",
+            "    _record(event)\n",
+            "\n",
+            "def on_contact_update(event):\n",
+            "    _record(event)\n",
+            "\n",
+            "def on_error(event):\n",
+            "    _record(event)\n",
+        ),
+    )
+    .expect("write recording hook");
+    add_hook_config(config, &script.display().to_string(), None);
+    script
+}
+
+fn add_closed_failing_hook(directory: &TempDir, config: &str, handler: &str) -> std::path::PathBuf {
+    assert!(matches!(handler, "after_send" | "on_ack"));
+    let script = directory.path().join(format!("fail_{handler}.py"));
+    fs::write(
+        &script,
+        format!(
+            concat!(
+                "from pathlib import Path\n",
+                "\n",
+                "def {handler}(event):\n",
+                "    marker = Path(__file__).with_suffix('.count')\n",
+                "    with marker.open('a', encoding='utf-8') as stream:\n",
+                "        stream.write('called\\n')\n",
+                "    raise RuntimeError('deliberate post-acceptance failure')\n",
+            ),
+            handler = handler,
+        ),
+    )
+    .expect("write failing hook");
+    add_hook_config(config, &script.display().to_string(), None);
+    let configured = fs::read_to_string(config).expect("read hook configuration");
+    let closed = configured.replacen(
+        "[hook]\nenabled = true\n",
+        "[hook]\nenabled = true\nobservational_failure = \"closed\"\n",
+        1,
+    );
+    assert_ne!(closed, configured, "hook section was not found");
+    fs::write(config, closed).expect("enable fail-closed observational hooks");
+    script
+}
+
+fn failing_hook_call_count(script: &Path) -> usize {
+    fs::read_to_string(script.with_extension("count"))
+        .expect("failing hook marker")
+        .lines()
+        .count()
+}
+
+fn recorded_hook_events(script: &Path) -> Vec<Value> {
+    let records =
+        fs::read_to_string(script.with_extension("jsonl")).expect("recording hook JSONL marker");
+    records
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("recorded hook event JSON"))
+        .collect()
+}
+
 fn enable_history(path: &str) {
     let config = fs::read_to_string(path).expect("read existing configuration");
     let updated = config.replacen("[history]\nenabled = false", "[history]\nenabled = true", 1);
@@ -352,6 +470,7 @@ fn init_demo(config: &str) {
         "--set-default",
     ]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(output.stderr.is_empty());
 }
 
 fn set_mock_scenario(config: &str, scenario: &str) {
@@ -499,6 +618,39 @@ fn demo_contacts_support_show_search_and_unique_prefixes() {
         assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
         assert!(text(&output.stdout).contains("Alice"));
     }
+
+    let output = invoke(&[
+        "--config", &config, "--output", "json", "contacts", "show", "Alice",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let parsed: Value = serde_json::from_slice(&output.stdout).expect("contact JSON");
+    assert_eq!(parsed["type"], "contact");
+    assert_eq!(parsed["data"]["profile"], "demo");
+    assert_eq!(parsed["data"]["name"], "Alice");
+    assert_eq!(
+        parsed["data"]["public_key"],
+        "2222222222222222222222222222222222222222222222222222222222222222"
+    );
+}
+
+#[test]
+fn contacts_refresh_reports_the_already_mandatory_fresh_device_query() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    for (refresh_requested, extra) in [(false, None), (true, Some("--refresh"))] {
+        let mut arguments = vec!["--config", &config, "--output", "json", "contacts"];
+        if let Some(extra) = extra {
+            arguments.push(extra);
+        }
+        let output = invoke(&arguments);
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let parsed: Value = serde_json::from_slice(&output.stdout).expect("contacts JSON");
+        assert_eq!(parsed["type"], "contacts");
+        assert_eq!(parsed["data"]["refreshed"], true);
+        assert_eq!(parsed["data"]["refresh_requested"], refresh_requested);
+    }
 }
 
 #[test]
@@ -541,6 +693,68 @@ fn demo_direct_send_waits_for_deterministic_ack() {
     let parsed: Value = serde_json::from_slice(&output.stdout).expect("JSON send result");
     assert_eq!(parsed["data"]["acknowledged"], true);
     assert_eq!(parsed["data"]["ack_code"], "12345678");
+}
+
+#[test]
+fn ordinary_send_reports_accepted_delivery_before_fail_closed_post_send_hooks() {
+    for handler in ["after_send", "on_ack"] {
+        let directory = TempDir::new().expect("temporary directory");
+        let config = config_path(&directory);
+        init_demo(&config);
+        enable_history(&config);
+        let data_dir = data_dir_path(&directory);
+        let script = add_closed_failing_hook(&directory, &config, handler);
+
+        let output = invoke(&[
+            "--config",
+            &config,
+            "--data-dir",
+            &data_dir,
+            "--output",
+            "json",
+            "send",
+            "Alice",
+            "hello",
+            "--wait",
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(11),
+            "{handler}: {}",
+            text(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{handler}: authoritative send JSON: {error}"));
+        assert_eq!(report["type"], "send");
+        assert_eq!(report["data"]["queued"], true);
+        assert_eq!(report["data"]["acknowledged"], true);
+        assert!(
+            text(&output.stderr).contains("device already accepted the message"),
+            "{handler}: {}",
+            text(&output.stderr)
+        );
+        assert_eq!(failing_hook_call_count(&script), 1, "{handler}");
+
+        let history = invoke(&[
+            "--config",
+            &config,
+            "--data-dir",
+            &data_dir,
+            "--output",
+            "json",
+            "history",
+            "list",
+        ]);
+        assert_eq!(history.status.code(), Some(0), "{handler}");
+        let history: Value = serde_json::from_slice(&history.stdout).expect("history JSON");
+        let outgoing = history["data"]["entries"]
+            .as_array()
+            .expect("history entries")
+            .iter()
+            .filter(|entry| entry["direction"] == "outgoing")
+            .count();
+        assert_eq!(outgoing, 1, "{handler}: accepted send must not be replayed");
+    }
 }
 
 #[test]
@@ -979,10 +1193,13 @@ fn scoped_ack_wait_handles_sigint_without_success_or_replay() {
     init_demo(&config);
     enable_history(&config);
     set_mock_scenario(&config, "ack-timeout");
-    let history = directory.path().join("history/demo.jsonl");
+    let data_dir = data_dir_path(&directory);
+    let history = history_path(&directory, &config, "demo");
     let mut child = InterruptibleChild::spawn(&[
         "--config",
         &config,
+        "--data-dir",
+        &data_dir,
         "--timeout",
         "5s",
         "--output",
@@ -1072,10 +1289,28 @@ fn opt_in_history_tracks_delivery_receive_and_confirmed_clear() {
     let config = config_path(&directory);
     init_demo(&config);
     enable_history(&config);
+    let data_dir = data_dir_path(&directory);
 
-    let sent = invoke(&["--config", &config, "send", "Alice", "retained", "--wait"]);
+    let sent = invoke(&[
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "send",
+        "Alice",
+        "retained",
+        "--wait",
+    ]);
     assert_eq!(sent.status.code(), Some(0), "{}", text(&sent.stderr));
-    let received = invoke(&["--config", &config, "inbox", "--limit", "1"]);
+    let received = invoke(&[
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "inbox",
+        "--limit",
+        "1",
+    ]);
     assert_eq!(
         received.status.code(),
         Some(0),
@@ -1083,7 +1318,16 @@ fn opt_in_history_tracks_delivery_receive_and_confirmed_clear() {
         text(&received.stderr)
     );
 
-    let listed = invoke(&["--config", &config, "--output", "json", "history", "list"]);
+    let listed = invoke(&[
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "--output",
+        "json",
+        "history",
+        "list",
+    ]);
     assert_eq!(listed.status.code(), Some(0), "{}", text(&listed.stderr));
     let parsed: Value = serde_json::from_slice(&listed.stdout).expect("history JSON");
     assert_eq!(parsed["data"]["storage"], "plaintext_opt_in");
@@ -1098,13 +1342,101 @@ fn opt_in_history_tracks_delivery_receive_and_confirmed_clear() {
     );
     assert!(entries.iter().any(|entry| entry["status"] == "received"));
 
-    let refused = invoke(&["--config", &config, "history", "clear"]);
+    let refused = invoke(&[
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "history",
+        "clear",
+    ]);
     assert_eq!(refused.status.code(), Some(9));
     let cleared = invoke(&[
-        "--config", &config, "--yes", "--output", "json", "history", "clear",
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "--yes",
+        "--output",
+        "json",
+        "history",
+        "clear",
     ]);
     assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared.stderr));
-    assert!(!directory.path().join("history/demo.jsonl").exists());
+    assert!(!history_path(&directory, &config, "demo").exists());
+}
+
+#[test]
+fn explicit_default_config_uses_and_clears_the_implicit_history_namespace() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config_root = directory.path().join("config-root");
+    let data_root = directory.path().join("data-root");
+    let config_root_text = config_root.display().to_string();
+    let data_root_text = data_root.display().to_string();
+    let environment = [
+        ("XDG_CONFIG_HOME", config_root_text.as_str()),
+        ("XDG_DATA_HOME", data_root_text.as_str()),
+    ];
+    let default_config = config_root.join("meshquill/config.toml");
+
+    let initialized = invoke_with_envs(
+        &[
+            "--non-interactive",
+            "init",
+            "--name",
+            "demo",
+            "--demo",
+            "--set-default",
+        ],
+        &environment,
+    );
+    assert_eq!(
+        initialized.status.code(),
+        Some(0),
+        "{}",
+        text(&initialized.stderr)
+    );
+    enable_history(&default_config.display().to_string());
+
+    let sent = invoke_with_envs(&["send", "Alice", "same namespace", "--wait"], &environment);
+    assert_eq!(sent.status.code(), Some(0), "{}", text(&sent.stderr));
+    let canonical = data_root.join("meshquill/history/demo.jsonl");
+    assert!(canonical.exists());
+
+    let listed = invoke_with_envs(
+        &[
+            "--config",
+            &default_config.display().to_string(),
+            "--output",
+            "json",
+            "history",
+            "list",
+        ],
+        &environment,
+    );
+    assert_eq!(listed.status.code(), Some(0), "{}", text(&listed.stderr));
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("history JSON");
+    assert_eq!(listed["data"]["path"], canonical.display().to_string());
+    assert_eq!(
+        listed["data"]["entries"]
+            .as_array()
+            .expect("history entries")
+            .len(),
+        1
+    );
+
+    let cleared = invoke_with_envs(
+        &[
+            "--config",
+            &default_config.display().to_string(),
+            "--yes",
+            "history",
+            "clear",
+        ],
+        &environment,
+    );
+    assert_eq!(cleared.status.code(), Some(0), "{}", text(&cleared.stderr));
+    assert!(!canonical.exists());
 }
 
 #[test]
@@ -1160,6 +1492,7 @@ fn watch_recovers_after_bounded_reconnect_failures_and_emits_live_message() {
     let config = config_path(&directory);
     init_demo(&config);
     set_mock_scenario(&config, "reconnect-demo");
+    let script = add_recording_hook(&directory, &config);
 
     let output = invoke_with_env_timeout(
         &[
@@ -1180,6 +1513,21 @@ fn watch_recovers_after_bounded_reconnect_failures_and_emits_live_message() {
         parsed["data"]["data"]["message"]["text"],
         "Live direct message after deterministic reconnect"
     );
+    let events = recorded_hook_events(&script);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_connect")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_disconnect")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -1188,6 +1536,7 @@ fn watch_exits_with_connection_status_after_reconnect_attempts_are_exhausted() {
     let config = config_path(&directory);
     init_demo(&config);
     set_mock_scenario(&config, "reconnect-fail");
+    let script = add_recording_hook(&directory, &config);
 
     let output = invoke_with_env_timeout(
         &[
@@ -1200,6 +1549,21 @@ fn watch_exits_with_connection_status_after_reconnect_attempts_are_exhausted() {
     assert_eq!(output.status.code(), Some(5));
     assert!(output.stdout.is_empty());
     assert!(text(&output.stderr).contains("the companion connection is unavailable"));
+    let events = recorded_hook_events(&script);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_connect")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_disconnect")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1408,12 +1772,105 @@ fn line_chat_accepts_piped_lines_without_a_tui() {
     assert_eq!(lines.len(), 4);
     assert_eq!(lines[0]["data"]["state"], "connected");
     assert_eq!(lines[1]["data"]["state"], "incoming");
+    assert!(
+        lines[1]["data"]["source"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
     assert_eq!(
         lines[1]["data"]["text"],
         "Demo direct packet for deterministic CLI tests"
     );
+    assert!(
+        lines[1]["data"]["message_id"]
+            .as_str()
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+    );
     assert_eq!(lines[2]["data"]["state"], "sent");
     assert_eq!(lines[3]["data"]["state"], "acknowledged");
+}
+
+#[test]
+fn line_chat_reports_accepted_delivery_before_fail_closed_post_send_hooks() {
+    for handler in ["after_send", "on_ack"] {
+        let directory = TempDir::new().expect("temporary directory");
+        let config = config_path(&directory);
+        init_demo(&config);
+        enable_history(&config);
+        let data_dir = data_dir_path(&directory);
+        let script = add_closed_failing_hook(&directory, &config, handler);
+
+        let output = invoke_with_input(
+            &[
+                "--config",
+                &config,
+                "--data-dir",
+                &data_dir,
+                "--output",
+                "jsonl",
+                "chat",
+                "Alice",
+                "--line",
+            ],
+            b"hello\n/quit\n",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(11),
+            "{handler}: {}",
+            text(&output.stderr)
+        );
+        let records: Vec<Value> = text(&output.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+            .collect();
+        let states: Vec<_> = records
+            .iter()
+            .filter_map(|record| record["data"]["state"].as_str())
+            .collect();
+        assert_eq!(
+            states.iter().filter(|state| **state == "sent").count(),
+            1,
+            "{handler}: accepted chat message must be reported once"
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|state| **state == "acknowledged")
+                .count(),
+            1,
+            "{handler}: acknowledgement must be reported before the hook error"
+        );
+        assert!(
+            text(&output.stderr).contains("device already accepted the message"),
+            "{handler}: {}",
+            text(&output.stderr)
+        );
+        assert_eq!(failing_hook_call_count(&script), 1, "{handler}");
+
+        let history = invoke(&[
+            "--config",
+            &config,
+            "--data-dir",
+            &data_dir,
+            "--output",
+            "json",
+            "history",
+            "list",
+        ]);
+        assert_eq!(history.status.code(), Some(0), "{handler}");
+        let history: Value = serde_json::from_slice(&history.stdout).expect("history JSON");
+        let outgoing = history["data"]["entries"]
+            .as_array()
+            .expect("history entries")
+            .iter()
+            .filter(|entry| entry["direction"] == "outgoing")
+            .count();
+        assert_eq!(
+            outgoing, 1,
+            "{handler}: accepted chat send must not be replayed"
+        );
+    }
 }
 
 #[test]
@@ -1422,6 +1879,7 @@ fn line_chat_reconnects_without_losing_or_replaying_piped_text() {
     let config = config_path(&directory);
     init_demo(&config);
     set_mock_scenario(&config, "reconnect-demo");
+    let script = add_recording_hook(&directory, &config);
 
     let output = invoke_with_input_env_timeout(
         &[
@@ -1461,6 +1919,21 @@ fn line_chat_reconnects_without_losing_or_replaying_piped_text() {
         line["data"]["state"] == "incoming"
             && line["data"]["text"] == "Live direct message after deterministic reconnect"
     }));
+    let events = recorded_hook_events(&script);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_connect")
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_disconnect")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -1639,9 +2112,18 @@ fn line_chat_double_slash_sends_one_literal_slash() {
     let config = config_path(&directory);
     init_demo(&config);
     enable_history(&config);
+    let data_dir = data_dir_path(&directory);
     let output = invoke_with_input(
         &[
-            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+            "--config",
+            &config,
+            "--data-dir",
+            &data_dir,
+            "--output",
+            "jsonl",
+            "chat",
+            "Alice",
+            "--line",
         ],
         b"//help\n/quit\n",
     );
@@ -1654,7 +2136,7 @@ fn line_chat_double_slash_sends_one_literal_slash() {
     assert!(lines.iter().any(|line| line["data"]["state"] == "sent"));
     assert!(!lines.iter().any(|line| line["data"]["state"] == "help"));
 
-    let entries: Vec<Value> = fs::read_to_string(directory.path().join("history/demo.jsonl"))
+    let entries: Vec<Value> = fs::read_to_string(history_path(&directory, &config, "demo"))
         .expect("chat history")
         .lines()
         .map(|line| serde_json::from_str(line).expect("history entry"))
@@ -1884,6 +2366,192 @@ fn hooks_validate_and_test_on_message_fixture() {
 }
 
 #[test]
+fn ordinary_read_hook_lifecycle_is_balanced_and_minimal() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let script = add_recording_hook(&directory, &config);
+
+    let output = invoke(&["--config", &config, "--output", "json", "device", "info"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+
+    let events = recorded_hook_events(&script);
+    let names: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert_eq!(names, ["on_connect", "on_disconnect"]);
+    assert_eq!(
+        events[0]["payload"]
+            .as_object()
+            .expect("connect payload")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["peer", "transport"]
+    );
+    assert_eq!(
+        events[1]["payload"]
+            .as_object()
+            .expect("disconnect payload")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["reason", "transport"]
+    );
+    let recorded = fs::read_to_string(script.with_extension("jsonl")).expect("hook JSONL");
+    assert!(!recorded.contains("Demo direct packet"));
+}
+
+#[test]
+fn post_connect_device_failure_hooks_error_without_changing_exit_status_or_leaking_secret() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let script = add_recording_hook(&directory, &config);
+    let secret = "wrong-password-hook-secret";
+
+    let output = invoke_with_input(
+        &[
+            "--config",
+            &config,
+            "--non-interactive",
+            "remote",
+            "login",
+            "Alice",
+            "--password-stdin",
+        ],
+        format!("{secret}\n").as_bytes(),
+    );
+    assert_eq!(output.status.code(), Some(8), "{}", text(&output.stderr));
+
+    let events = recorded_hook_events(&script);
+    let names: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["event"].as_str())
+        .collect();
+    assert_eq!(names, ["on_connect", "on_error", "on_disconnect"]);
+    assert_eq!(events[1]["payload"]["operation"], "remote login");
+    assert_eq!(
+        events[1]["payload"]["message"],
+        "remote authentication failed"
+    );
+    assert_eq!(
+        events[1]["payload"]
+            .as_object()
+            .expect("error payload")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["message", "operation"]
+    );
+    let recorded = fs::read_to_string(script.with_extension("jsonl")).expect("hook JSONL");
+    assert!(!recorded.contains(secret));
+    assert!(!recorded.contains("Demo direct packet"));
+    assert!(!text(&output.stdout).contains(secret));
+    assert!(!text(&output.stderr).contains(secret));
+}
+
+#[test]
+fn every_successful_local_contact_mutation_emits_one_update_hook() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+
+    let exported = invoke(&[
+        "--config", &config, "--output", "json", "contacts", "export", "Alice",
+    ]);
+    assert_eq!(
+        exported.status.code(),
+        Some(0),
+        "{}",
+        text(&exported.stderr)
+    );
+    let exported_json: Value =
+        serde_json::from_slice(&exported.stdout).expect("contact export JSON");
+    let uri = exported_json["data"]["uri"]
+        .as_str()
+        .expect("exported contact URI")
+        .to_owned();
+    let script = add_recording_hook(&directory, &config);
+
+    for (label, output) in [
+        (
+            "update",
+            invoke(&[
+                "--config", &config, "contacts", "update", "Alice", "--name", "Alicia",
+            ]),
+        ),
+        (
+            "forget",
+            invoke(&["--config", &config, "--yes", "contacts", "forget", "Alice"]),
+        ),
+        (
+            "import",
+            invoke(&["--config", &config, "contacts", "import", &uri]),
+        ),
+        (
+            "path set",
+            invoke(&[
+                "--config", &config, "--yes", "contacts", "path", "set", "Alice", "12,ab,ff",
+            ]),
+        ),
+        (
+            "path reset",
+            invoke(&[
+                "--config", &config, "--yes", "contacts", "path", "reset", "Alice",
+            ]),
+        ),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label}: {}",
+            text(&output.stderr)
+        );
+    }
+
+    let events = recorded_hook_events(&script);
+    let mutations: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "on_contact_update")
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_connect")
+            .count(),
+        5
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_disconnect")
+            .count(),
+        5
+    );
+    assert!(!events.iter().any(|event| event["event"] == "on_error"));
+    assert_eq!(mutations.len(), 5, "{events:?}");
+    let changes: Vec<_> = mutations
+        .iter()
+        .filter_map(|event| event["payload"]["change"].as_str())
+        .collect();
+    assert_eq!(
+        changes,
+        ["updated", "removed", "added", "updated", "updated"]
+    );
+    assert_eq!(mutations[4]["payload"]["display_name"], "Alice");
+    assert!(mutations.iter().all(|event| {
+        event["payload"]
+            .as_object()
+            .is_some_and(|payload| payload.len() == 3 && !payload.contains_key("text"))
+    }));
+    let recorded = fs::read_to_string(script.with_extension("jsonl")).expect("hook JSONL");
+    assert!(!recorded.contains(&uri));
+    assert!(!recorded.contains("Demo direct packet"));
+}
+
+#[test]
 fn configured_on_message_hook_runs_during_real_inbox_flow() {
     let directory = TempDir::new().expect("temporary directory");
     let config = config_path(&directory);
@@ -2021,6 +2689,59 @@ fn mqtt_configure_persists_valid_non_secret_gateway_settings() {
 }
 
 #[test]
+fn mqtt_configure_persists_absolute_tls_paths_across_working_directories() {
+    let directory = TempDir::new().expect("temporary directory");
+    let configure_dir = directory.path().join("configure");
+    let run_dir = directory.path().join("run");
+    fs::create_dir_all(&configure_dir).expect("configure directory");
+    fs::create_dir_all(&run_dir).expect("run directory");
+    let ca_path = configure_dir.join("ca.pem");
+    fs::write(
+        &ca_path,
+        b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+    )
+    .expect("CA fixture");
+    fs::write(run_dir.join("ca.pem"), b"conflicting relative file").expect("conflicting CA");
+    let config = config_path(&directory);
+
+    let configured = invoke_in_dir(
+        &[
+            "--config",
+            &config,
+            "mqtt",
+            "configure",
+            "--host",
+            "broker.invalid",
+            "--ca-file",
+            "ca.pem",
+        ],
+        &configure_dir,
+    );
+    assert_eq!(
+        configured.status.code(),
+        Some(0),
+        "{}",
+        text(&configured.stderr)
+    );
+    let loaded = meshquill_store::ConfigStore::new(&config)
+        .load_with_overrides(&std::collections::HashMap::new())
+        .expect("load MQTT config");
+    let meshquill_store::LoadOutcome::Loaded(loaded) = loaded else {
+        panic!("expected current MQTT config");
+    };
+    assert_eq!(
+        loaded.mqtt.gateway.tls.ca_path.as_deref(),
+        Some(fs::canonicalize(&ca_path).expect("canonical CA").as_path())
+    );
+
+    let status = invoke_in_dir(
+        &["--config", &config, "--output", "json", "mqtt", "status"],
+        &run_dir,
+    );
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+}
+
+#[test]
 fn mqtt_tls_validation_fails_before_writing_configuration() {
     let directory = TempDir::new().expect("temporary directory");
     let config = config_path(&directory);
@@ -2065,6 +2786,48 @@ fn mqtt_password_input_is_bounded_before_credential_store_access() {
 }
 
 #[test]
+fn mqtt_password_environment_reference_persists_without_secret_material() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let secret = "mqtt-environment-secret-must-not-be-persisted";
+    let output = invoke_with_env(
+        &[
+            "--config",
+            &config,
+            "--output",
+            "json",
+            "mqtt",
+            "configure",
+            "--host",
+            "broker.invalid",
+            "--username",
+            "alice",
+            "--password-env",
+            "MESHQUILL_TEST_MQTT_PASSWORD",
+        ],
+        "MESHQUILL_TEST_MQTT_PASSWORD",
+        secret,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(!text(&output.stdout).contains(secret));
+    assert!(!text(&output.stderr).contains(secret));
+
+    let saved = fs::read_to_string(&config).expect("saved MQTT configuration");
+    assert!(saved.contains("kind = \"environment\""));
+    assert!(saved.contains("name = \"MESHQUILL_TEST_MQTT_PASSWORD\""));
+    assert!(!saved.contains(secret));
+
+    let status = invoke_with_env(
+        &["--config", &config, "--output", "json", "mqtt", "status"],
+        "MESHQUILL_TEST_MQTT_PASSWORD",
+        secret,
+    );
+    assert_eq!(status.status.code(), Some(0), "{}", text(&status.stderr));
+    assert!(!text(&status.stdout).contains(secret));
+    assert!(!text(&status.stderr).contains(secret));
+}
+
+#[test]
 fn mqtt_test_has_a_bounded_mqtt_specific_failure_status() {
     let directory = TempDir::new().expect("temporary directory");
     let config = config_path(&directory);
@@ -2092,6 +2855,62 @@ fn mqtt_test_has_a_bounded_mqtt_specific_failure_status() {
 }
 
 #[test]
+fn mqtt_bridge_exits_on_core_disconnect_without_reconnect_or_hook_replay() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    set_mock_scenario(&config, "reconnect-demo");
+    let script = add_recording_hook(&directory, &config);
+    let configure = invoke(&[
+        "--config",
+        &config,
+        "mqtt",
+        "configure",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9",
+        "--no-tls",
+    ]);
+    assert_eq!(
+        configure.status.code(),
+        Some(0),
+        "{}",
+        text(&configure.stderr)
+    );
+
+    let output = invoke_with_env_timeout(
+        &["--config", &config, "--output", "jsonl", "mqtt", "bridge"],
+        "MESHQUILL_TIMEOUT_RETRY_MS",
+        "1",
+        Duration::from_secs(3),
+    );
+    assert_eq!(output.status.code(), Some(5), "{}", text(&output.stderr));
+    assert!(
+        text(&output.stderr).contains("MeshCore companion disconnected"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(text(&output.stderr).contains("Restart the bridge"));
+
+    let events = recorded_hook_events(&script);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_connect")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "on_disconnect")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn mqtt_bridge_requires_stream_output_before_connecting() {
     let directory = TempDir::new().expect("temporary directory");
     let config = config_path(&directory);
@@ -2099,4 +2918,255 @@ fn mqtt_bridge_requires_stream_output_before_connecting() {
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("jsonl"));
     assert!(!Path::new(&config).exists());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn profile_operations_share_selection_and_migrate_history_without_secret_loss() {
+    use std::collections::HashMap;
+
+    use meshquill_store::{
+        ConfigStore, LoadOutcome, SecretRef, TransportConfig, TransportOverrides,
+    };
+
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    let data_dir = data_dir_path(&directory);
+    init_demo(&config);
+    let second = invoke(&[
+        "--config",
+        &config,
+        "--non-interactive",
+        "init",
+        "--name",
+        "field",
+        "--demo",
+    ]);
+    assert_eq!(second.status.code(), Some(0), "{}", text(&second.stderr));
+
+    let listed = invoke(&["--config", &config, "--output", "json", "profile", "list"]);
+    assert_eq!(listed.status.code(), Some(0), "{}", text(&listed.stderr));
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("profiles JSON");
+    assert_eq!(listed["type"], "profiles");
+    assert_eq!(
+        listed["data"]["profiles"]
+            .as_array()
+            .expect("profile rows")
+            .len(),
+        2
+    );
+
+    let store = ConfigStore::new(&config);
+    let LoadOutcome::Loaded(mut stored) = store
+        .load_with_overrides(&HashMap::new())
+        .expect("load profile configuration")
+    else {
+        panic!("expected current profile configuration");
+    };
+    let field = stored
+        .device_profiles
+        .get_mut("field")
+        .expect("field profile");
+    field.transport_overrides = Some(TransportOverrides {
+        request_timeout_ms: Some(777),
+    });
+    field.secret = Some(SecretRef::environment("MESHQUILL_FIELD_SECRET").expect("secret ref"));
+    store.save(&stored).expect("save profile settings");
+
+    let reconfigured = invoke(&[
+        "--config", &config, "--output", "json", "profiles", "edit", "field", "--serial", "COM7",
+    ]);
+    assert_eq!(
+        reconfigured.status.code(),
+        Some(0),
+        "{}",
+        text(&reconfigured.stderr)
+    );
+    let reconfigured_json: Value =
+        serde_json::from_slice(&reconfigured.stdout).expect("reconfigured JSON");
+    assert_eq!(reconfigured_json["type"], "profile_reconfigured");
+    let LoadOutcome::Loaded(mut stored) = store
+        .load_with_overrides(&HashMap::new())
+        .expect("reload profile configuration")
+    else {
+        panic!("expected current profile configuration");
+    };
+    let field = stored.device_profiles.get("field").expect("field profile");
+    assert!(matches!(
+        &field.transport,
+        TransportConfig::Serial { port, baud } if port == "COM7" && *baud == 115_200
+    ));
+    assert_eq!(
+        field
+            .transport_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.request_timeout_ms),
+        Some(777)
+    );
+    assert!(matches!(field.secret, Some(SecretRef::Environment { .. })));
+
+    stored.default_profile = None;
+    store.save(&stored).expect("clear default profile");
+    let ambiguous = invoke(&["--config", &config, "status"]);
+    assert_eq!(ambiguous.status.code(), Some(3));
+    assert!(
+        text(&ambiguous.stderr).contains("meshquill profiles set-default NAME"),
+        "{}",
+        text(&ambiguous.stderr)
+    );
+
+    let default_set = invoke(&[
+        "--config",
+        &config,
+        "--output",
+        "json",
+        "profiles",
+        "set-default",
+        "field",
+    ]);
+    assert_eq!(
+        default_set.status.code(),
+        Some(0),
+        "{}",
+        text(&default_set.stderr)
+    );
+    let default_json: Value = serde_json::from_slice(&default_set.stdout).expect("default JSON");
+    assert_eq!(default_json["type"], "profile_default_set");
+
+    let selected = invoke(&["--config", &config, "--output", "json", "status"]);
+    let selected: Value = serde_json::from_slice(&selected.stdout).expect("selected status JSON");
+    assert_eq!(selected["data"]["profile"], "field");
+    let explicit = invoke(&[
+        "--config",
+        &config,
+        "--profile",
+        "demo",
+        "--output",
+        "json",
+        "status",
+    ]);
+    let explicit: Value = serde_json::from_slice(&explicit.stdout).expect("explicit status JSON");
+    assert_eq!(explicit["data"]["profile"], "demo");
+
+    let demo_transport = invoke(&[
+        "--config",
+        &config,
+        "profiles",
+        "reconfigure",
+        "field",
+        "--demo",
+    ]);
+    assert_eq!(
+        demo_transport.status.code(),
+        Some(0),
+        "{}",
+        text(&demo_transport.stderr)
+    );
+    enable_history(&config);
+    let sent = invoke(&[
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "--profile",
+        "field",
+        "send",
+        "Alice",
+        "rename history",
+        "--wait",
+    ]);
+    assert_eq!(sent.status.code(), Some(0), "{}", text(&sent.stderr));
+    let old_history = history_path(&directory, &config, "field");
+    let new_history = history_path(&directory, &config, "renamed");
+    assert!(old_history.exists());
+
+    let renamed = invoke(&[
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "--yes",
+        "--output",
+        "json",
+        "profiles",
+        "rename",
+        "field",
+        "renamed",
+    ]);
+    assert_eq!(renamed.status.code(), Some(0), "{}", text(&renamed.stderr));
+    let renamed_json: Value = serde_json::from_slice(&renamed.stdout).expect("renamed JSON");
+    assert_eq!(renamed_json["type"], "profile_renamed");
+    assert_eq!(renamed_json["data"]["history_migrated"], true);
+    assert!(
+        renamed_json["data"]["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("credential hashes"))
+    );
+    assert!(!old_history.exists());
+    assert!(new_history.exists());
+
+    let LoadOutcome::Loaded(renamed_config) = store
+        .load_with_overrides(&HashMap::new())
+        .expect("load renamed configuration")
+    else {
+        panic!("expected renamed current configuration");
+    };
+    assert_eq!(renamed_config.default_profile.as_deref(), Some("renamed"));
+    let renamed_profile = renamed_config
+        .device_profiles
+        .get("renamed")
+        .expect("renamed profile");
+    assert_eq!(
+        renamed_profile
+            .transport_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.request_timeout_ms),
+        Some(777)
+    );
+    assert!(matches!(
+        renamed_profile.secret,
+        Some(SecretRef::Environment { .. })
+    ));
+
+    let deleted = invoke(&[
+        "--config", &config, "--yes", "--output", "json", "profiles", "remove", "renamed",
+    ]);
+    assert_eq!(deleted.status.code(), Some(0), "{}", text(&deleted.stderr));
+    let deleted_json: Value = serde_json::from_slice(&deleted.stdout).expect("deleted JSON");
+    assert_eq!(deleted_json["type"], "profile_deleted");
+    assert_eq!(deleted_json["data"]["default_cleared"], true);
+    assert_eq!(deleted_json["data"]["history_retained"], true);
+    assert!(new_history.exists());
+
+    let refused_reuse = invoke(&[
+        "--config",
+        &config,
+        "--data-dir",
+        &data_dir,
+        "--yes",
+        "profiles",
+        "rename",
+        "demo",
+        "renamed",
+    ]);
+    assert_eq!(
+        refused_reuse.status.code(),
+        Some(3),
+        "{}",
+        text(&refused_reuse.stderr)
+    );
+    assert!(text(&refused_reuse.stderr).contains("retained destination history"));
+    let LoadOutcome::Loaded(after_refusal) = store
+        .load_with_overrides(&HashMap::new())
+        .expect("load configuration after refused reuse")
+    else {
+        panic!("expected current configuration after refused reuse");
+    };
+    assert!(after_refusal.device_profiles.contains_key("demo"));
+    assert!(!after_refusal.device_profiles.contains_key("renamed"));
+
+    let sole = invoke(&["--config", &config, "--output", "json", "status"]);
+    assert_eq!(sole.status.code(), Some(0), "{}", text(&sole.stderr));
+    let sole: Value = serde_json::from_slice(&sole.stdout).expect("sole status JSON");
+    assert_eq!(sole["data"]["profile"], "demo");
 }

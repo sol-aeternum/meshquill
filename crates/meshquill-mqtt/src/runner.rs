@@ -31,6 +31,8 @@ use crate::topics::TopicSet;
 pub enum GatewayNotice {
     /// Current MQTT broker connection state for local status reporting.
     BrokerState(ConnectionStatus),
+    /// The broker granted the exact outbound-command subscription.
+    CommandReady,
     /// A fully validated allowlisted send request.
     Command(AcceptedCommand),
     /// An inbound broker publication was safely rejected.
@@ -355,7 +357,19 @@ impl GatewayRunner {
                 self.publish_connection_state(ConnectionStatus::Disconnected)
                     .await
             }
-            NetworkNotice::Publish { topic, payload } => {
+            NetworkNotice::CommandReady => self.send_notice(GatewayNotice::CommandReady).await,
+            NetworkNotice::CommandSubscriptionRejected => {
+                Err(GatewayError::CommandSubscriptionRejected)
+            }
+            NetworkNotice::Publish {
+                topic,
+                payload,
+                retain,
+            } => {
+                if retain {
+                    self.try_send_rejection(CommandError::RetainedCommand)?;
+                    return Ok(());
+                }
                 let Ok(topic) = std::str::from_utf8(&topic) else {
                     self.try_send_rejection(CommandError::InvalidTopicEncoding)?;
                     return Ok(());
@@ -458,7 +472,13 @@ fn prepare_publication(
 enum NetworkNotice {
     Connected,
     Disconnected,
-    Publish { topic: Vec<u8>, payload: Vec<u8> },
+    CommandReady,
+    CommandSubscriptionRejected,
+    Publish {
+        topic: Vec<u8>,
+        payload: Vec<u8>,
+        retain: bool,
+    },
 }
 
 enum ProtocolClient {
@@ -571,7 +591,18 @@ fn classify_v311_event(event: rumqttc::Event) -> Option<NetworkNotice> {
         rumqttc::Event::Incoming(Packet::Publish(publication)) => Some(NetworkNotice::Publish {
             topic: publication.topic.into_bytes(),
             payload: publication.payload.to_vec(),
+            retain: publication.retain,
         }),
+        rumqttc::Event::Incoming(Packet::SubAck(ack)) => Some(
+            if matches!(
+                ack.return_codes.as_slice(),
+                [rumqttc::SubscribeReasonCode::Success(_)]
+            ) {
+                NetworkNotice::CommandReady
+            } else {
+                NetworkNotice::CommandSubscriptionRejected
+            },
+        ),
         rumqttc::Event::Incoming(_) | rumqttc::Event::Outgoing(_) => None,
     }
 }
@@ -585,8 +616,19 @@ fn classify_v5_event(event: rumqttc::v5::Event) -> Option<NetworkNotice> {
             Some(NetworkNotice::Publish {
                 topic: publication.topic.to_vec(),
                 payload: publication.payload.to_vec(),
+                retain: publication.retain,
             })
         }
+        rumqttc::v5::Event::Incoming(V5Packet::SubAck(ack)) => Some(
+            if matches!(
+                ack.return_codes.as_slice(),
+                [rumqttc::v5::mqttbytes::v5::SubscribeReasonCode::Success(_)]
+            ) {
+                NetworkNotice::CommandReady
+            } else {
+                NetworkNotice::CommandSubscriptionRejected
+            },
+        ),
         rumqttc::v5::Event::Incoming(_) | rumqttc::v5::Event::Outgoing(_) => None,
     }
 }
@@ -890,6 +932,9 @@ pub enum GatewayError {
     /// The network worker stopped without cancellation.
     #[error("MQTT network worker stopped unexpectedly")]
     NetworkWorkerStopped,
+    /// The broker refused the exact allowlisted command subscription.
+    #[error("MQTT broker rejected the outbound-command subscription")]
+    CommandSubscriptionRejected,
     /// A runner invariant lost its owned event loop.
     #[error("MQTT runner has no event loop")]
     MissingEventLoop,
@@ -916,7 +961,10 @@ pub enum GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use rumqttc::v5::mqttbytes::v5::{
+        Packet as V5Packet, Publish as V5Publish, SubAck as V5SubAck,
+        SubscribeReasonCode as V5SubscribeReasonCode,
+    };
 
     fn offline_parts(
         mut config: MqttConfig,
@@ -942,9 +990,9 @@ mod tests {
         let (handle, _runner) =
             GatewayRunner::from_v311_parts(config, client, event_loop, cancellation)
                 .expect("valid offline runner");
-        let publication = Publication::Telemetry(crate::schema::TelemetryData {
-            source: None,
-            values: BTreeMap::from([("large".to_owned(), serde_json::json!("x".repeat(256)))]),
+        let publication = Publication::Telemetry(crate::schema::TelemetryData::RawCayenneLpp {
+            source_pubkey_prefix: "001122334455".to_owned(),
+            payload: "aa".repeat(256),
         });
         assert!(matches!(
             handle.publish(publication).await,
@@ -1032,5 +1080,128 @@ mod tests {
         let result =
             GatewayRunner::from_v5_parts(config, client, event_loop, CancellationToken::new());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn protocol_classifiers_preserve_retain_and_subscription_outcomes() {
+        let mut publication = rumqttc::Publish::new(
+            "meshquill/v1/out/send",
+            rumqttc::QoS::AtLeastOnce,
+            b"{}".to_vec(),
+        );
+        publication.retain = true;
+        assert!(matches!(
+            classify_v311_event(rumqttc::Event::Incoming(Packet::Publish(publication))),
+            Some(NetworkNotice::Publish { retain: true, .. })
+        ));
+        let accepted = rumqttc::SubAck::new(
+            1,
+            vec![rumqttc::SubscribeReasonCode::Success(
+                rumqttc::QoS::AtLeastOnce,
+            )],
+        );
+        assert!(matches!(
+            classify_v311_event(rumqttc::Event::Incoming(Packet::SubAck(accepted))),
+            Some(NetworkNotice::CommandReady)
+        ));
+        let rejected = rumqttc::SubAck::new(1, vec![rumqttc::SubscribeReasonCode::Failure]);
+        assert!(matches!(
+            classify_v311_event(rumqttc::Event::Incoming(Packet::SubAck(rejected))),
+            Some(NetworkNotice::CommandSubscriptionRejected)
+        ));
+
+        let mut publication = V5Publish::new(
+            "meshquill/v1/out/send",
+            rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+            b"{}".to_vec(),
+            None,
+        );
+        publication.retain = true;
+        assert!(matches!(
+            classify_v5_event(rumqttc::v5::Event::Incoming(V5Packet::Publish(publication))),
+            Some(NetworkNotice::Publish { retain: true, .. })
+        ));
+        let accepted = V5SubAck {
+            pkid: 1,
+            return_codes: vec![V5SubscribeReasonCode::Success(
+                rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+            )],
+            properties: None,
+        };
+        assert!(matches!(
+            classify_v5_event(rumqttc::v5::Event::Incoming(V5Packet::SubAck(accepted))),
+            Some(NetworkNotice::CommandReady)
+        ));
+        let rejected = V5SubAck {
+            pkid: 1,
+            return_codes: vec![V5SubscribeReasonCode::NotAuthorized],
+            properties: None,
+        };
+        assert!(matches!(
+            classify_v5_event(rumqttc::v5::Event::Incoming(V5Packet::SubAck(rejected))),
+            Some(NetworkNotice::CommandSubscriptionRejected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn retained_command_is_rejected_before_dedupe_and_fresh_copy_is_accepted() {
+        let config = MqttConfig {
+            allow_send: true,
+            tls: TlsConfig {
+                enabled: false,
+                ..TlsConfig::default()
+            },
+            ..MqttConfig::default()
+        };
+        let topic = TopicSet::new(&config.topic_prefix)
+            .expect("topic set")
+            .outbound_send()
+            .to_owned();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "schema": crate::topics::SCHEMA_VERSION,
+            "event_id": Uuid::now_v7(),
+            "origin": "remote-test",
+            "timestamp": 1_725_000_000_000_u64,
+            "type": "send_direct",
+            "data": {"destination": "alice", "text": "hello"}
+        }))
+        .expect("command JSON");
+        let (config, client, event_loop, cancellation) = offline_parts(config);
+        let (mut handle, mut runner) =
+            GatewayRunner::from_v311_parts(config, client, event_loop, cancellation)
+                .expect("offline runner");
+
+        runner
+            .handle_network_notice(NetworkNotice::Publish {
+                topic: topic.as_bytes().to_vec(),
+                payload: payload.clone(),
+                retain: true,
+            })
+            .await
+            .expect("retained rejection");
+        assert!(matches!(
+            handle.recv_notice().await,
+            Some(GatewayNotice::Rejected(CommandError::RetainedCommand))
+        ));
+
+        runner
+            .handle_network_notice(NetworkNotice::Publish {
+                topic: topic.into_bytes(),
+                payload,
+                retain: false,
+            })
+            .await
+            .expect("fresh command");
+        assert!(matches!(
+            handle.recv_notice().await,
+            Some(GatewayNotice::Command(_))
+        ));
+
+        assert!(matches!(
+            runner
+                .handle_network_notice(NetworkNotice::CommandSubscriptionRejected)
+                .await,
+            Err(GatewayError::CommandSubscriptionRejected)
+        ));
     }
 }

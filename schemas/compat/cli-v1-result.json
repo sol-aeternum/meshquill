@@ -3,6 +3,8 @@
   "type": "contacts",
   "data": {
     "profile": "demo",
+    "refreshed": true,
+    "refresh_requested": false,
     "contacts": []
   }
 }

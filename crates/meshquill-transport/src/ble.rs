@@ -19,6 +19,7 @@ use meshquill_core::{
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::discovery::{
     DiscoveredDevice, DiscoveryError, TargetError, TransportTarget, validate_nonempty,
@@ -327,9 +328,14 @@ impl Transport for BleTransport {
             return Err(TransportError::NotConnected);
         }
 
+        let write_peripheral = peripheral.clone();
         let result = with_ble_timeout(
             self.connect_timeout,
-            peripheral.write(&write_characteristic, payload, write_type),
+            provider_write_once(payload, write_type, move |packet, write_type| async move {
+                write_peripheral
+                    .write(&write_characteristic, &packet, write_type)
+                    .await
+            }),
             "Nordic UART write (packet not retried)",
             &self.selector,
         )
@@ -705,7 +711,7 @@ async fn establish_connection(
 
     Ok(BleConnection {
         peripheral_id: peripheral.id().to_string(),
-        max_write_payload: negotiated_payload_limit(peripheral.mtu()),
+        max_write_payload: negotiated_payload_limit(peripheral.mtu(), uart.write_type),
         peripheral,
         write_characteristic: uart.write,
         notify_characteristic: uart.notify,
@@ -858,8 +864,26 @@ fn preferred_write_type(properties: CharPropFlags) -> Option<WriteType> {
     }
 }
 
-fn negotiated_payload_limit(mtu: u16) -> usize {
-    usize::from(mtu.saturating_sub(3)).min(MAX_INNER_PAYLOAD)
+fn negotiated_payload_limit(mtu: u16, write_type: WriteType) -> usize {
+    match write_type {
+        // A write request may use ATT Prepare/Execute Write below the provider API. It must be one
+        // provider call so firmware observes one Nordic UART callback and one companion frame.
+        WriteType::WithResponse => MAX_INNER_PAYLOAD,
+        // ATT has no long-write procedure for write commands (without response).
+        WriteType::WithoutResponse => usize::from(mtu.saturating_sub(3)).min(MAX_INNER_PAYLOAD),
+    }
+}
+
+async fn provider_write_once<E, F, Fut>(
+    payload: &[u8],
+    write_type: WriteType,
+    write: F,
+) -> Result<(), E>
+where
+    F: FnOnce(Zeroizing<Vec<u8>>, WriteType) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    write(Zeroizing::new(payload.to_vec()), write_type).await
 }
 
 fn validate_negotiated_payload(
@@ -1089,15 +1113,41 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_mtu_bounds_raw_ble_packets() {
-        assert_eq!(negotiated_payload_limit(2), 0);
-        assert_eq!(negotiated_payload_limit(23), 20);
-        assert_eq!(negotiated_payload_limit(303), MAX_INNER_PAYLOAD);
-        assert_eq!(negotiated_payload_limit(517), MAX_INNER_PAYLOAD);
+    fn negotiated_mtu_bounds_only_write_commands() {
+        assert_eq!(negotiated_payload_limit(2, WriteType::WithoutResponse), 0);
+        assert_eq!(negotiated_payload_limit(23, WriteType::WithoutResponse), 20);
+        assert_eq!(
+            negotiated_payload_limit(23, WriteType::WithResponse),
+            MAX_INNER_PAYLOAD
+        );
+        assert_eq!(
+            negotiated_payload_limit(517, WriteType::WithResponse),
+            MAX_INNER_PAYLOAD
+        );
 
+        for length in [21, 50, MAX_INNER_PAYLOAD] {
+            let payload = vec![0_u8; length];
+            assert!(
+                validate_negotiated_payload(
+                    &payload,
+                    negotiated_payload_limit(23, WriteType::WithResponse),
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            validate_negotiated_payload(
+                &[0_u8; 20],
+                negotiated_payload_limit(23, WriteType::WithoutResponse),
+            )
+            .is_ok()
+        );
         let payload = vec![0_u8; 21];
         assert!(matches!(
-            validate_negotiated_payload(&payload, negotiated_payload_limit(23)),
+            validate_negotiated_payload(
+                &payload,
+                negotiated_payload_limit(23, WriteType::WithoutResponse),
+            ),
             Err(TransportError::PayloadTooLarge {
                 maximum: 20,
                 actual: 21,
@@ -1167,6 +1217,62 @@ mod tests {
                 actual,
             }) if actual == MAX_INNER_PAYLOAD + 1
         ));
+    }
+
+    #[tokio::test]
+    async fn provider_write_submits_one_complete_frame_without_chunking_or_replay() {
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        let payload = vec![0xa5_u8; MAX_INNER_PAYLOAD];
+        provider_write_once(
+            &payload,
+            WriteType::WithResponse,
+            move |packet, write_type| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed
+                        .lock()
+                        .expect("write observation mutex")
+                        .push((packet, write_type));
+                    Ok::<(), io::Error>(())
+                }
+            },
+        )
+        .await
+        .expect("provider write");
+
+        let calls = calls.lock().expect("write observation mutex");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.as_slice(), payload);
+        assert_eq!(calls[0].1, WriteType::WithResponse);
+    }
+
+    #[tokio::test]
+    async fn provider_write_failure_is_returned_after_one_attempt() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let result = provider_write_once(
+            &[0x5a; 50],
+            WriteType::WithResponse,
+            move |_packet, _write_type| async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected failure",
+                ))
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -7,9 +7,9 @@ use zeroize::Zeroizing;
 use crate::client::Client;
 use crate::domain::{
     Ack, AdvertPath, AutoAddConfig, BatteryInfo, BinaryResponse, ChannelInfo, CommandTracking,
-    Contact, ContactRoute, ContactUri, CustomVariables, DefaultFloodScope, DeviceInfo, DeviceStats,
-    Event, FloodScope, FrequencyRange, LoginSession, Message, Path, PathDiscovery,
-    PrivateKeyMaterial, RadioParams, RemoteStatus, SelfInfo, Signature, StatsType,
+    Contact, ContactRoute, ContactSnapshot, ContactUri, CustomVariables, DefaultFloodScope,
+    DeviceInfo, DeviceStats, Event, FloodScope, FrequencyRange, LoginSession, Message, Path,
+    PathDiscovery, PrivateKeyMaterial, RadioParams, RemoteStatus, SelfInfo, Signature, StatsType,
     TelemetryResponse, TuningParams,
 };
 use crate::error::CoreError;
@@ -165,6 +165,19 @@ impl ManagedClient {
     /// Returns the underlying client error, or [`CoreError::ActorStopped`] if the actor has exited.
     pub async fn list_contacts(&self, lastmod: Option<u32>) -> Result<Vec<Contact>, CoreError> {
         self.request(|reply| ActorCommand::ListContacts { lastmod, reply })
+            .await
+    }
+
+    /// Lists contacts and preserves the firmware snapshot sequence marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying client error, or [`CoreError::ActorStopped`] if the actor has exited.
+    pub async fn list_contacts_snapshot(
+        &self,
+        lastmod: Option<u32>,
+    ) -> Result<ContactSnapshot, CoreError> {
+        self.request(|reply| ActorCommand::ListContactsSnapshot { lastmod, reply })
             .await
     }
 
@@ -875,6 +888,10 @@ enum ActorCommand {
         lastmod: Option<u32>,
         reply: Reply<Vec<Contact>>,
     },
+    ListContactsSnapshot {
+        lastmod: Option<u32>,
+        reply: Reply<ContactSnapshot>,
+    },
     GetTime(Reply<u32>),
     SetTime {
         value: u32,
@@ -1188,6 +1205,9 @@ where
         }
         ActorCommand::ListContacts { lastmod, reply } => {
             let _ = reply.send(client.list_contacts(lastmod).await);
+        }
+        ActorCommand::ListContactsSnapshot { lastmod, reply } => {
+            let _ = reply.send(client.list_contacts_snapshot(lastmod).await);
         }
         ActorCommand::SendDirectText {
             destination_prefix,
@@ -1697,6 +1717,12 @@ mod tests {
         raw
     }
 
+    fn contact_end_packet(lastmod: u32) -> Vec<u8> {
+        let mut raw = vec![PacketCode::ContactEnd.to_u8()];
+        raw.extend_from_slice(&lastmod.to_le_bytes());
+        raw
+    }
+
     fn node_discovery_packet(tag: u32) -> Vec<u8> {
         let mut raw = vec![
             PacketCode::ControlData.to_u8(),
@@ -1899,6 +1925,72 @@ mod tests {
             .await;
         driver.packet(vec![PacketCode::NoMoreMsgs.to_u8()]);
         assert!(join_ok(contacts_task).await.is_empty());
+
+        shutdown_client(&client, &mut driver).await;
+    }
+
+    #[tokio::test]
+    async fn sync_publishes_valid_pushes_before_its_single_message_response() {
+        let (transport, mut driver) = actor_test_transport(false);
+        let client = managed_client(transport);
+        let _ = connect_client(&client, &mut driver).await;
+        let mut events = client.subscribe();
+
+        let first_sync = tokio::spawn({
+            let client = client.clone();
+            async move { client.sync_next_message().await }
+        });
+        driver
+            .expect_write(&Command::sync_next_message().encode())
+            .await;
+        driver.packet(vec![PacketCode::MessagesWaiting.to_u8()]);
+        driver.packet(channel_message_packet("queued sync response"));
+
+        let response = join_ok(first_sync).await.expect("sync message");
+        assert_eq!(response.text, "queued sync response");
+        assert!(matches!(
+            recv_event(&mut events).await,
+            Event::MessagesWaiting
+        ));
+        match recv_event(&mut events).await {
+            Event::Message(message) => {
+                assert_eq!(message.text, "queued sync response");
+                assert_eq!(message.observation_id, response.observation_id);
+            }
+            other => panic!("expected message event, got {other:?}"),
+        }
+
+        let final_sync = tokio::spawn({
+            let client = client.clone();
+            async move { client.sync_next_message().await }
+        });
+        driver
+            .expect_write(&Command::sync_next_message().encode())
+            .await;
+        driver.packet(vec![PacketCode::NoMoreMsgs.to_u8()]);
+        assert!(join_ok(final_sync).await.is_none());
+
+        shutdown_client(&client, &mut driver).await;
+    }
+
+    #[tokio::test]
+    async fn contact_snapshot_marker_is_exposed_through_the_actor() {
+        let (transport, mut driver) = actor_test_transport(false);
+        let client = managed_client(transport);
+        let _ = connect_client(&client, &mut driver).await;
+        let expected_lastmod = 0xa1b2_c3d4;
+
+        let snapshot_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.list_contacts_snapshot(None).await }
+        });
+        driver
+            .expect_write(&Command::get_contacts(None).encode())
+            .await;
+        driver.packet(contact_end_packet(expected_lastmod));
+        let snapshot = join_ok(snapshot_task).await;
+        assert!(snapshot.contacts.is_empty());
+        assert_eq!(snapshot.lastmod, expected_lastmod);
 
         shutdown_client(&client, &mut driver).await;
     }

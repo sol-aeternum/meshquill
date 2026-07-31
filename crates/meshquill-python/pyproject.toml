@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "meshquill-sdk"
-version = "0.1.0rc2"
+version = "0.1.0rc3"
 description = "Async Python SDK for MeshCore companions, backed by Meshquill's Rust core"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -35,6 +35,7 @@ Issues = "https://github.com/sol-aeternum/meshquill/issues"
 [dependency-groups]
 dev = [
   "maturin==1.11.5",
+  "jsonschema==4.26.0",
   "mypy==1.20.2",
   "pytest==9.1.1",
   "pytest-asyncio==1.4.0",

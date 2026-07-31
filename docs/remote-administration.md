@@ -3,7 +3,8 @@
 Remote administration targets repeater, room-server, or sensor contacts through the locally
 connected companion. This RC has deterministic virtual-companion coverage but no recorded physical
 hardware verification. Do not use it for safety-critical or destructive administration; check
-[current status](../STATUS.md) and [hardware verification](hardware-testing.md).
+[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) and
+[hardware verification](hardware-testing.md).
 
 ## Prerequisites and command classes
 

@@ -12,8 +12,17 @@ use zeroize::Zeroizing;
 /// Largest MQTT application payload accepted by configuration validation.
 pub const MAX_CONFIGURED_PAYLOAD_BYTES: usize = 1024 * 1024;
 
+/// Hard MQTT v1 destination bound; installations may configure a smaller value.
+pub const MAX_COMMAND_DESTINATION_BYTES: usize = 128;
+
+/// Hard MQTT v1 command-text bound; installations may configure a smaller value.
+pub const MAX_COMMAND_TEXT_BYTES: usize = 1024;
+
 /// Largest configured TLS PEM file read by the gateway (one MiB).
 pub const MAX_TLS_FILE_BYTES: usize = 1024 * 1024;
+
+/// Largest runtime MQTT password accepted from any credential source.
+pub const MAX_MQTT_PASSWORD_BYTES: usize = 4_096;
 
 /// Largest allowed reconnect delay (one hour).
 pub const MAX_RECONNECT_DELAY_MS: u64 = 60 * 60 * 1000;
@@ -341,17 +350,27 @@ impl MqttConfig {
 pub struct MqttPassword(SecretString);
 
 impl MqttPassword {
-    /// Wraps a non-empty password for runtime use.
+    /// Wraps a non-empty, bounded password for runtime use.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when the supplied password is empty.
+    /// Returns [`ConfigError`] when the supplied password is empty, contains NUL, or exceeds
+    /// [`MAX_MQTT_PASSWORD_BYTES`] UTF-8 bytes.
     pub fn new(password: impl Into<String>) -> Result<Self, ConfigError> {
-        let password = password.into();
+        let mut password = Zeroizing::new(password.into());
         if password.is_empty() {
             return Err(ConfigError::invalid("password", "must not be empty"));
         }
-        Ok(Self(SecretString::from(password)))
+        if password.len() > MAX_MQTT_PASSWORD_BYTES {
+            return Err(ConfigError::invalid(
+                "password",
+                "must not exceed 4096 UTF-8 bytes",
+            ));
+        }
+        if password.as_bytes().contains(&0) {
+            return Err(ConfigError::invalid("password", "must not contain NUL"));
+        }
+        Ok(Self(SecretString::from(std::mem::take(&mut *password))))
     }
 
     pub(crate) fn expose(&self) -> &str {
@@ -517,16 +536,21 @@ fn validate_command_limits(
     limits: CommandLimits,
     max_payload_bytes: usize,
 ) -> Result<(), ConfigError> {
-    if limits.max_destination_bytes == 0 || limits.max_destination_bytes > 1024 {
+    if limits.max_destination_bytes == 0
+        || limits.max_destination_bytes > MAX_COMMAND_DESTINATION_BYTES
+    {
         return Err(ConfigError::invalid(
             "command_limits.max_destination_bytes",
-            "must be between 1 and 1024",
+            "must be between 1 and 128",
         ));
     }
-    if limits.max_text_bytes == 0 || limits.max_text_bytes > max_payload_bytes {
+    if limits.max_text_bytes == 0
+        || limits.max_text_bytes > max_payload_bytes
+        || limits.max_text_bytes > MAX_COMMAND_TEXT_BYTES
+    {
         return Err(ConfigError::invalid(
             "command_limits.max_text_bytes",
-            "must be non-zero and no larger than max_payload_bytes",
+            "must be non-zero and no larger than 1024 or max_payload_bytes",
         ));
     }
     Ok(())
@@ -683,6 +707,29 @@ mod tests {
     }
 
     #[test]
+    fn configured_command_limits_cannot_expand_the_v1_wire_contract() {
+        let mut config = MqttConfig::default();
+        config.command_limits.max_destination_bytes = MAX_COMMAND_DESTINATION_BYTES + 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "command_limits.max_destination_bytes",
+                ..
+            })
+        ));
+
+        config.command_limits.max_destination_bytes = MAX_COMMAND_DESTINATION_BYTES;
+        config.command_limits.max_text_bytes = MAX_COMMAND_TEXT_BYTES + 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "command_limits.max_text_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn unsafe_topics_and_tls_verification_are_rejected() {
         let mut config = MqttConfig {
             topic_prefix: "meshquill/#".to_owned(),
@@ -831,6 +878,25 @@ mod tests {
 
         let config_json = serde_json::to_string(&MqttConfig::default()).expect("serialize config");
         assert!(!config_json.contains("password"));
+    }
+
+    #[test]
+    fn password_bound_applies_to_every_constructor_caller() {
+        assert!(MqttPassword::new("x".repeat(MAX_MQTT_PASSWORD_BYTES)).is_ok());
+        assert!(matches!(
+            MqttPassword::new("x".repeat(MAX_MQTT_PASSWORD_BYTES + 1)),
+            Err(ConfigError::InvalidField {
+                field: "password",
+                ..
+            })
+        ));
+        assert!(matches!(
+            MqttPassword::new("contains\0nul"),
+            Err(ConfigError::InvalidField {
+                field: "password",
+                ..
+            })
+        ));
     }
 
     #[test]

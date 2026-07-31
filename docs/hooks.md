@@ -38,7 +38,9 @@ script configured in the selected configuration. `MESHQUILL_HOOK_ENABLED` and
 ## Versioned contract
 
 Every handler accepts exactly one positional dictionary. Synchronous and asynchronous handlers are
-supported. The envelope is:
+supported. The checked-in [Draft 2020-12 schema](../schemas/meshquill-hook-v1.schema.json) and
+[nine-event compatibility fixture](../schemas/compat/hook-v1-valid.jsonl) are the normative
+machine-readable contract. The envelope is:
 
 ```json
 {
@@ -50,21 +52,27 @@ supported. The envelope is:
 }
 ```
 
+The schema governs event dictionaries delivered to handlers; `before_send` return objects use the
+separate response contract below. Envelope fields are closed. Payload objects may gain compatible
+fields, so hooks must ignore unfamiliar payload keys. Every key listed below is present; `peer`,
+`reason`, applicable `message_id`, `source`, `round_trip_ms`, and `display_name` are nullable rather
+than omitted.
+
 The supported handlers and payload fields are:
 
 | Handler | Payload |
 | --- | --- |
-| `on_connect` | `transport`, optional `peer` |
-| `on_disconnect` | `transport`, optional `reason` |
-| `on_message` | `source`, `text`, optional `message_id` |
+| `on_connect` | `transport`, nullable `peer` |
+| `on_disconnect` | `transport`, nullable `reason` |
+| `on_message` | `source`, `text`, nullable `message_id` |
 | `before_send` | `destination`, `text` |
-| `after_send` | `destination`, `text`, optional `message_id` |
-| `on_ack` | `message_id`, optional `source`, optional `round_trip_ms` |
-| `on_timeout` | `operation`, optional `message_id` |
-| `on_contact_update` | `contact_id`, optional `display_name`, `change` (`added`, `updated`, or `removed`) |
+| `after_send` | `destination`, `text`, nullable `message_id` |
+| `on_ack` | `message_id`, nullable `source`, nullable `round_trip_ms` |
+| `on_timeout` | `operation`, nullable `message_id` |
+| `on_contact_update` | `contact_id`, nullable `display_name`, `change` (`added`, `updated`, or `removed`) |
 | `on_error` | `operation`, sanitized `message` |
 
-`message_id` is a Meshquill-local workflow UUID that relates local hook events and, when enabled,
+`message_id` is a Meshquill-local workflow identifier that relates local hook events and, when enabled,
 the corresponding history record. It is not a MeshCore message ID, a durable identity across
 process restarts, or a deduplication key.
 
@@ -82,6 +90,12 @@ subprocesses run through one hook runtime.
 
 Observational handlers default to fail-open: Meshquill records a redacted category and continues.
 `before_send` defaults to fail-closed because silently bypassing a local send policy is unsafe.
+If an operator deliberately makes observational handlers fail-closed, an `after_send` or `on_ack`
+failure occurs after the companion may already have accepted the radio operation. Finite send and
+line chat emit their authoritative `queued`/`sent` and acknowledgement state first, then exit with
+hook status and an explicit “do not retry automatically” diagnostic. MQTT command results likewise
+retain `queued: true` with a post-send failure reason. A hook failure never causes an automatic
+radio replay.
 The safe environment mode exposes only a conservative locale/time/path allowlist; `clear` exposes
 none, and `{ mode = "allow_list", variables = ["NAME"] }` names explicit variables. Python
 exception text and captured output are intentionally not copied into normal logs because they may

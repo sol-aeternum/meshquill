@@ -19,8 +19,15 @@ meshquill mqtt status
 
 Use `--ca-file` for a private CA, and both `--client-certificate` and `--client-key` for mutual TLS.
 Certificate verification cannot be disabled while TLS is on. `--no-tls` is an explicit plain-TCP
-choice intended for a secured local test broker. Passwords are read from a terminal or stdin and
-stored through the OS credential store; they are not accepted in argv or emitted by `config show`.
+choice intended for a secured local test broker. `--password-stdin` stores the supplied password in
+the OS credential store. `--password-env NAME` stores only the validated environment-variable name
+and resolves its value at runtime; the password is never written to TOML or argv. Reusing the same
+username without either option preserves its existing reference, while `--clear-auth` removes the
+authentication configuration and any managed credential. Secrets are never emitted by
+`config show`. Passwords from stdin, environment variables, the credential store, or an interactive
+prompt share the same 1–4096 UTF-8-byte bound and reject NUL. TLS file arguments are canonicalized
+to absolute paths before the configuration transaction is saved, so a later working directory
+cannot change which trust or identity material is loaded.
 
 For a disposable local Mosquitto broker:
 
@@ -34,7 +41,12 @@ meshquill --profile demo --output jsonl mqtt bridge
 
 The bridge is a foreground streaming command and requires `--output jsonl` for machine output.
 Ctrl-C stops both the MeshCore client and broker session. Broker reconnect uses bounded exponential
-backoff. The application never retransmits a radio message merely because the device reconnects.
+backoff. The first broker connection publishes a full contacts/battery/telemetry snapshot; the
+first successful connection after each observed broker disconnect publishes one fresh full
+snapshot. The application never retransmits a radio message during that synchronization. A
+MeshCore companion disconnect is terminal for the bridge: pending local ACK records are marked
+failed, hooks are balanced once, and the command exits with connection status and asks the operator
+to restart after restoring the device.
 MQTT 3.1.1 and MQTT 5 are both supported; protocol selection changes the broker session, not the
 versioned application payload schema.
 
@@ -55,7 +67,11 @@ mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 \
 For a channel, use `"type":"send_channel"` and
 `"data":{"channel":0,"text":"hello"}`. The gateway rejects its own origin, nil or duplicate
 event IDs, unknown fields, malformed/oversized payloads, invalid destinations, channels above 7,
-and any non-allowlisted type. The default duplicate cache retains 4096 IDs for 15 minutes.
+and any non-allowlisted type. Retained publications are rejected before parsing or duplicate-cache
+insertion, so a broker cannot replay a retained send into a fresh gateway. A trusted local
+`before_send` hook may modify a command, but the gateway applies the configured destination,
+channel, and text bounds again before radio I/O. The default duplicate cache retains 4096 IDs for
+15 minutes.
 
 Deduplication is deliberately process-local. A configuration with `allow_send = true` therefore
 must use a clean broker session; validation rejects a persistent session that could redeliver old
@@ -75,7 +91,10 @@ bridge publishes:
 - `P/meshquill.mqtt/v1/events/telemetry`
 
 It subscribes only to `P/meshquill.mqtt/v1/outbound/send`, and only after outbound sends are
-explicitly enabled. MQTT QoS improves broker delivery semantics; it is not a MeshCore radio ACK.
+explicitly enabled. `mqtt test` does not report send-capable readiness until the broker returns one
+successful SUBACK for that exact subscription; rejection, an empty response, or a mismatched
+multi-topic response is terminal and includes an ACL hint. MQTT QoS improves broker delivery
+semantics; it is not a MeshCore radio ACK.
 
 ## Validation evidence
 
@@ -88,6 +107,6 @@ client certificate. The secured case is designed to assert that unrelated trust 
 password, a missing client identity and a mismatched server name do not reach `Connected`.
 
 Broker-restart behavior is covered by the maintained client's reconnect state machine and bounded
-unit tests, but this RC does not claim a live container-restart endurance test. Until
-[STATUS.md](../STATUS.md) records a fresh successful RC2 CI run, the integration-suite description
-above is validation design, not a claim that RC2 executed it.
+unit tests, but this RC does not claim a live container-restart endurance test. [Live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md)
+records which exact release candidate executed the real-broker suite; this page describes the
+maintained validation design and is not evidence by itself.

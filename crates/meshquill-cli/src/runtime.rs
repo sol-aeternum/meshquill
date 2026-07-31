@@ -40,7 +40,8 @@ use crate::{
     },
     batch_cli,
     config::{
-        SelectedProfile, config_store, initialize, load_optional, load_unmodified, select_profile,
+        SelectedProfile, config_store, initialize, load_optional, load_unmodified,
+        load_unmodified_locked, select_profile,
     },
     error::CliError,
     hooks_cli,
@@ -48,11 +49,12 @@ use crate::{
     interrupt::InterruptWatcher,
     mqtt_cli,
     output::{ExitStatus, OutputWriter},
+    profiles,
     reconnect::{ReconnectPolicy, reconnect_device, reconnect_trigger},
     remote_cli,
     transport::CliTransport,
     workflow::{
-        IncomingOrigin, OutgoingRecord, WorkflowServices, clear_history,
+        CompanionSession, IncomingOrigin, OutgoingRecord, WorkflowServices, clear_history,
         history_store_for_selected, load_history,
     },
 };
@@ -93,8 +95,19 @@ struct ContactView {
 }
 
 #[derive(Debug, Serialize)]
+struct ContactReport {
+    profile: String,
+    #[serde(flatten)]
+    contact: ContactView,
+}
+
+#[derive(Debug, Serialize)]
 struct ContactsReport {
     profile: String,
+    /// Contact lists always come from a fresh device query; no cached path exists.
+    refreshed: bool,
+    /// Records use of the compatibility spelling that explicitly requests that query.
+    refresh_requested: bool,
     contacts: Vec<ContactView>,
 }
 
@@ -342,7 +355,7 @@ pub(crate) async fn dispatch<W: Write>(
 
     match &cli.command {
         Command::Init(args) => {
-            let report = initialize(cli, args)?;
+            let report = initialize(cli, args).await?;
             let human = format!(
                 "Created {} profile '{}' at {}{}",
                 report.transport,
@@ -354,6 +367,7 @@ pub(crate) async fn dispatch<W: Write>(
                 .result("configuration_initialized", &report, &human)
                 .map_err(CliError::from)
         }
+        Command::Profiles(command) => profiles::profiles(cli, command, writer),
         Command::Devices(args) => devices(cli, args, writer).await,
         Command::Connect(args) if args.watch => watch_connection(cli, writer).await,
         Command::Connect(_) => connect(cli, writer).await,
@@ -437,6 +451,9 @@ fn status<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Result<(), CliEr
         .map_err(CliError::from)
 }
 
+// Audited direct-connect exceptions: connect, send, and inbox own established lifecycle flows;
+// doctor performs a diagnostic probe; watch and chat own reconnect state machines. MQTT owns its
+// separate gateway lifecycle in mqtt_cli, while batch reaches sessions through nested dispatch.
 async fn connect<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Result<(), CliError> {
     let selected = select_profile(cli)?;
     let workflow = WorkflowServices::from_selected(&selected)?;
@@ -445,10 +462,13 @@ async fn connect<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Result<()
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
-    if let Err(error) = workflow.connected(&self_info.name).await {
-        let _ = client.shutdown().await;
-        return Err(error);
-    }
+    activate_workflow(
+        &client,
+        &workflow,
+        &self_info.name,
+        "connection hook failed",
+    )
+    .await?;
     let report = ConnectionReport {
         profile: selected.name,
         transport: describe_transport(&selected.profile.transport),
@@ -472,12 +492,18 @@ async fn device_info<W: Write>(
 ) -> Result<(), CliError> {
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    let self_info = match client.connect().await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(&client, Err(error)).await,
+    let operation_name = if firmware_only {
+        "device firmware"
+    } else {
+        "device info"
     };
-    let operation = client.query_device_info().await;
-    let device_info = finish(&client, operation).await?;
+    let (session, self_info) = CompanionSession::connect(&selected, client, operation_name).await?;
+    let operation = session
+        .client()
+        .query_device_info()
+        .await
+        .map_err(CliError::from);
+    let device_info = session.finish(operation).await?;
     let report = DeviceReport {
         profile: selected.name,
         self_info,
@@ -527,17 +553,22 @@ async fn device_telemetry<W: Write>(
 ) -> Result<(), CliError> {
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
+    let (session, _) = CompanionSession::connect(&selected, client, "device telemetry").await?;
+    let operation = async {
+        let battery = session
+            .client()
+            .get_battery()
+            .await
+            .map_err(CliError::from)?;
+        let telemetry = session
+            .client()
+            .get_self_telemetry()
+            .await
+            .map_err(CliError::from)?;
+        Ok((battery, telemetry))
     }
-    let battery = match client.get_battery().await {
-        Ok(battery) => battery,
-        Err(error) => return finish::<()>(&client, Err(error)).await,
-    };
-    let telemetry = match client.get_self_telemetry().await {
-        Ok(telemetry) => telemetry,
-        Err(error) => return finish::<()>(&client, Err(error)).await,
-    };
+    .await;
+    let (battery, telemetry) = session.finish(operation).await?;
     let report = DeviceTelemetryReport {
         profile: selected.name,
         battery_level: battery.level,
@@ -558,7 +589,6 @@ async fn device_telemetry<W: Write>(
         report.pubkey_prefix,
         telemetry.payload.len()
     );
-    finish(&client, Ok(())).await?;
     writer
         .result("telemetry", &report, &human)
         .map_err(CliError::from)
@@ -569,60 +599,51 @@ async fn device_clock<W: Write>(
     args: &crate::args::DeviceClockArgs,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
+    let host_time = args.sync.then(bounded_unix_time).transpose()?;
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
-    let previous_time = match client.get_time().await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(&client, Err(error)).await,
-    };
-    if !args.sync {
-        let report = DeviceClockReport {
-            profile: selected.name,
-            previous_time,
-            synced: false,
-            current_time: previous_time,
-        };
-        let human = format!("Device time is {previous_time}");
-        finish(&client, Ok(())).await?;
-        writer
-            .result("device_clock", &report, &human)
-            .map_err(CliError::from)?;
-        return Ok(());
-    }
-    let host_time = bounded_unix_time()?;
-    let set_result = client.set_time(host_time).await;
-    match set_result {
-        Ok(()) => {
-            let current_time = match client.get_time().await {
-                Ok(value) => value,
-                Err(error) => return finish::<()>(&client, Err(error)).await,
-            };
-            if current_time != host_time {
-                return finish::<()>(
-                    &client,
-                    Err(CoreError::ProtocolInvariant(
-                        "device clock readback did not match requested host time",
-                    )),
-                )
-                .await;
-            }
-            let report = DeviceClockReport {
+    let (session, _) = CompanionSession::connect(&selected, client, "device clock").await?;
+    let operation = async {
+        let previous_time = session.client().get_time().await.map_err(CliError::from)?;
+        let Some(host_time) = host_time else {
+            return Ok(DeviceClockReport {
                 profile: selected.name,
                 previous_time,
-                synced: true,
-                current_time,
-            };
-            let human = format!("Device time was {previous_time}; synced to {current_time}");
-            finish(&client, Ok(())).await?;
-            writer
-                .result("device_clock", &report, &human)
-                .map_err(CliError::from)
+                synced: false,
+                current_time: previous_time,
+            });
+        };
+        session
+            .client()
+            .set_time(host_time)
+            .await
+            .map_err(CliError::from)?;
+        let current_time = session.client().get_time().await.map_err(CliError::from)?;
+        if current_time != host_time {
+            return Err(CliError::from(CoreError::ProtocolInvariant(
+                "device clock readback did not match requested host time",
+            )));
         }
-        Err(error) => finish::<()>(&client, Err(error)).await,
+        Ok(DeviceClockReport {
+            profile: selected.name,
+            previous_time,
+            synced: true,
+            current_time,
+        })
     }
+    .await;
+    let report = session.finish(operation).await?;
+    let human = if report.synced {
+        format!(
+            "Device time was {}; synced to {}",
+            report.previous_time, report.current_time
+        )
+    } else {
+        format!("Device time is {}", report.current_time)
+    };
+    writer
+        .result("device_clock", &report, &human)
+        .map_err(CliError::from)
 }
 
 async fn device_advertise<W: Write>(
@@ -636,38 +657,43 @@ async fn device_advertise<W: Write>(
     };
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
-    if let Some((scope, _)) = &scope
-        && let Err(error) = client.set_flood_scope(scope).await
-    {
-        return finish::<()>(&client, Err(error)).await;
-    }
-
-    if let Err(error) = client.send_self_advert(args.flood).await {
-        if scope.is_some() {
-            let _ = client.set_flood_scope(&FloodScope::Default).await;
+    let (session, _) = CompanionSession::connect(&selected, client, "device advertise").await?;
+    let operation = async {
+        if let Some((scope, _)) = &scope {
+            session
+                .client()
+                .set_flood_scope(scope)
+                .await
+                .map_err(CliError::from)?;
         }
-        let _ = client.shutdown().await;
-        return Err(CliError::from(error));
+        let send = session
+            .client()
+            .send_self_advert(args.flood)
+            .await
+            .map_err(CliError::from);
+        let restore = if scope.is_some() {
+            session
+                .client()
+                .set_flood_scope(&FloodScope::Default)
+                .await
+                .map_err(CliError::from)
+        } else {
+            Ok(())
+        };
+        send?;
+        restore?;
+        Ok(DeviceAdvertiseReport {
+            profile: selected.name,
+            flood: args.flood,
+        })
     }
-    if scope.is_some()
-        && let Err(error) = client.set_flood_scope(&FloodScope::Default).await
-    {
-        let _ = client.shutdown().await;
-        return Err(CliError::from(error));
-    }
-    let report = DeviceAdvertiseReport {
-        profile: selected.name,
-        flood: args.flood,
-    };
+    .await;
+    let report = session.finish(operation).await?;
     let human = if args.flood {
         "Sent flood advertisement"
     } else {
         "Sent normal advertisement"
     };
-    finish(&client, Ok(())).await?;
     writer
         .result("advertise", &report, human)
         .map_err(CliError::from)
@@ -677,18 +703,14 @@ async fn device_reboot<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Res
     confirm(cli, "reboot the local companion")?;
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
-    if let Err(error) = client.reboot().await {
-        let _ = client.shutdown().await;
-        return Err(CliError::from(error));
-    }
-    let _ = client.shutdown().await;
-    let report = DeviceRebootReport {
-        profile: selected.name,
-        disconnected: true,
-    };
+    let (session, _) = CompanionSession::connect(&selected, client, "device reboot").await?;
+    let operation = session.client().reboot().await.map_err(CliError::from);
+    let report = session
+        .finish(operation.map(|()| DeviceRebootReport {
+            profile: selected.name,
+            disconnected: true,
+        }))
+        .await?;
     let human = "Reboot command sent";
     writer
         .result("device_reboot", &report, human)
@@ -717,18 +739,22 @@ async fn network_discover<W: Write>(
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
     let mut events = client.subscribe();
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
-    if let Some((scope, _)) = &temporary_scope
-        && let Err(error) = client.set_flood_scope(scope).await
-    {
-        return finish::<()>(&client, Err(error)).await;
+    let (session, _) = CompanionSession::connect(&selected, client, "network discover").await?;
+    if let Some((scope, _)) = &temporary_scope {
+        let scope_result = session
+            .client()
+            .set_flood_scope(scope)
+            .await
+            .map_err(CliError::from);
+        if let Err(error) = scope_result {
+            return session.finish(Err(error)).await;
+        }
     }
 
     let filter = discovery_filter(args.kind);
     let operation = async {
-        client
+        session
+            .client()
             .send_node_discovery(filter, true, tag, None)
             .await
             .map_err(CliError::from)?;
@@ -736,22 +762,24 @@ async fn network_discover<W: Write>(
     }
     .await;
     let restore = if temporary_scope.is_some() {
-        client
+        session
+            .client()
             .set_flood_scope(&FloodScope::Default)
             .await
             .map_err(CliError::from)
     } else {
         Ok(())
     };
-    let shutdown = client.shutdown().await.map_err(CliError::from);
-    let nodes = match operation {
-        Err(error) => return Err(error),
-        Ok(nodes) => {
-            restore?;
-            shutdown?;
-            nodes
+    let operation = match (operation, restore) {
+        (Err(primary), Err(_)) => {
+            tracing::warn!("secondary flood-scope restore failure; details omitted");
+            Err(primary)
         }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Ok(nodes), Ok(())) => Ok(nodes),
     };
+    let nodes = session.finish(operation).await?;
 
     let timeout_ms = u64::try_from(cli.timeout.as_millis()).unwrap_or(u64::MAX);
     let report = NetworkDiscoveryReport {
@@ -916,83 +944,79 @@ async fn network_scope<W: Write>(
             "--set-default requires a scope value",
         ));
     }
+    let parsed_scope = args.scope.as_deref().map(parse_flood_scope).transpose()?;
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
+    let (session, _) = CompanionSession::connect(&selected, client, "network scope").await?;
+    let operation = async {
+        let Some((scope, key_name)) = parsed_scope else {
+            let configured = match session
+                .client()
+                .get_default_flood_scope()
+                .await
+                .map_err(CliError::from)?
+            {
+                DefaultFloodScope::Unconfigured => None,
+                DefaultFloodScope::Configured(scope) => scope.name().map(str::to_owned),
+            };
+            return Ok(NetworkScopeReport {
+                profile: selected.name,
+                action: "query".to_owned(),
+                scope: configured,
+            });
+        };
 
-    if args.scope.is_none() {
-        let configured = match client.get_default_flood_scope().await {
-            Ok(DefaultFloodScope::Unconfigured) => None,
-            Ok(DefaultFloodScope::Configured(scope)) => scope.name().map(str::to_owned),
-            Err(error) => return finish::<()>(&client, Err(error)).await,
-        };
-        let report = NetworkScopeReport {
-            profile: selected.name,
-            action: "query".to_owned(),
-            scope: configured,
-        };
-        let human = match &report.scope {
-            Some(scope) => format!("Configured default scope: {scope}"),
-            None => "No persistent flood scope is configured".to_owned(),
-        };
-        finish(&client, Ok(())).await?;
-        return writer
-            .result("network_scope", &report, &human)
-            .map_err(CliError::from);
+        if args.set_default {
+            match (&scope, key_name.as_deref()) {
+                (FloodScope::Default | FloodScope::Unscoped, _) => {
+                    session
+                        .client()
+                        .clear_default_flood_scope()
+                        .await
+                        .map_err(CliError::from)?;
+                    Ok(NetworkScopeReport {
+                        profile: selected.name,
+                        action: "clear_default".to_owned(),
+                        scope: None,
+                    })
+                }
+                (FloodScope::Key(key), Some(name)) => {
+                    session
+                        .client()
+                        .set_default_flood_scope(name, *key)
+                        .await
+                        .map_err(CliError::from)?;
+                    Ok(NetworkScopeReport {
+                        profile: selected.name,
+                        action: "set_default".to_owned(),
+                        scope: Some(name.to_owned()),
+                    })
+                }
+                (FloodScope::Key(_), None) => Err(CliError::from(CoreError::ProtocolInvariant(
+                    "scope key name was lost",
+                ))),
+            }
+        } else {
+            session
+                .client()
+                .set_flood_scope(&scope)
+                .await
+                .map_err(CliError::from)?;
+            Ok(NetworkScopeReport {
+                profile: selected.name,
+                action: "set".to_owned(),
+                scope: scope_name_for_report(&scope, key_name),
+            })
+        }
     }
-
-    let scope_value = args
-        .scope
-        .as_deref()
-        .ok_or_else(|| CliError::new(ExitStatus::Usage, "network scope requires a scope value"))?;
-    let (scope, key_name) = parse_flood_scope(scope_value)?;
-    let report = if args.set_default {
-        match (&scope, key_name.as_deref()) {
-            (FloodScope::Default | FloodScope::Unscoped, _) => {
-                if let Err(error) = client.clear_default_flood_scope().await {
-                    return finish::<()>(&client, Err(error)).await;
-                }
-                NetworkScopeReport {
-                    profile: selected.name,
-                    action: "clear_default".to_owned(),
-                    scope: None,
-                }
-            }
-            (FloodScope::Key(key), Some(name)) => {
-                if let Err(error) = client.set_default_flood_scope(name, *key).await {
-                    return finish::<()>(&client, Err(error)).await;
-                }
-                NetworkScopeReport {
-                    profile: selected.name,
-                    action: "set_default".to_owned(),
-                    scope: Some(name.to_owned()),
-                }
-            }
-            (FloodScope::Key(_), None) => {
-                return finish::<()>(
-                    &client,
-                    Err(CoreError::ProtocolInvariant("scope key name was lost")),
-                )
-                .await;
-            }
-        }
-    } else {
-        if let Err(error) = client.set_flood_scope(&scope).await {
-            return finish::<()>(&client, Err(error)).await;
-        }
-        NetworkScopeReport {
-            profile: selected.name,
-            action: "set".to_owned(),
-            scope: scope_name_for_report(&scope, key_name),
-        }
-    };
-    finish(&client, Ok(())).await?;
+    .await;
+    let report = session.finish(operation).await?;
     let human = match (report.action.as_str(), report.scope.as_deref()) {
         ("set_default", Some(scope)) => format!("Configured persistent scope '{scope}'"),
         ("set", Some(scope)) => format!("Set current flood scope to '{scope}'"),
         ("clear_default", _) => "Cleared persistent flood scope".to_owned(),
+        ("query", Some(scope)) => format!("Configured default scope: {scope}"),
+        ("query", None) => "No persistent flood scope is configured".to_owned(),
         _ => "Updated flood scope".to_owned(),
     };
     writer
@@ -1032,56 +1056,67 @@ async fn network_trace<W: Write>(
     };
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
-    let contacts = match client.list_contacts(None).await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(&client, Err(error)).await,
-    };
-    let contact = match resolve_contact(&contacts, &args.target) {
-        Ok(contact) => contact,
-        Err(error) => {
-            let _ = client.shutdown().await;
-            return Err(error);
-        }
-    };
-    let previous_hash_mode = if let Some(mode) = requested_hash_mode {
-        let previous = match client.get_path_hash_mode().await {
-            Ok(value) => value,
-            Err(error) => return finish::<()>(&client, Err(error)).await,
+    let (session, _) = CompanionSession::connect(&selected, client, "network trace").await?;
+    let operation = async {
+        let contacts = session
+            .client()
+            .list_contacts(None)
+            .await
+            .map_err(CliError::from)?;
+        let contact = resolve_contact(&contacts, &args.target)?.clone();
+        let previous_hash_mode = if let Some(mode) = requested_hash_mode {
+            let previous = session
+                .client()
+                .get_path_hash_mode()
+                .await
+                .map_err(CliError::from)?;
+            if previous != mode {
+                session
+                    .client()
+                    .set_path_hash_mode(mode)
+                    .await
+                    .map_err(CliError::from)?;
+            }
+            Some(previous)
+        } else {
+            None
         };
-        if previous != mode
-            && let Err(error) = client.set_path_hash_mode(mode).await
+        let discovery = session
+            .client()
+            .discover_path(contact.public_key.as_bytes())
+            .await
+            .map_err(CliError::from);
+        let restore = if let (Some(previous), Some(requested)) =
+            (previous_hash_mode, requested_hash_mode)
+            && previous != requested
         {
-            return finish::<()>(&client, Err(error)).await;
-        }
-        Some(previous)
-    } else {
-        None
-    };
-    let discovery_result = client.discover_path(contact.public_key.as_bytes()).await;
-    let restore_result = if let (Some(previous), Some(requested)) =
-        (previous_hash_mode, requested_hash_mode)
-        && previous != requested
-    {
-        client.set_path_hash_mode(previous).await
-    } else {
-        Ok(())
-    };
-    let discovery = match (discovery_result, restore_result) {
-        (Ok(value), Ok(())) => value,
-        (Err(primary), _) => return finish::<()>(&client, Err(primary)).await,
-        (Ok(_), Err(restore)) => return finish::<()>(&client, Err(restore)).await,
-    };
-    let report = NetworkTraceReport {
-        profile: selected.name,
-        target: contact.adv_name.clone(),
-        public_key: contact.public_key.to_hex(),
-        discovery,
-    };
+            session
+                .client()
+                .set_path_hash_mode(previous)
+                .await
+                .map_err(CliError::from)
+        } else {
+            Ok(())
+        };
+        let discovery = match (discovery, restore) {
+            (Err(primary), Err(_)) => {
+                tracing::warn!("secondary path-hash restore failure; details omitted");
+                return Err(primary);
+            }
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(restore)) => return Err(restore),
+            (Ok(discovery), Ok(())) => discovery,
+        };
+        Ok(NetworkTraceReport {
+            profile: selected.name,
+            target: contact.adv_name.clone(),
+            public_key: contact.public_key.to_hex(),
+            discovery,
+        })
+    }
+    .await;
+    let report = session.finish(operation).await?;
     let human = format!("Discovered path for '{}'", report.target);
-    finish(&client, Ok(())).await?;
     writer
         .result("network_trace", &report, &human)
         .map_err(CliError::from)
@@ -1093,107 +1128,102 @@ async fn contacts<W: Write>(
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
     let selected = select_profile(cli)?;
-    let workflow = WorkflowServices::from_selected(&selected)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
-    let contacts = match &args.command {
-        Some(ContactCommand::Import { .. }) => None,
-        _ => match client.list_contacts(None).await {
-            Ok(contacts) => Some(contacts),
-            Err(error) => return finish::<()>(&client, Err(error)).await,
-        },
-    };
-    match &args.command {
-        Some(ContactCommand::Show { contact }) => {
-            let contact = match resolve_contact(contacts.as_deref().unwrap_or_default(), contact) {
-                Ok(contact) => contact_view(contact),
-                Err(error) => return finish_cli_error(&client, error).await,
-            };
-            let human = format!(
-                "{}\t{}\t{}\nRoute: {}\nPath: {}",
-                contact.name, contact.kind, contact.public_key, contact.route, contact.path
-            );
-            finish(&client, Ok(())).await?;
-            writer
-                .result("contact", &contact, &human)
-                .map_err(CliError::from)
-        }
-        Some(ContactCommand::Update(args)) => {
-            contact_update(
-                &selected,
-                &workflow,
-                &client,
-                contacts.as_deref().unwrap_or_default(),
-                args,
-                writer,
-            )
-            .await
-        }
-        Some(ContactCommand::Forget { contact }) => {
-            contact_forget(
-                cli,
-                &selected,
-                &workflow,
-                &client,
-                contacts.as_deref().unwrap_or_default(),
-                contact,
-                writer,
-            )
-            .await
-        }
-        Some(ContactCommand::Export { contact }) => {
-            contact_export(
-                &selected,
-                &client,
-                contacts.as_deref().unwrap_or_default(),
-                contact,
-                writer,
-            )
-            .await
-        }
-        Some(ContactCommand::Import { uri }) => {
-            contact_import(&selected, &workflow, &client, uri, writer).await
-        }
-        Some(ContactCommand::Path(command)) => {
-            contact_path(
-                cli,
-                &selected,
-                &workflow,
-                &client,
-                contacts.as_deref().unwrap_or_default(),
-                command,
-                writer,
-            )
-            .await
-        }
-        None => {
-            contact_list(
-                &selected,
-                &client,
-                args,
-                contacts.unwrap_or_default(),
-                writer,
-            )
-            .await
-        }
-        Some(ContactCommand::Pending(_)) => {
-            finish_cli_error(&client, CliError::unsupported("pending contacts")).await
+    let (session, _) = CompanionSession::connect(&selected, client, "contacts").await?;
+    let operation = async {
+        let contacts = match &args.command {
+            Some(ContactCommand::Import { .. }) => None,
+            _ => Some(
+                session
+                    .client()
+                    .list_contacts(None)
+                    .await
+                    .map_err(CliError::from)?,
+            ),
+        };
+        match &args.command {
+            Some(ContactCommand::Show { contact }) => {
+                let contact = contact_view(resolve_contact(
+                    contacts.as_deref().unwrap_or_default(),
+                    contact,
+                )?);
+                let human = format!(
+                    "{}\t{}\t{}\nRoute: {}\nPath: {}",
+                    contact.name, contact.kind, contact.public_key, contact.route, contact.path
+                );
+                let report = ContactReport {
+                    profile: selected.name.clone(),
+                    contact,
+                };
+                writer
+                    .result("contact", &report, &human)
+                    .map_err(CliError::from)
+            }
+            Some(ContactCommand::Update(args)) => {
+                contact_update(
+                    &selected,
+                    session.workflow(),
+                    session.client(),
+                    contacts.as_deref().unwrap_or_default(),
+                    args,
+                    writer,
+                )
+                .await
+            }
+            Some(ContactCommand::Forget { contact }) => {
+                contact_forget(
+                    cli,
+                    &selected,
+                    session.workflow(),
+                    session.client(),
+                    contacts.as_deref().unwrap_or_default(),
+                    contact,
+                    writer,
+                )
+                .await
+            }
+            Some(ContactCommand::Export { contact }) => {
+                contact_export(
+                    &selected,
+                    session.client(),
+                    contacts.as_deref().unwrap_or_default(),
+                    contact,
+                    writer,
+                )
+                .await
+            }
+            Some(ContactCommand::Import { uri }) => {
+                contact_import(&selected, session.workflow(), session.client(), uri, writer).await
+            }
+            Some(ContactCommand::Path(command)) => {
+                contact_path(
+                    cli,
+                    &selected,
+                    session.workflow(),
+                    session.client(),
+                    contacts.as_deref().unwrap_or_default(),
+                    command,
+                    writer,
+                )
+                .await
+            }
+            None => contact_list(&selected, args, contacts.unwrap_or_default(), writer),
+            Some(ContactCommand::Pending(_)) => Err(CliError::unsupported("pending contacts")),
         }
     }
+    .await;
+    session.finish(operation).await
 }
 
-async fn contact_list<W: Write>(
+fn contact_list<W: Write>(
     selected: &SelectedProfile,
-    client: &ManagedClient,
     args: &ContactsArgs,
     contacts: Vec<Contact>,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
     let contacts = filter_contacts(contacts, args);
     let contacts: Vec<_> = contacts.iter().map(contact_view).collect();
-    let human = if contacts.is_empty() {
+    let mut human = if contacts.is_empty() {
         "No contacts matched.".to_owned()
     } else {
         contacts
@@ -1209,11 +1239,17 @@ async fn contact_list<W: Write>(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    if args.refresh {
+        human = format!(
+            "Contacts fetched fresh from the device (--refresh explicitly requested).\n{human}"
+        );
+    }
     let report = ContactsReport {
         profile: selected.name.clone(),
+        refreshed: true,
+        refresh_requested: args.refresh,
         contacts,
     };
-    finish(client, Ok(())).await?;
     writer
         .result("contacts", &report, &human)
         .map_err(CliError::from)
@@ -1227,50 +1263,39 @@ async fn contact_update<W: Write>(
     args: &crate::args::ContactUpdateArgs,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let contact = match resolve_contact(contacts, &args.contact) {
-        Ok(contact) => contact,
-        Err(error) => return finish_cli_error(client, error).await,
-    };
-    let contact = match client.get_contact(contact.public_key.as_bytes()).await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(client, Err(error)).await,
-    };
+    let contact = resolve_contact(contacts, &args.contact)?;
+    let contact = client
+        .get_contact(contact.public_key.as_bytes())
+        .await
+        .map_err(CliError::from)?;
     let (updated, changed) = apply_contact_update(contact, args);
     if !changed {
-        return finish_cli_error(
-            client,
-            CliError::new(ExitStatus::Usage, "no contact changes were supplied"),
+        return Err(CliError::new(
+            ExitStatus::Usage,
+            "no contact changes were supplied",
+        ));
+    }
+    client
+        .update_contact(&updated)
+        .await
+        .map_err(CliError::from)?;
+    workflow
+        .contact_updated(
+            updated.public_key.to_hex(),
+            Some(updated.adv_name.clone()),
+            ContactChange::Updated,
         )
-        .await;
-    }
-    let operation = client.update_contact(&updated).await;
-    match operation {
-        Ok(()) => {
-            if let Err(error) = workflow
-                .contact_updated(
-                    updated.public_key.to_hex(),
-                    Some(updated.adv_name.clone()),
-                    ContactChange::Updated,
-                )
-                .await
-            {
-                let _ = client.shutdown().await;
-                return Err(error);
-            }
-            let report = ContactUpdateReport {
-                profile: selected.name.clone(),
-                public_key: updated.public_key.to_hex(),
-                name: updated.adv_name.clone(),
-                favorite: updated.flags & 1 != 0,
-            };
-            let human = format!("Updated contact '{}'", report.name);
-            finish(client, Ok(())).await?;
-            writer
-                .result("contact_update", &report, &human)
-                .map_err(CliError::from)
-        }
-        Err(error) => finish::<()>(client, Err(error)).await,
-    }
+        .await?;
+    let report = ContactUpdateReport {
+        profile: selected.name.clone(),
+        public_key: updated.public_key.to_hex(),
+        name: updated.adv_name.clone(),
+        favorite: updated.flags & 1 != 0,
+    };
+    let human = format!("Updated contact '{}'", report.name);
+    writer
+        .result("contact_update", &report, &human)
+        .map_err(CliError::from)
 }
 
 async fn contact_forget<W: Write>(
@@ -1282,39 +1307,28 @@ async fn contact_forget<W: Write>(
     contact: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let contact = match resolve_contact(contacts, contact) {
-        Ok(contact) => contact,
-        Err(error) => return finish_cli_error(client, error).await,
+    let contact = resolve_contact(contacts, contact)?;
+    confirm(cli, &format!("remove contact {}", contact.adv_name))?;
+    client
+        .remove_contact(contact.public_key.as_bytes())
+        .await
+        .map_err(CliError::from)?;
+    workflow
+        .contact_updated(
+            contact.public_key.to_hex(),
+            Some(contact.adv_name.clone()),
+            ContactChange::Removed,
+        )
+        .await?;
+    let report = ContactForgetReport {
+        profile: selected.name.clone(),
+        contact: contact.adv_name.clone(),
+        public_key: contact.public_key.to_hex(),
     };
-    if let Err(error) = confirm(cli, &format!("remove contact {}", contact.adv_name)) {
-        return finish_cli_error(client, error).await;
-    }
-    match client.remove_contact(contact.public_key.as_bytes()).await {
-        Ok(()) => {
-            if let Err(error) = workflow
-                .contact_updated(
-                    contact.public_key.to_hex(),
-                    Some(contact.adv_name.clone()),
-                    ContactChange::Removed,
-                )
-                .await
-            {
-                let _ = client.shutdown().await;
-                return Err(error);
-            }
-            let report = ContactForgetReport {
-                profile: selected.name.clone(),
-                contact: contact.adv_name.clone(),
-                public_key: contact.public_key.to_hex(),
-            };
-            let human = format!("Removed contact '{}'", report.contact);
-            finish(client, Ok(())).await?;
-            writer
-                .result("contact_remove", &report, &human)
-                .map_err(CliError::from)
-        }
-        Err(error) => finish::<()>(client, Err(error)).await,
-    }
+    let human = format!("Removed contact '{}'", report.contact);
+    writer
+        .result("contact_remove", &report, &human)
+        .map_err(CliError::from)
 }
 
 async fn contact_export<W: Write>(
@@ -1324,17 +1338,11 @@ async fn contact_export<W: Write>(
     contact: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let contact = match resolve_contact(contacts, contact) {
-        Ok(contact) => contact,
-        Err(error) => return finish_cli_error(client, error).await,
-    };
-    let uri = match client
+    let contact = resolve_contact(contacts, contact)?;
+    let uri = client
         .export_contact(Some(contact.public_key.as_bytes()))
         .await
-    {
-        Ok(uri) => uri,
-        Err(error) => return finish::<()>(client, Err(error)).await,
-    };
+        .map_err(CliError::from)?;
     let report = ContactExportReport {
         profile: selected.name.clone(),
         contact: contact.adv_name.clone(),
@@ -1342,7 +1350,6 @@ async fn contact_export<W: Write>(
         uri: uri.uri,
     };
     let human = format!("Exported contact '{}'", report.contact);
-    finish(client, Ok(())).await?;
     writer
         .result("contact_export", &report, &human)
         .map_err(CliError::from)
@@ -1355,34 +1362,21 @@ async fn contact_import<W: Write>(
     uri: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let card = match parse_meshcore_uri(uri) {
-        Ok(card) => card,
-        Err(error) => return finish_cli_error(client, error).await,
+    let card = parse_meshcore_uri(uri)?;
+    client.import_contact(&card).await.map_err(CliError::from)?;
+    let mut digest = Sha256::new();
+    digest.update(&card);
+    let contact_id = format!("import-{}", hex::encode(&digest.finalize()[..16]));
+    workflow
+        .contact_updated(contact_id, None, ContactChange::Added)
+        .await?;
+    let report = ContactImportReport {
+        profile: selected.name.clone(),
+        card_bytes: card.len(),
     };
-    match client.import_contact(&card).await {
-        Ok(()) => {
-            let mut digest = Sha256::new();
-            digest.update(&card);
-            let contact_id = format!("import-{}", hex::encode(&digest.finalize()[..16]));
-            if let Err(error) = workflow
-                .contact_updated(contact_id, None, ContactChange::Added)
-                .await
-            {
-                let _ = client.shutdown().await;
-                return Err(error);
-            }
-            let report = ContactImportReport {
-                profile: selected.name.clone(),
-                card_bytes: card.len(),
-            };
-            let human = "Imported contact";
-            finish(client, Ok(())).await?;
-            writer
-                .result("contact_import", &report, human)
-                .map_err(CliError::from)
-        }
-        Err(error) => finish::<()>(client, Err(error)).await,
-    }
+    writer
+        .result("contact_import", &report, "Imported contact")
+        .map_err(CliError::from)
 }
 
 async fn contact_path<W: Write>(
@@ -1396,14 +1390,11 @@ async fn contact_path<W: Write>(
 ) -> Result<(), CliError> {
     match command {
         crate::args::ContactPathCommand::Show { contact } => {
-            let contact = match resolve_contact(contacts, contact) {
-                Ok(value) => value,
-                Err(error) => return finish_cli_error(client, error).await,
-            };
-            let path = match client.get_advert_path(contact.public_key.as_bytes()).await {
-                Ok(value) => value,
-                Err(error) => return finish::<()>(client, Err(error)).await,
-            };
+            let contact = resolve_contact(contacts, contact)?;
+            let path = client
+                .get_advert_path(contact.public_key.as_bytes())
+                .await
+                .map_err(CliError::from)?;
             let report = ContactPathReport {
                 profile: selected.name.clone(),
                 contact: contact.adv_name.clone(),
@@ -1413,20 +1404,16 @@ async fn contact_path<W: Write>(
                 path: path.path.to_hex(),
             };
             let human = format!("Path for '{}' is {}", report.contact, report.path);
-            finish(client, Ok(())).await?;
             writer
                 .result("contact_path", &report, &human)
                 .map_err(CliError::from)
         }
         crate::args::ContactPathCommand::Discover { contact } => {
-            let contact = match resolve_contact(contacts, contact) {
-                Ok(value) => value,
-                Err(error) => return finish_cli_error(client, error).await,
-            };
-            let discovery = match client.discover_path(contact.public_key.as_bytes()).await {
-                Ok(value) => value,
-                Err(error) => return finish::<()>(client, Err(error)).await,
-            };
+            let contact = resolve_contact(contacts, contact)?;
+            let discovery = client
+                .discover_path(contact.public_key.as_bytes())
+                .await
+                .map_err(CliError::from)?;
             let report = ContactPathDiscoveryReport {
                 profile: selected.name.clone(),
                 contact: contact.adv_name.clone(),
@@ -1434,37 +1421,34 @@ async fn contact_path<W: Write>(
                 discovery,
             };
             let human = format!("Discovered path for '{}'", report.contact);
-            finish(client, Ok(())).await?;
             writer
                 .result("contact_path_discovery", &report, &human)
                 .map_err(CliError::from)
         }
         crate::args::ContactPathCommand::Reset { contact } => {
-            let contact = match resolve_contact(contacts, contact) {
-                Ok(value) => value,
-                Err(error) => return finish_cli_error(client, error).await,
+            let contact = resolve_contact(contacts, contact)?;
+            confirm(cli, &format!("reset path for contact {}", contact.adv_name))?;
+            client
+                .reset_path(contact.public_key.as_bytes())
+                .await
+                .map_err(CliError::from)?;
+            workflow
+                .contact_updated(
+                    contact.public_key.to_hex(),
+                    Some(contact.adv_name.clone()),
+                    ContactChange::Updated,
+                )
+                .await?;
+            let report = ContactPathResetReport {
+                profile: selected.name.clone(),
+                contact: contact.adv_name.clone(),
+                public_key: contact.public_key.to_hex(),
+                reset: true,
             };
-            if let Err(error) =
-                confirm(cli, &format!("reset path for contact {}", contact.adv_name))
-            {
-                return finish_cli_error(client, error).await;
-            }
-            match client.reset_path(contact.public_key.as_bytes()).await {
-                Ok(()) => {
-                    let report = ContactPathResetReport {
-                        profile: selected.name.clone(),
-                        contact: contact.adv_name.clone(),
-                        public_key: contact.public_key.to_hex(),
-                        reset: true,
-                    };
-                    let human = format!("Reset path for '{}'", report.contact);
-                    finish(client, Ok(())).await?;
-                    writer
-                        .result("contact_path_reset", &report, &human)
-                        .map_err(CliError::from)
-                }
-                Err(error) => finish::<()>(client, Err(error)).await,
-            }
+            let human = format!("Reset path for '{}'", report.contact);
+            writer
+                .result("contact_path_reset", &report, &human)
+                .map_err(CliError::from)
         }
         crate::args::ContactPathCommand::Set { contact, path } => {
             contact_path_set(
@@ -1486,38 +1470,26 @@ async fn contact_path_set<W: Write>(
     path: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let listed = match resolve_contact(contacts, contact) {
-        Ok(value) => value,
-        Err(error) => return finish_cli_error(client, error).await,
-    };
-    let mut updated = match client.get_contact(listed.public_key.as_bytes()).await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(client, Err(error)).await,
-    };
+    let listed = resolve_contact(contacts, contact)?;
+    let mut updated = client
+        .get_contact(listed.public_key.as_bytes())
+        .await
+        .map_err(CliError::from)?;
     let hash_mode = match client.get_path_hash_mode().await {
         Ok(value) if value <= 2 => value,
         Ok(_) => {
-            return finish_cli_error(
-                client,
-                CliError::new(
-                    ExitStatus::Protocol,
-                    "the device reported an unsupported contact path hash mode",
-                ),
-            )
-            .await;
+            return Err(CliError::new(
+                ExitStatus::Protocol,
+                "the device reported an unsupported contact path hash mode",
+            ));
         }
-        Err(error) => return finish::<()>(client, Err(error)).await,
+        Err(error) => return Err(CliError::from(error)),
     };
-    let path_bytes = match parse_explicit_contact_path(path, hash_mode) {
-        Ok(value) => value,
-        Err(error) => return finish_cli_error(client, error).await,
-    };
-    if let Err(error) = confirm(
+    let path_bytes = parse_explicit_contact_path(path, hash_mode)?;
+    confirm(
         cli,
         &format!("replace path for contact {}", updated.adv_name),
-    ) {
-        return finish_cli_error(client, error).await;
-    }
+    )?;
     let width = usize::from(hash_mode) + 1;
     let hop_count = u8::try_from(path_bytes.len() / width)
         .map_err(|_| CliError::new(ExitStatus::Usage, "contact path contains too many hops"))?;
@@ -1526,20 +1498,17 @@ async fn contact_path_set<W: Write>(
         hop_count,
     };
     updated.out_path = meshquill_core::Path::try_from_bytes(&path_bytes).map_err(CliError::from)?;
-    if let Err(error) = client.update_contact(&updated).await {
-        return finish::<()>(client, Err(error)).await;
-    }
-    if let Err(error) = workflow
+    client
+        .update_contact(&updated)
+        .await
+        .map_err(CliError::from)?;
+    workflow
         .contact_updated(
             updated.public_key.to_hex(),
             Some(updated.adv_name.clone()),
             ContactChange::Updated,
         )
-        .await
-    {
-        let _ = client.shutdown().await;
-        return Err(error);
-    }
+        .await?;
     let report = ContactPathSetReport {
         profile: selected.name.clone(),
         contact: updated.adv_name,
@@ -1550,7 +1519,6 @@ async fn contact_path_set<W: Write>(
         updated: true,
     };
     let human = format!("Updated path for '{}'", terminal_safe(&report.contact));
-    finish(client, Ok(())).await?;
     writer
         .result("contact_path_set", &report, &human)
         .map_err(CliError::from)
@@ -1572,28 +1540,27 @@ async fn channels<W: Write>(
 
     let selected = select_profile(cli)?;
     let client = make_client(&selected)?;
-    if let Err(error) = client.connect().await {
-        return finish::<()>(&client, Err(error)).await;
-    }
-    match args {
-        ChannelCommand::List => channel_list(&selected, &client, writer).await,
-        ChannelCommand::Show { channel } => channel_show(&selected, &client, channel, writer).await,
+    let (session, _) = CompanionSession::connect(&selected, client, "channels").await?;
+    let operation = match args {
+        ChannelCommand::List => channel_list(&selected, session.client(), writer).await,
+        ChannelCommand::Show { channel } => {
+            channel_show(&selected, session.client(), channel, writer).await
+        }
         ChannelCommand::Set(command) => {
             let Some(secret) = set_secret else {
-                return finish::<()>(
-                    &client,
-                    Err(CoreError::ProtocolInvariant(
+                return session
+                    .finish(Err(CliError::from(CoreError::ProtocolInvariant(
                         "validated channel secret was unavailable",
-                    )),
-                )
-                .await;
+                    ))))
+                    .await;
             };
-            channel_set(&selected, &client, command, secret, writer).await
+            channel_set(&selected, session.client(), command, secret, writer).await
         }
         ChannelCommand::Remove { channel } => {
-            channel_remove(cli, &selected, &client, channel, writer).await
+            channel_remove(cli, &selected, session.client(), channel, writer).await
         }
-    }
+    };
+    session.finish(operation).await
 }
 
 async fn channel_list<W: Write>(
@@ -1601,10 +1568,9 @@ async fn channel_list<W: Write>(
     client: &ManagedClient,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let mut channels = match collect_channel_views(client).await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(client, Err(error)).await,
-    };
+    let mut channels = collect_channel_views(client)
+        .await
+        .map_err(CliError::from)?;
     channels.retain(|channel| !channel.name.is_empty());
     let human = if channels.is_empty() {
         "No configured channels.".to_owned()
@@ -1619,7 +1585,6 @@ async fn channel_list<W: Write>(
         profile: selected.name.clone(),
         channels,
     };
-    finish(client, Ok(())).await?;
     writer
         .result("channels", &report, &human)
         .map_err(CliError::from)
@@ -1631,23 +1596,15 @@ async fn channel_show<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let channels = match collect_channel_views(client).await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(client, Err(error)).await,
-    };
-    let idx = match resolve_channel_query(&channels, query) {
-        Ok(value) => value,
-        Err(error) => return finish_cli_error(client, error).await,
-    };
+    let channels = collect_channel_views(client)
+        .await
+        .map_err(CliError::from)?;
+    let idx = resolve_channel_query(&channels, query)?;
     let Some(channel) = channels.iter().find(|value| value.idx == idx) else {
-        return finish::<()>(
-            client,
-            Err(CoreError::InvalidArgument {
-                field: "channel",
-                message: "channel index is out of range".to_owned(),
-            }),
-        )
-        .await;
+        return Err(CliError::from(CoreError::InvalidArgument {
+            field: "channel",
+            message: "channel index is out of range".to_owned(),
+        }));
     };
     let report = ChannelReport {
         profile: selected.name.clone(),
@@ -1661,7 +1618,6 @@ async fn channel_show<W: Write>(
         &report.name
     };
     let human = format!("Channel {}: {display_name}", report.idx);
-    finish(client, Ok(())).await?;
     writer
         .result("channel", &report, &human)
         .map_err(CliError::from)
@@ -1674,29 +1630,22 @@ async fn channel_set<W: Write>(
     secret: [u8; 16],
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let channels = match collect_channel_views(client).await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(client, Err(error)).await,
-    };
+    let channels = collect_channel_views(client)
+        .await
+        .map_err(CliError::from)?;
     if !channels
         .iter()
         .any(|channel| channel.idx == command.channel)
     {
-        return finish_cli_error(
-            client,
-            CliError::new(
-                ExitStatus::NotFound,
-                format!("channel index '{}' is out of range", command.channel),
-            ),
-        )
-        .await;
+        return Err(CliError::new(
+            ExitStatus::NotFound,
+            format!("channel index '{}' is out of range", command.channel),
+        ));
     }
-    if let Err(error) = client
+    client
         .set_channel(command.channel, command.name.as_str(), secret)
         .await
-    {
-        return finish::<()>(client, Err(error)).await;
-    }
+        .map_err(CliError::from)?;
     let report = ChannelSetReport {
         profile: selected.name.clone(),
         idx: command.channel,
@@ -1704,7 +1653,6 @@ async fn channel_set<W: Write>(
         secret_set: true,
     };
     let human = format!("Configured channel {}", command.channel);
-    finish(client, Ok(())).await?;
     writer
         .result("channel_set", &report, &human)
         .map_err(CliError::from)
@@ -1717,34 +1665,22 @@ async fn channel_remove<W: Write>(
     query: &str,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let channels = match collect_channel_views(client).await {
-        Ok(value) => value,
-        Err(error) => return finish::<()>(client, Err(error)).await,
-    };
-    let idx = match resolve_channel_query(&channels, query) {
-        Ok(value) => value,
-        Err(error) => return finish_cli_error(client, error).await,
-    };
+    let channels = collect_channel_views(client)
+        .await
+        .map_err(CliError::from)?;
+    let idx = resolve_channel_query(&channels, query)?;
     let previous_name = channels
         .iter()
         .find(|value| value.idx == idx)
         .map_or_else(String::new, |value| value.name.clone());
     if previous_name.is_empty() {
-        return finish_cli_error(
-            client,
-            CliError::new(
-                ExitStatus::NotFound,
-                format!("channel index '{idx}' is not configured"),
-            ),
-        )
-        .await;
+        return Err(CliError::new(
+            ExitStatus::NotFound,
+            format!("channel index '{idx}' is not configured"),
+        ));
     }
-    if let Err(error) = confirm(cli, &format!("remove channel {idx} ({previous_name})")) {
-        return finish_cli_error(client, error).await;
-    }
-    if let Err(error) = client.clear_channel(idx).await {
-        return finish::<()>(client, Err(error)).await;
-    }
+    confirm(cli, &format!("remove channel {idx} ({previous_name})"))?;
+    client.clear_channel(idx).await.map_err(CliError::from)?;
     let report = ChannelRemoveReport {
         profile: selected.name.clone(),
         idx,
@@ -1752,7 +1688,6 @@ async fn channel_remove<W: Write>(
         removed: true,
     };
     let human = format!("Removed channel {idx}");
-    finish(client, Ok(())).await?;
     writer
         .result("channel_remove", &report, &human)
         .map_err(CliError::from)
@@ -1805,10 +1740,13 @@ async fn send<W: Write>(
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
-    if let Err(error) = workflow.connected(&info.name).await {
-        let _ = client.shutdown().await;
-        return Err(error);
-    }
+    activate_workflow(
+        &client,
+        &workflow,
+        &info.name,
+        "send connection hook failed",
+    )
+    .await?;
     if interrupt.token().is_cancelled() {
         cleanup_workflow(&client, &workflow, "interrupted").await;
         return Err(interrupt.error());
@@ -1837,6 +1775,7 @@ async fn send<W: Write>(
         }
     };
     let workflow_message_id = outgoing.message_id().to_string();
+    let mut post_acceptance_error: Option<(&'static str, CliError)> = None;
     if interrupt.token().is_cancelled() {
         if let Err(history_error) = workflow.failed(&mut outgoing).await {
             tracing::warn!(error = %history_error, "could not record interrupted send state");
@@ -1869,14 +1808,7 @@ async fn send<W: Write>(
                         )
                         .await
                     {
-                        cleanup_send(
-                            &client,
-                            &workflow,
-                            scope.is_some(),
-                            "after-send hook failed",
-                        )
-                        .await;
-                        return Err(error);
+                        post_acceptance_error = Some(("post-send workflow failed", error));
                     }
                     Ok(SendReport {
                         destination: prepared.destination.clone(),
@@ -1951,14 +1883,7 @@ async fn send<W: Write>(
                 )
                 .await
             {
-                cleanup_send(
-                    &client,
-                    &workflow,
-                    scope.is_some(),
-                    "after-send hook failed",
-                )
-                .await;
-                return Err(error);
+                post_acceptance_error = Some(("post-send workflow failed", error));
             }
             let ack = if args.wait {
                 let firmware_timeout = Duration::from_millis(u64::from(tracking.timeout_ms));
@@ -1989,14 +1914,15 @@ async fn send<W: Write>(
                             )
                             .await
                         {
-                            cleanup_send(
-                                &client,
-                                &workflow,
-                                scope.is_some(),
-                                "acknowledgement hook failed",
-                            )
-                            .await;
-                            return Err(error);
+                            if post_acceptance_error.is_none() {
+                                post_acceptance_error =
+                                    Some(("acknowledgement workflow failed", error));
+                            } else {
+                                tracing::warn!(
+                                    error = %error,
+                                    "secondary acknowledgement workflow failure; message was already accepted"
+                                );
+                            }
                         }
                         Some(value)
                     }
@@ -2041,23 +1967,27 @@ async fn send<W: Write>(
             return Err(error);
         }
     };
-    if interrupt.token().is_cancelled() {
-        cleanup_send(&client, &workflow, scope.is_some(), "interrupted").await;
-        return Err(interrupt.error());
+    if interrupt.token().is_cancelled() && post_acceptance_error.is_none() {
+        post_acceptance_error = Some(("post-send cleanup was interrupted", interrupt.error()));
     }
     if scope.is_some()
         && let Err(error) = client.set_flood_scope(&FloodScope::Default).await
     {
-        let _ = workflow.disconnected(Some("scope reset failed")).await;
-        let _ = client.shutdown().await;
-        return Err(CliError::from(error));
-    }
-    if interrupt.token().is_cancelled() {
-        cleanup_workflow(&client, &workflow, "interrupted").await;
-        return Err(interrupt.error());
+        let error = CliError::from(error);
+        if post_acceptance_error.is_none() {
+            post_acceptance_error = Some(("flood-scope cleanup failed", error));
+        } else {
+            tracing::warn!(error = %error, "secondary flood-scope cleanup failure");
+        }
     }
 
-    finish_workflow(&client, &workflow, "command completed").await?;
+    if let Err(error) = finish_workflow(&client, &workflow, "command completed").await {
+        if post_acceptance_error.is_none() {
+            post_acceptance_error = Some(("disconnect cleanup failed", error));
+        } else {
+            tracing::warn!(error = %error, "secondary send cleanup failure");
+        }
+    }
     let human = if report.acknowledged {
         format!(
             "Sent to {} and received acknowledgement",
@@ -2068,7 +1998,21 @@ async fn send<W: Write>(
     };
     writer
         .result("send", &report, &human)
-        .map_err(CliError::from)
+        .map_err(CliError::from)?;
+    if let Some((stage, error)) = post_acceptance_error {
+        return Err(accepted_delivery_error(stage, &error));
+    }
+    Ok(())
+}
+
+fn accepted_delivery_error(stage: &str, error: &CliError) -> CliError {
+    CliError::new(
+        error.status(),
+        format!(
+            "the device already accepted the message, but {stage}; do not retry automatically"
+        ),
+    )
+    .with_hint("The emitted send result is authoritative: queued=true means radio transmission was accepted.")
 }
 
 async fn cleanup_send(
@@ -2077,15 +2021,37 @@ async fn cleanup_send(
     reset_scope: bool,
     reason: &str,
 ) {
-    if reset_scope {
-        let _ = client.set_flood_scope(&FloodScope::Default).await;
+    if reset_scope && client.set_flood_scope(&FloodScope::Default).await.is_err() {
+        tracing::warn!("secondary flood-scope cleanup failure; details omitted");
     }
     cleanup_workflow(client, workflow, reason).await;
 }
 
 async fn cleanup_workflow(client: &ManagedClient, workflow: &WorkflowServices, reason: &str) {
-    let _ = workflow.disconnected(Some(reason)).await;
-    let _ = client.shutdown().await;
+    if workflow.disconnected(Some(reason)).await.is_err() {
+        tracing::warn!("secondary disconnect hook failure; details omitted");
+    }
+    if client.shutdown().await.is_err() {
+        tracing::warn!("secondary client shutdown failure; details omitted");
+    }
+}
+
+async fn activate_workflow(
+    client: &ManagedClient,
+    workflow: &WorkflowServices,
+    peer: &str,
+    failure_reason: &str,
+) -> Result<(), CliError> {
+    if let Err(primary) = workflow.connected(peer).await {
+        if workflow.disconnected(Some(failure_reason)).await.is_err() {
+            tracing::warn!("secondary disconnect hook failure; details omitted");
+        }
+        if client.shutdown().await.is_err() {
+            tracing::warn!("secondary client shutdown failure; details omitted");
+        }
+        return Err(primary);
+    }
+    Ok(())
 }
 
 async fn finish_workflow(
@@ -2095,8 +2061,14 @@ async fn finish_workflow(
 ) -> Result<(), CliError> {
     let disconnect_result = workflow.disconnected(Some(reason)).await;
     let shutdown_result = finish(client, Ok(())).await;
-    disconnect_result?;
-    shutdown_result
+    match (disconnect_result, shutdown_result) {
+        (Err(primary), Err(_)) => {
+            tracing::warn!("secondary client shutdown failure; details omitted");
+            Err(primary)
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), result) => result,
+    }
 }
 
 async fn inbox<W: Write>(
@@ -2111,10 +2083,13 @@ async fn inbox<W: Write>(
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
-    if let Err(error) = workflow.connected(&info.name).await {
-        let _ = client.shutdown().await;
-        return Err(error);
-    }
+    activate_workflow(
+        &client,
+        &workflow,
+        &info.name,
+        "inbox connection hook failed",
+    )
+    .await?;
     let mut messages = Vec::new();
     let mut drained = false;
     while args.limit.is_none_or(|limit| messages.len() < limit) {
@@ -2259,23 +2234,24 @@ fn config_show<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Result<(), 
 
 fn config_migrate<W: Write>(cli: &Cli, writer: &mut OutputWriter<W>) -> Result<(), CliError> {
     let store = config_store(cli)?;
-    let (changed, backup_path) = match load_unmodified(&store)? {
+    let locked = store.lock_exclusive().map_err(CliError::from)?;
+    let (changed, backup_path) = match load_unmodified_locked(&locked)? {
         LoadOutcome::Missing => {
             return Err(CliError::new(
                 ExitStatus::Configuration,
-                format!("configuration is missing at {}", store.path().display()),
+                format!("configuration is missing at {}", locked.path().display()),
             )
             .with_hint("Run `meshquill init`."));
         }
         LoadOutcome::Loaded(_) => (false, None),
         LoadOutcome::NeedsMigration(config) => {
-            let backup = store.backup().map_err(CliError::from)?;
-            store.save(&config).map_err(CliError::from)?;
+            let backup = locked.backup().map_err(CliError::from)?;
+            locked.save(&config).map_err(CliError::from)?;
             (true, Some(backup.display().to_string()))
         }
     };
     let report = ConfigChangeReport {
-        path: store.path().display().to_string(),
+        path: locked.path().display().to_string(),
         changed,
         backup_path,
     };
@@ -2324,7 +2300,8 @@ fn config_import_legacy<W: Write>(
     let address = read_legacy_address(&source)?;
 
     let store = config_store(cli)?;
-    let mut config = match load_unmodified(&store)? {
+    let locked = store.lock_exclusive().map_err(CliError::from)?;
+    let mut config = match load_unmodified_locked(&locked)? {
         LoadOutcome::Missing => Config::default(),
         LoadOutcome::Loaded(config) => config,
         LoadOutcome::NeedsMigration(_) => {
@@ -2356,11 +2333,11 @@ fn config_import_legacy<W: Write>(
     if make_default {
         config.default_profile = Some(IMPORTED_PROFILE.to_owned());
     }
-    store.save(&config).map_err(CliError::from)?;
+    locked.save(&config).map_err(CliError::from)?;
 
     let report = LegacyImportReport {
         source: source.display().to_string(),
-        config_path: store.path().display().to_string(),
+        config_path: locked.path().display().to_string(),
         profile: IMPORTED_PROFILE.to_owned(),
         default: make_default,
         transport: "ble",
@@ -2470,11 +2447,6 @@ async fn finish<T>(client: &ManagedClient, operation: Result<T, CoreError>) -> R
             Err(CliError::from(error))
         }
     }
-}
-
-async fn finish_cli_error<T>(client: &ManagedClient, error: CliError) -> Result<T, CliError> {
-    let _ = client.shutdown().await;
-    Err(error)
 }
 
 async fn collect_channel_views(client: &ManagedClient) -> Result<Vec<ChannelInfoView>, CoreError> {
@@ -3547,10 +3519,13 @@ async fn watch_events<W: Write>(
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
-    if let Err(error) = workflow.connected(&info.name).await {
-        let _ = client.shutdown().await;
-        return Err(error);
-    }
+    activate_workflow(
+        &client,
+        &workflow,
+        &info.name,
+        "watch connection hook failed",
+    )
+    .await?;
     let mut device_name = info.name;
     let mut workflow_connected = true;
     let mut awaiting_reconnect_confirmation = false;
@@ -3595,7 +3570,13 @@ async fn watch_events<W: Write>(
                                 workflow.disconnected(Some("device event")).await
                             }
                             Event::Connected if !workflow_connected => {
-                                let result = workflow.connected(&device_name).await;
+                                let result = activate_workflow(
+                                    &client,
+                                    &workflow,
+                                    &device_name,
+                                    "watch reconnect hook failed",
+                                )
+                                .await;
                                 if result.is_ok() {
                                     workflow_connected = true;
                                 }
@@ -3637,10 +3618,13 @@ async fn watch_events<W: Write>(
                             {
                                 Ok(reconnected) => {
                                     device_name = reconnected.name;
-                                    if let Err(error) = workflow.connected(&device_name).await {
-                                        let _ = client.shutdown().await;
-                                        return Err(error);
-                                    }
+                                    activate_workflow(
+                                        &client,
+                                        &workflow,
+                                        &device_name,
+                                        "watch reconnect hook failed",
+                                    )
+                                    .await?;
                                     workflow_connected = true;
                                     awaiting_reconnect_confirmation = true;
                                 }
@@ -4266,10 +4250,13 @@ async fn chat<W: Write>(
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
-    if let Err(error) = workflow.connected(&info.name).await {
-        let _ = client.shutdown().await;
-        return Err(error);
-    }
+    activate_workflow(
+        &client,
+        &workflow,
+        &info.name,
+        "chat connection hook failed",
+    )
+    .await?;
     let workflow_connected = AtomicBool::new(true);
     let control = ChatSessionControl {
         ack_timeout: cli.timeout,
@@ -4344,8 +4331,8 @@ async fn cleanup_chat_workflow(
 ) {
     if workflow_connected.load(Ordering::Acquire) {
         cleanup_workflow(client, workflow, reason).await;
-    } else {
-        let _ = client.shutdown().await;
+    } else if client.shutdown().await.is_err() {
+        tracing::warn!("secondary client shutdown failure; details omitted");
     }
 }
 
@@ -4418,7 +4405,7 @@ async fn reconnect_chat_session(
     }
     let info =
         reconnect_device(client, control.reconnect_policy, control.interrupt.token()).await?;
-    workflow.connected(&info.name).await?;
+    activate_workflow(client, workflow, &info.name, "chat reconnect hook failed").await?;
     control.workflow_connected.store(true, Ordering::Release);
     Ok(info)
 }
@@ -4520,6 +4507,15 @@ async fn run_chat_lines<W: Write>(
                             "Reconnected to the companion; no message was replayed.",
                             writer,
                         )?;
+                    }
+                    Ok(
+                        Event::ProtocolError(_)
+                        | Event::UnknownPacket { .. }
+                        | Event::LoginFailed { .. },
+                    ) => {
+                        workflow
+                            .error("chat", "the device emitted an error event")
+                            .await?;
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -4807,7 +4803,7 @@ async fn submit_chat_draft<W: Write>(
     let mut session_reconnected = false;
     match send_result {
         Ok(tracking) => {
-            workflow
+            let mut post_acceptance_error = workflow
                 .sent(
                     &mut outgoing,
                     &draft.target.destination,
@@ -4815,7 +4811,9 @@ async fn submit_chat_draft<W: Write>(
                     &message_id,
                     tracking.as_ref().map(|value| value.ack_code),
                 )
-                .await?;
+                .await
+                .err()
+                .map(|error| ("post-send workflow failed", error));
             emit_chat_state(
                 &draft.target,
                 "sent",
@@ -4824,10 +4822,13 @@ async fn submit_chat_draft<W: Write>(
                 writer,
             )?;
             if control.interrupt.token().is_cancelled() {
-                return Err(control.interrupt.error());
+                return Err(accepted_delivery_error(
+                    "chat was interrupted after delivery was accepted",
+                    &control.interrupt.error(),
+                ));
             }
             if let Some(tracking) = tracking {
-                let outcome = wait_for_chat_ack(
+                let (outcome, acknowledgement_workflow_error) = wait_for_chat_ack(
                     client,
                     workflow,
                     &draft.target,
@@ -4837,6 +4838,16 @@ async fn submit_chat_draft<W: Write>(
                     control,
                 )
                 .await?;
+                if let Some(error) = acknowledgement_workflow_error {
+                    if post_acceptance_error.is_none() {
+                        post_acceptance_error = Some(("acknowledgement workflow failed", error));
+                    } else {
+                        tracing::warn!(
+                            error = %error,
+                            "secondary acknowledgement workflow failure; message was already accepted"
+                        );
+                    }
+                }
                 session_reconnected = matches!(&outcome, ChatAckOutcome::Reconnected);
                 let (state, human) = outcome.output();
                 emit_chat_state(
@@ -4846,6 +4857,9 @@ async fn submit_chat_draft<W: Write>(
                     &format!("{}: {human}", draft.target.destination),
                     writer,
                 )?;
+            }
+            if let Some((stage, error)) = post_acceptance_error {
+                return Err(accepted_delivery_error(stage, &error));
             }
         }
         Err(error) if reconnect_trigger(&error) => {
@@ -4892,7 +4906,7 @@ async fn wait_for_chat_ack(
     message_id: &str,
     tracking: CommandTracking,
     control: ChatSessionControl<'_>,
-) -> Result<ChatAckOutcome, CliError> {
+) -> Result<(ChatAckOutcome, Option<CliError>), CliError> {
     let firmware_timeout = Duration::from_millis(u64::from(tracking.timeout_ms));
     let timeout = firmware_timeout.min(control.ack_timeout);
     let ack_result = tokio::select! {
@@ -4904,7 +4918,7 @@ async fn wait_for_chat_ack(
     };
     match ack_result {
         Ok(ack) => {
-            workflow
+            let workflow_error = workflow
                 .acknowledged(
                     outgoing,
                     message_id,
@@ -4912,8 +4926,9 @@ async fn wait_for_chat_ack(
                     ack.trip_time_ms,
                     tracking.ack_code,
                 )
-                .await?;
-            Ok(ChatAckOutcome::Acknowledged)
+                .await
+                .err();
+            Ok((ChatAckOutcome::Acknowledged, workflow_error))
         }
         Err(error) => {
             let reconnectable = reconnect_trigger(&error);
@@ -4925,7 +4940,7 @@ async fn wait_for_chat_ack(
                 {
                     tracing::warn!(error = %workflow_error, "could not record timed-out chat acknowledgement");
                 }
-                return Ok(ChatAckOutcome::TimedOut);
+                return Ok((ChatAckOutcome::TimedOut, None));
             }
 
             if let Err(workflow_error) = workflow.failed(outgoing).await {
@@ -4942,7 +4957,7 @@ async fn wait_for_chat_ack(
                 "chat acknowledgement transport failed",
             )
             .await?;
-            Ok(ChatAckOutcome::Reconnected)
+            Ok((ChatAckOutcome::Reconnected, None))
         }
     }
 }
@@ -4971,6 +4986,15 @@ async fn poll_chat_incoming<W: Write>(
                 }
                 Ok(Event::Disconnected) => connection_active = false,
                 Ok(Event::Connected) => connection_active = true,
+                Ok(
+                    Event::ProtocolError(_)
+                    | Event::UnknownPacket { .. }
+                    | Event::LoginFailed { .. },
+                ) => {
+                    workflow
+                        .error("chat", "the device emitted an error event")
+                        .await?;
+                }
                 Ok(_) => {}
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
@@ -5410,6 +5434,13 @@ mod tests {
             Ok(_) => panic!("{context}"),
             Err(error) => error,
         }
+    }
+
+    #[test]
+    fn direct_connect_call_sites_remain_audited() {
+        let needle = concat!("client.", "connect()");
+        assert_eq!(include_str!("runtime.rs").matches(needle).count(), 6);
+        assert_eq!(include_str!("remote_cli.rs").matches(needle).count(), 0);
     }
 
     #[test]

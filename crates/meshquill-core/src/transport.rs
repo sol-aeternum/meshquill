@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    task::{Context, Poll, Waker},
+};
 
 use async_trait::async_trait;
 
@@ -17,6 +20,17 @@ pub enum TransportKind {
     Tcp,
     /// Fallback for unknown/legacy transport implementations.
     Unknown,
+}
+
+/// Result of one non-blocking transport read attempt.
+#[derive(Debug)]
+pub enum ReadyRead {
+    /// No complete logical packet is currently buffered.
+    Pending,
+    /// The peer has closed the connection cleanly.
+    Closed,
+    /// One complete logical companion packet was available.
+    Packet(Vec<u8>),
 }
 
 /// Minimal async transport abstraction used by the core client.
@@ -45,6 +59,25 @@ pub trait Transport: Send + Unpin {
     /// not consume a logical packet. This lets the managed client interrupt an idle read when a
     /// command arrives without losing protocol data.
     async fn read(&mut self) -> Result<Option<Vec<u8>>, TransportError>;
+
+    /// Polls once for a logical packet without waiting for future input.
+    ///
+    /// The default implementation relies on the cancellation-safety guarantee of [`Self::read`].
+    /// Test transports whose preloaded frames model future command responses may override this and
+    /// report [`ReadyRead::Pending`].
+    ///
+    /// # Errors
+    /// Returns the same transport errors as [`Self::read`] when a packet is immediately ready.
+    fn try_read(&mut self) -> Result<ReadyRead, TransportError> {
+        let mut future = self.read();
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Pending => Ok(ReadyRead::Pending),
+            Poll::Ready(Ok(Some(packet))) => Ok(ReadyRead::Packet(packet)),
+            Poll::Ready(Ok(None)) => Ok(ReadyRead::Closed),
+            Poll::Ready(Err(error)) => Err(error),
+        }
+    }
 }
 
 /// Transport abstraction for transports that can perform a reconnect attempt.
@@ -157,6 +190,14 @@ impl Transport for ScriptedTransport {
         }
 
         Ok(self.incoming.pop_front())
+    }
+
+    fn try_read(&mut self) -> Result<ReadyRead, TransportError> {
+        if !self.connected {
+            return Err(TransportError::NotConnected);
+        }
+        // Scripted inbound frames model responses that become visible after the matching write.
+        Ok(ReadyRead::Pending)
     }
 }
 

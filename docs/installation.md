@@ -2,11 +2,12 @@
 
 ## Release archives
 
-No `v0.1.0-rc.2` tag or public prerelease is claimed by this source snapshot. Until
-[status](../STATUS.md) records that publication, build the current checkout; the asset names and
-downloaded-archive commands in this section describe the future RC2 delivery.
+Consult [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) for authoritative
+`v0.1.0-rc.3` tag, artifact, and public-prerelease availability. A source checkout or packaged copy
+of this page does not itself prove publication. If the release is not yet public, use the source
+installation below; the asset names and download commands apply once status records publication.
 
-When run for the `v0.1.0-rc.2` tag, the release workflow builds:
+When run for the `v0.1.0-rc.3` tag, the release workflow builds:
 
 | Target | Archive | Build/runtime note |
 | --- | --- | --- |
@@ -24,10 +25,10 @@ After the prerelease is published, download both the archive and its sibling `.s
 verify and install a Unix archive:
 
 ```console
-sha256sum --check meshquill-v0.1.0-rc.2-x86_64-unknown-linux-gnu.tar.gz.sha256
-# macOS: shasum -a 256 -c meshquill-v0.1.0-rc.2-x86_64-apple-darwin.tar.gz.sha256
-tar -xzf meshquill-v0.1.0-rc.2-x86_64-unknown-linux-gnu.tar.gz
-cd meshquill-v0.1.0-rc.2-x86_64-unknown-linux-gnu
+sha256sum --check meshquill-v0.1.0-rc.3-x86_64-unknown-linux-gnu.tar.gz.sha256
+# macOS: shasum -a 256 -c meshquill-v0.1.0-rc.3-x86_64-apple-darwin.tar.gz.sha256
+tar -xzf meshquill-v0.1.0-rc.3-x86_64-unknown-linux-gnu.tar.gz
+cd meshquill-v0.1.0-rc.3-x86_64-unknown-linux-gnu
 ./bin/meshquill --version
 mkdir -p "$HOME/.local/bin"
 install -m 0755 bin/meshquill "$HOME/.local/bin/meshquill"
@@ -59,12 +60,12 @@ Rust 1.88 or newer is supported. Install the current source checkout with:
 cargo install --path crates/meshquill-cli --locked
 ```
 
-Only after [status](../STATUS.md) records that the `v0.1.0-rc.2` tag exists will this tagged-source
-command work:
+When [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records that the
+`v0.1.0-rc.3` tag exists, the tagged-source command is:
 
 ```console
 cargo install --locked --git https://github.com/sol-aeternum/meshquill \
-  --tag v0.1.0-rc.2 meshquill
+  --tag v0.1.0-rc.3 meshquill
 ```
 
 Do not assume the unqualified crates.io `cargo install meshquill` route exists unless status records
@@ -87,19 +88,19 @@ Bluetooth-service checks.
 ## Python wheel
 
 For the currently available source checkout, use the source-build procedure in the
-[Python SDK guide](python-sdk.md#install). After status records a published RC2 GitHub prerelease,
-download the wheel matching your platform and install that file directly:
+[Python SDK guide](python-sdk.md#install). After live status records a published RC3 GitHub
+prerelease, download the wheel matching your platform and install that file directly:
 
 ```console
-python -m pip install ./meshquill_sdk-0.1.0rc2-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc3-*.whl
 python -c "import meshcore_sdk; print(meshcore_sdk.__version__)"
 ```
 
 That wheel uses PyO3's `abi3-py39` interface and supports CPython 3.9+. Only if status separately
-records the `0.1.0rc2` PyPI publication should the exact index install be used:
+records the `0.1.0rc3` PyPI publication should the exact index install be used:
 
 ```console
-python -m pip install --pre "meshquill-sdk==0.1.0rc2"
+python -m pip install --pre "meshquill-sdk==0.1.0rc3"
 ```
 
 See the [Python SDK guide](python-sdk.md) for source builds and a complete smoke test.

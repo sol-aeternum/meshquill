@@ -4,6 +4,7 @@ use std::{io, time::Duration};
 
 use meshquill_core::{
     TransportError,
+    framing::MAX_OUTER_PAYLOAD,
     protocol::MAX_INNER_PAYLOAD,
     transport::{ReconnectableTransport, Transport},
 };
@@ -109,7 +110,7 @@ async fn tcp_decoder_recovers_after_oversized_header_on_a_later_read() {
     let (continue_sender, continue_receiver) = oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept TCP client");
-        let oversized = u16::try_from(MAX_INNER_PAYLOAD + 1).expect("limit fits u16");
+        let oversized = u16::try_from(MAX_OUTER_PAYLOAD + 1).expect("limit fits u16");
         socket
             .write_all(&[0x3e, oversized.to_le_bytes()[0], oversized.to_le_bytes()[1]])
             .await

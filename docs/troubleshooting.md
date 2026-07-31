@@ -25,7 +25,7 @@ connection or protocol diagnostic. These checks validate only the bounded compan
 known packet layout, not physical hardware, radio performance, or every firmware feature.
 
 The project has not yet completed physical BLE or serial testing. A successful demo or loopback
-test is not hardware evidence. Check [current status](../STATUS.md) and the
+test is not hardware evidence. Check [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) and the
 [hardware matrix](hardware-testing.md) before interpreting a failure as a supported-device
 regression.
 
@@ -231,3 +231,9 @@ Message history is plaintext and disabled by default. Disabling it does not remo
 `meshquill history list` to inspect the selected profile history and
 `meshquill --yes history clear` to perform the confirmed deletion. Details are in
 [configuration](configuration.md#opt-in-to-plaintext-message-history).
+
+If history appears missing after changing paths, use the same `--config` and `--data-dir` (or
+environment equivalents) on every invocation and inspect the canonical `path` in
+`meshquill --output json history list`. Explicit config paths receive their own digest namespace.
+The first access reconciles older config-adjacent history only when both path selections identify
+the intended files; do not manually merge JSONL while Meshquill is running.
