@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "meshquill-sdk"
-version = "0.1.0rc3"
+version = "0.1.0rc4"
 description = "Async Python SDK for MeshCore companions, backed by Meshquill's Rust core"
 readme = "README.md"
 requires-python = ">=3.9"

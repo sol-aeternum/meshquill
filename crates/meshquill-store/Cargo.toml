@@ -15,8 +15,8 @@ readme = "../../README.md"
 [dependencies]
 fs4.workspace = true
 keyring = { workspace = true }
-meshquill-hooks = { version = "=0.1.0-rc.3", path = "../meshquill-hooks" }
-meshquill-mqtt = { version = "=0.1.0-rc.3", path = "../meshquill-mqtt" }
+meshquill-hooks = { version = "=0.1.0-rc.4", path = "../meshquill-hooks" }
+meshquill-mqtt = { version = "=0.1.0-rc.4", path = "../meshquill-mqtt" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }

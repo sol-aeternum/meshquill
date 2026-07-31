@@ -3,11 +3,11 @@
 ## Release archives
 
 Consult [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) for authoritative
-`v0.1.0-rc.3` tag, artifact, and public-prerelease availability. A source checkout or packaged copy
+`v0.1.0-rc.4` tag, artifact, and public-prerelease availability. A source checkout or packaged copy
 of this page does not itself prove publication. If the release is not yet public, use the source
 installation below; the asset names and download commands apply once status records publication.
 
-When run for the `v0.1.0-rc.3` tag, the release workflow builds:
+When run for the `v0.1.0-rc.4` tag, the release workflow builds:
 
 | Target | Archive | Build/runtime note |
 | --- | --- | --- |
@@ -25,10 +25,10 @@ After the prerelease is published, download both the archive and its sibling `.s
 verify and install a Unix archive:
 
 ```console
-sha256sum --check meshquill-v0.1.0-rc.3-x86_64-unknown-linux-gnu.tar.gz.sha256
-# macOS: shasum -a 256 -c meshquill-v0.1.0-rc.3-x86_64-apple-darwin.tar.gz.sha256
-tar -xzf meshquill-v0.1.0-rc.3-x86_64-unknown-linux-gnu.tar.gz
-cd meshquill-v0.1.0-rc.3-x86_64-unknown-linux-gnu
+sha256sum --check meshquill-v0.1.0-rc.4-x86_64-unknown-linux-gnu.tar.gz.sha256
+# macOS: shasum -a 256 -c meshquill-v0.1.0-rc.4-x86_64-apple-darwin.tar.gz.sha256
+tar -xzf meshquill-v0.1.0-rc.4-x86_64-unknown-linux-gnu.tar.gz
+cd meshquill-v0.1.0-rc.4-x86_64-unknown-linux-gnu
 ./bin/meshquill --version
 mkdir -p "$HOME/.local/bin"
 install -m 0755 bin/meshquill "$HOME/.local/bin/meshquill"
@@ -61,11 +61,11 @@ cargo install --path crates/meshquill-cli --locked
 ```
 
 When [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records that the
-`v0.1.0-rc.3` tag exists, the tagged-source command is:
+`v0.1.0-rc.4` tag exists, the tagged-source command is:
 
 ```console
 cargo install --locked --git https://github.com/sol-aeternum/meshquill \
-  --tag v0.1.0-rc.3 meshquill
+  --tag v0.1.0-rc.4 meshquill
 ```
 
 Do not assume the unqualified crates.io `cargo install meshquill` route exists unless status records
@@ -88,19 +88,19 @@ Bluetooth-service checks.
 ## Python wheel
 
 For the currently available source checkout, use the source-build procedure in the
-[Python SDK guide](python-sdk.md#install). After live status records a published RC3 GitHub
+[Python SDK guide](python-sdk.md#install). After live status records a published RC4 GitHub
 prerelease, download the wheel matching your platform and install that file directly:
 
 ```console
-python -m pip install ./meshquill_sdk-0.1.0rc3-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc4-*.whl
 python -c "import meshcore_sdk; print(meshcore_sdk.__version__)"
 ```
 
 That wheel uses PyO3's `abi3-py39` interface and supports CPython 3.9+. Only if status separately
-records the `0.1.0rc3` PyPI publication should the exact index install be used:
+records the `0.1.0rc4` PyPI publication should the exact index install be used:
 
 ```console
-python -m pip install --pre "meshquill-sdk==0.1.0rc3"
+python -m pip install --pre "meshquill-sdk==0.1.0rc4"
 ```
 
 See the [Python SDK guide](python-sdk.md) for source builds and a complete smoke test.

@@ -242,7 +242,7 @@ jobs:
           assert meshcore_sdk.__version__ == os.environ["EXPECTED_RUST"]
           assert importlib.metadata.version("meshquill-sdk") == os.environ["EXPECTED_PY"]
           PY
-          python -m pytest crates/meshquill-python/tests
+          python -m pytest crates/meshquill-python/tests/test_sdk.py
           python -m mypy.stubtest meshcore_sdk
           python crates/meshquill-python/examples/quickstart.py
           python crates/meshquill-python/examples/streaming.py

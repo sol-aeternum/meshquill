@@ -5,6 +5,21 @@ This file follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-rc.4] - 2026-07-31
+
+### Fixed
+
+- Scoped each release-wheel smoke test to the installed SDK suite. The prerequisite full CI still
+  builds the native CLI and runs the complete Python and CLI-schema integration suite, so wheel
+  jobs no longer require an unrelated debug CLI binary.
+
+### Release process
+
+- Preserved the immutable RC3 tag after its workflow built and validated all five native archives
+  and all five wheels but failed before draft assembly because wheel jobs invoked a CLI integration
+  test without first building the CLI. No RC3 release, assets, registry package, or public
+  prerelease was created.
+
 ## [0.1.0-rc.3] - 2026-07-31
 
 ### Added

@@ -9,18 +9,18 @@ Python, and the native CLI does not depend on Python.
 
 Python 3.9 or newer is supported through CPython's stable ABI.
 
-The current `0.1.0rc3` source is not claimed to be published on PyPI. Build this checkout using the
+The current `0.1.0rc4` source is not claimed to be published on PyPI. Build this checkout using the
 [development steps](#development) below. After [live project status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md)
-records a published RC3 GitHub prerelease, install its downloaded platform wheel directly:
+records a published RC4 GitHub prerelease, install its downloaded platform wheel directly:
 
 ```console
-python -m pip install ./meshquill_sdk-0.1.0rc3-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc4-*.whl
 ```
 
 Only after status records the separate PyPI publication will this exact index command work:
 
 ```console
-python -m pip install --pre "meshquill-sdk==0.1.0rc3"
+python -m pip install --pre "meshquill-sdk==0.1.0rc4"
 ```
 
 The installed import remains `meshcore_sdk` in code examples below.

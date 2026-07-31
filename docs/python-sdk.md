@@ -7,7 +7,7 @@ legacy Python MeshCore client.
 
 The API supports CPython 3.9 and newer through one stable-ABI wheel per operating-system and CPU
 target. The release workflow stages those wheels in a private draft. Until
-[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published RC3
+[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published RC4
 prerelease, build the source checkout; a successful workflow draft alone is not a public download.
 
 ## Install
@@ -19,7 +19,7 @@ environment:
 python -m venv .venv
 . .venv/bin/activate
 # Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install ./meshquill_sdk-0.1.0rc3-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc4-*.whl
 python -c "import meshcore_sdk; print(meshcore_sdk.__version__)"
 ```
 

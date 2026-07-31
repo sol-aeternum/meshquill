@@ -2,21 +2,27 @@
 
 Last updated: 2026-07-31
 
-## RC3 candidate summary
+## RC4 candidate summary
 
-The current checkout is the `0.1.0-rc.3` release candidate. RC3 adds complete stored-profile
-management and sole-profile selection, platform application-data roots with safe history
-reconciliation, exact incoming-observation correlation, corrected 176-byte BLE/logical-packet
-bounds, balanced hook lifecycles, and strict CLI/hook/MQTT schemas plus MQTT startup feeds and
-persisted environment-secret coverage.
+The current checkout is the `0.1.0-rc.4` release candidate. It carries RC3's product behavior
+unchanged and corrects one release-only orchestration defect: cross-platform installed-wheel jobs
+exercise the SDK test module, while their prerequisite full CI continues to build the native CLI
+and run the complete Python and CLI-schema integration suite.
 
-RC3 is **not tagged or published yet**. The local candidate evidence below was generated fresh from
-the RC3 content; no RC2 count or artifact result is reused as RC3 evidence. Source candidate
-`dcb7c97aab723ec96bfc900aa773ddaff710ea2a` is pushed and passed its exact GitHub CI and
-supply-chain workflows. Recording that evidence in this file creates the final tag candidate; that
-resulting exact commit must pass both workflows before an annotated `v0.1.0-rc.3` tag may trigger
-the artifact matrix. A successful tag workflow creates a private draft prerelease. Making that
-draft public is a separate maintainer decision after all 16 assets are inspected.
+The immutable annotated `v0.1.0-rc.3` tag peels to
+`b72135fc0edf390fe89811587c7c5363fe8d368b`. Its
+[release workflow](https://github.com/sol-aeternum/meshquill/actions/runs/30615078718) passed tag
+validation, the full CI and supply-chain gates, all five native archive jobs, and every wheel build,
+metadata, install, import, version, and SDK check on all five targets. Each wheel job then invoked a
+CLI schema integration test without building the expected debug CLI, so draft assembly was skipped.
+No RC3 GitHub release, release asset, registry package, or public prerelease was created, and the
+tag was not moved or replaced.
+
+RC4 is an unpublished candidate. Its immutable source snapshot intentionally does not assert a
+future tag or publication state: consult this file on `main` for live state. Before tagging, the
+exact candidate commit must pass fresh CI and supply-chain workflows. A successful tag workflow
+creates a private draft prerelease; making that draft public remains a separate maintainer decision
+after all 16 assets are inspected.
 
 No physical MeshCore companion was available, so no BLE, serial, or over-the-air radio result is
 claimed. No crates.io or PyPI credential is available; those independent registry uploads remain
@@ -36,8 +42,9 @@ unpublished and do not block a public GitHub prerelease.
   were not replaced.
 - The pushed annotated `v0.1.0-rc.1` tag points to
   `5c6c1233143ae95337fe8e064d78b42727e7daf8`; its 16-asset release also remains a private draft.
-- No `v0.1.0-rc.3` tag or release exists yet. No `meshquill` crates.io package or
-  `meshquill-sdk` PyPI release is claimed.
+- RC3 has the immutable tag and failed workflow recorded above, but no GitHub release or release
+  assets. No `v0.1.0-rc.4` tag or release exists at candidate preparation time. No `meshquill`
+  crates.io package or `meshquill-sdk` PyPI release is claimed.
 
 ## Verification environment
 
@@ -53,9 +60,33 @@ unpublished and do not block a public GitHub prerelease.
 TCP loopbacks and the deterministic companion are software evidence, not physical-device evidence.
 The physical matrix remains in [hardware testing](docs/hardware-testing.md).
 
-## Fresh local RC3 evidence
+## Fresh local RC4 delta evidence
 
-| Gate | RC3 result |
+RC4 changes only release orchestration and versioned metadata; the broader unchanged product
+behavior remains covered by the historical RC3 evidence below.
+
+| Gate | Fresh RC4 result |
+| --- | --- |
+| Version and metadata | Passed the Rust `0.1.0-rc.4`, Python `0.1.0rc4`, changelog, exact internal dependency, locked workspace, and locked fuzz metadata contracts |
+| Rust formatting/compile/lint | Passed formatting, locked all-target/all-feature checking, warnings-denied Clippy, and warnings-denied all-feature Rustdoc with Rust 1.97.1 |
+| Rust tests/MSRV | Passed 395 ordinary workspace/all-target tests; the five real-broker tests were the only ignored cases and all five TCP loopback tests passed. Locked all-target/all-feature checking passed with Rust 1.88.0 |
+| Installed Python wheel | A fresh local `cp39-abi3` RC4 wheel passed strict metadata and licence inventory, dependency and exact-version checks, Ruff, Mypy, two-module stubtest, generated-API drift, the corrected 28-test release SDK scope, the complete 37-test CI suite, and both examples on CPython 3.14. The same wheel passed import/version/dependency checks and both examples on CPython 3.9 |
+| Dependencies/licences | `cargo audit --no-fetch` and `cargo deny check` passed for root and fuzz lockfiles; a current online Pip Audit reported no known vulnerabilities in the exact Python requirements |
+| Workflows/docs | Actionlint 1.7.12, shell package syntax, and `git diff --check` passed; Lychee 0.24.2 validated all 165 tracked source Markdown links |
+| Native package | The RC4 shell package produced a verified archive and sibling checksum. Safe clean extraction found 130 regular files, no links or unsafe paths, both licences, 26 docs, one example, nine schemas/fixtures, four completions, and 83 man pages. The extracted binary reported RC4 and passed init, device info, contacts, ACKed send, inbox, and bounded JSONL watch |
+| Remote source matrix | Pending the pushed candidate. The exact final tag commit must pass both CI and supply-chain workflows before tagging |
+
+The local archive was built on a rolling Linux host and is local smoke evidence only; it is not a
+substitute for any tagged CI artifact. Tagged CI must build and validate all five native targets,
+enforce the Linux glibc ceiling, build and audit all five wheels, and assemble the exact 16-asset
+private draft.
+
+## Historical local RC3 evidence
+
+RC3's product evidence remains applicable to the unchanged implementation carried by RC4, but it
+is not substituted for RC4's fresh version, workflow, source, and artifact gates.
+
+| Gate | Historical RC3 result |
 | --- | --- |
 | Version and metadata | Passed the Rust `0.1.0-rc.3`, Python `0.1.0rc3`, changelog, locked workspace metadata, locked fuzz metadata, shell syntax, and `git diff --check` contracts |
 | Rust formatting/compile/lint | Passed `cargo fmt`; locked workspace checking and warnings-denied Clippy across all targets and features |
@@ -67,7 +98,7 @@ The physical matrix remains in [hardware testing](docs/hardware-testing.md).
 | Fuzzing | All four sanitizer targets completed fresh 20-second unsandboxed gates without a crash: `protocol_packet`, `outer_frames`, `remote_payloads`, and `mqtt_commands` |
 | Dependencies/licences | `cargo audit --no-fetch` and `cargo deny check` passed for root and fuzz lockfiles; Pip Audit reported no known vulnerabilities for the exact Python requirements |
 | Workflows/docs | Actionlint 1.7.12 passed; the shell package script passed `bash -n`; Lychee 0.24.2 validated 162 source Markdown links. PowerShell packaging remains delegated to tagged Windows CI because `pwsh` is unavailable locally |
-| Remote source matrix | Passed for pushed source candidate `dcb7c97aab723ec96bfc900aa773ddaff710ea2a`: [CI run 30613191343](https://github.com/sol-aeternum/meshquill/actions/runs/30613191343) and [supply-chain run 30613191030](https://github.com/sol-aeternum/meshquill/actions/runs/30613191030) both completed successfully. This evidence-only status commit still requires its own exact-SHA rerun before tagging |
+| Remote source matrix | Passed for final tagged commit `b72135fc0edf390fe89811587c7c5363fe8d368b`: [CI run 30613920036](https://github.com/sol-aeternum/meshquill/actions/runs/30613920036) and [supply-chain run 30613919813](https://github.com/sol-aeternum/meshquill/actions/runs/30613919813) both completed successfully |
 | Source install/interactive use | A locked offline `cargo install` reported RC3. Real PTYs exercised both guided profile/transport prompts and destination-prompted line chat; chat displayed the queued message, sent one reply, observed its ACK, and exited via `/quit` |
 | Public hook example | An isolated copy of `examples/hooks/basic.py` validated and dispatched `on_message`, producing exactly one `meshquill.hook/v1` metadata record beside the copied script |
 | Native package | The RC3 shell package produced one archive and sibling checksum. Safe clean extraction found 130 regular files, no symlinks, both licences, 26 docs, one example, nine schemas/fixtures, four completions, and 83 man pages; the extracted binary passed version, init, info, contacts, ACKed send, inbox, and bounded JSONL watch |
@@ -77,13 +108,13 @@ referenced glibc symbol is 2.39, so it is deliberately not a distributable relea
 CI must still build all five native targets, enforce Linux glibc 2.35 or older, build and audit five
 platform wheels, and assemble the exact 16-asset private draft.
 
-## Fresh local RC3 acceptance scenarios
+## Historical local RC3 acceptance scenarios
 
 Commands used isolated configuration/data directories and either the locked source-installed RC3
 binary, the clean extracted RC3 archive, the installed RC3 wheel, or exact named tests. Hardware-only
 evidence is called out rather than simulated.
 
-| # | Scenario | Fresh RC3 result and reproducible evidence |
+| # | Scenario | Historical RC3 result and reproducible evidence |
 | ---: | --- | --- |
 | 1 | Clean native installation | Passed locked, offline `cargo install --path crates/meshquill-cli --root TEMP`; the installed binary reports `0.1.0-rc.3` |
 | 2 | First-run wizard/profile | Passed through a real PTY: `Profile name` = `wizard`, `Transport` = `demo`; the private atomic config selected the new profile by default |
@@ -164,7 +195,7 @@ diagnostic while connecting, waiting for an ACK, waiting for line input, and wat
 bounded user-visible cancellation and no automatic replay; they do not claim physical transport
 disconnect instrumentation.
 
-## Known limitations and remaining RC3 release gates
+## Known limitations and remaining RC4 release gates
 
 - The companion protocol supplies no globally unique, durable message ID. Meshquill preserves every
   separately decoded occurrence and coalesces only return/event clones carrying the same ephemeral
@@ -176,8 +207,8 @@ disconnect instrumentation.
   are disabled by default and broker ACLs remain a security boundary.
 - Release archives and wheels use SHA-256 integrity checks but are unsigned; macOS and Windows
   binaries are not code-signed.
-- RC3 still requires: committing and pushing this evidence-only status update, successful CI and
-  supply-chain runs for that resulting exact SHA, an immutable annotated tag, successful
+- RC4 still requires: successful CI and supply-chain runs for the exact final source SHA, an
+  immutable annotated tag, successful
   five-target artifact jobs, inspection of all 16 private-draft assets and packaged documentation,
   explicit approval before public GitHub prerelease publication, and a fresh public
   checksum/download smoke. Physical hardware and registry publication remain separately recorded
@@ -193,4 +224,4 @@ on 2026-07-30. Its local evidence used Rust 1.97.1/MSRV 1.88, CPython 3.9.25 and
 `scripts/package-release.sh x86_64-unknown-linux-gnu v0.1.0-rc.1 dist`. The final tagged RC1 commit is
 `5c6c1233143ae95337fe8e064d78b42727e7daf8`; its five native archives and five wheels were assembled
 successfully but remain only in the private draft described above. RC1 is historical evidence, not
-the availability or quality claim for the current RC3 source.
+the availability or quality claim for the current RC4 source.

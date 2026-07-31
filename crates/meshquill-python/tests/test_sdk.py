@@ -27,7 +27,7 @@ from meshcore_sdk import (
 
 def test_installed_distribution_imports_without_legacy_meshcore_dependency() -> None:
     distribution = importlib.metadata.distribution("meshquill-sdk")
-    assert meshcore_sdk.__version__ == "0.1.0-rc.3"
+    assert meshcore_sdk.__version__ == "0.1.0-rc.4"
     requirements = distribution.requires or []
     assert not any(requirement.lower().startswith("meshcore") for requirement in requirements)
 

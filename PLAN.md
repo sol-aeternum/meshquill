@@ -79,11 +79,20 @@ fresh candidate-specific gates below; prior-candidate results are not carried fo
 - [x] Complete the fresh RC3 local gates, clean-room/PTY/artifact review, and all 20 acceptance
       scenarios, explicitly recording the unavailable physical-radio portion rather than claiming
       deterministic coverage as hardware evidence.
-- [ ] Push the exact RC3 candidate through CI and supply-chain gates, create immutable annotated
-      `v0.1.0-rc.3`, and inspect all five archives, five wheels, checksums, and packaged docs.
+- [x] Push the exact RC3 candidate through CI and supply-chain gates and create immutable annotated
+      `v0.1.0-rc.3`. Preserve that tag after its workflow built and validated all target artifacts
+      but failed before draft assembly because wheel jobs invoked a CLI test without building the
+      CLI; no RC3 release or release assets were created.
+- [x] Audit and close the six outstanding dependency/tooling pull requests without merging changes
+      that were incompatible, incomplete, unexercised, or behavior-regressing for this candidate.
+- [x] Prepare RC4 with the release-wheel test scope corrected while retaining full CLI/schema
+      coverage in the prerequisite CI workflow.
+- [ ] Complete exact-source RC4 CI/supply-chain gates, create immutable annotated `v0.1.0-rc.4`,
+      and inspect all five archives, five wheels, checksums, and packaged docs. Fresh local RC4
+      delta validation is complete.
 - [ ] Run the separate physical-hardware suite and add actual device/firmware/transport rows.
 - [ ] Publish registry packages in dependency order when credentials exist, and request explicit
-      maintainer approval before changing the tested RC3 GitHub draft to a public prerelease.
+      maintainer approval before changing the tested RC4 GitHub draft to a public prerelease.
 
 ## Current blockers
 
@@ -93,6 +102,6 @@ fresh candidate-specific gates below; prior-candidate results are not carried fo
    repository. This blocks only those two registry uploads; it does not block the tagged artifacts
    or public GitHub prerelease.
 
-The GitHub repository and superseded RC1/RC2 drafts exist, authentication is active, and RC3 is
-being gated. Artifact and publication work proceeds in the exact order kept in
-[the release runbook](docs/release.md).
+The GitHub repository and superseded RC1/RC2 drafts exist, RC3's immutable failed tag is preserved,
+authentication is active, and RC4 is being gated. Artifact and publication work proceeds in the
+exact order kept in [the release runbook](docs/release.md).

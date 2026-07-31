@@ -1,9 +1,9 @@
 # Automation contract
 
 Meshquill separates finite command results from live event streams. This page documents the
-`meshquill.cli/v1` contract implemented by the current `0.1.0-rc.3` source checkout. Until
-[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published RC3
-prerelease, this is a source contract rather than a claim that released RC3 artifacts are available.
+`meshquill.cli/v1` contract implemented by the current `0.1.0-rc.4` source checkout. Until
+[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published RC4
+prerelease, this is a source contract rather than a claim that released RC4 artifacts are available.
 
 ## Output modes
 

@@ -23,12 +23,12 @@ clap_complete.workspace = true
 clap_mangen.workspace = true
 humantime.workspace = true
 hex.workspace = true
-meshquill-core = { version = "=0.1.0-rc.3", path = "../meshquill-core" }
-meshquill-hooks = { version = "=0.1.0-rc.3", path = "../meshquill-hooks" }
-meshquill-mqtt = { version = "=0.1.0-rc.3", path = "../meshquill-mqtt" }
-meshquill-store = { version = "=0.1.0-rc.3", path = "../meshquill-store" }
-meshquill-test-support = { version = "=0.1.0-rc.3", path = "../meshquill-test-support" }
-meshquill-transport = { version = "=0.1.0-rc.3", path = "../meshquill-transport" }
+meshquill-core = { version = "=0.1.0-rc.4", path = "../meshquill-core" }
+meshquill-hooks = { version = "=0.1.0-rc.4", path = "../meshquill-hooks" }
+meshquill-mqtt = { version = "=0.1.0-rc.4", path = "../meshquill-mqtt" }
+meshquill-store = { version = "=0.1.0-rc.4", path = "../meshquill-store" }
+meshquill-test-support = { version = "=0.1.0-rc.4", path = "../meshquill-test-support" }
+meshquill-transport = { version = "=0.1.0-rc.4", path = "../meshquill-transport" }
 rpassword.workspace = true
 secrecy.workspace = true
 serde.workspace = true

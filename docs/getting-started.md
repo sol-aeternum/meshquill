@@ -1,8 +1,8 @@
 # Getting started
 
-Meshquill `0.1.0-rc.3` is a pre-release command-line client in the current source checkout. Until
+Meshquill `0.1.0-rc.4` is a pre-release command-line client in the current source checkout. Until
 [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published
-`v0.1.0-rc.3` prerelease, its GitHub tag,
+`v0.1.0-rc.4` prerelease, its GitHub tag,
 checksummed assets and tagged-install commands are future delivery paths, and no crates.io or PyPI
 package is assumed available. Build the current checkout below; [installation](installation.md)
 also documents the conditional release-asset flow. Physical BLE and serial verification has not

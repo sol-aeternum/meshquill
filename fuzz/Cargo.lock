@@ -407,7 +407,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meshquill-core"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-mqtt"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 dependencies = [
  "battalion-rumqttc",
  "meshquill-core",

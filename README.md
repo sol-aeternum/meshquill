@@ -5,7 +5,7 @@ companion devices. It provides BLE, USB serial and TCP transports, clear interac
 interfaces, trusted local Python hooks, and an optional application-level MQTT gateway. The native
 CLI does not require Python.
 
-This source tree identifies as `0.1.0-rc.3`. Tag, artifact, and public-prerelease availability are
+This source tree identifies as `0.1.0-rc.4`. Tag, artifact, and public-prerelease availability are
 reported only by [live status and evidence](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md);
 a source checkout or packaged documentation snapshot does not itself prove publication. Its
 protocol model is based on MeshCore companion firmware v1.16.0, `meshcore_py`
@@ -23,14 +23,14 @@ cargo install --path crates/meshquill-cli --locked
 ```
 
 When [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published
-`v0.1.0-rc.3` prerelease, its archives contain
+`v0.1.0-rc.4` prerelease, its archives contain
 the binary, four shell completions, man pages and licences. Each checksum is a separate sibling
 `.sha256` release asset; `SHA256SUMS` is another release asset covering the native archives and
 Python wheels. The corresponding tagged-source installation is:
 
 ```console
 cargo install --locked --git https://github.com/sol-aeternum/meshquill \
-  --tag v0.1.0-rc.3 meshquill
+  --tag v0.1.0-rc.4 meshquill
 ```
 
 Linux source builds need a C compiler, `pkg-config`, D-Bus development headers and libudev

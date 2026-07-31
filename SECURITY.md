@@ -14,7 +14,7 @@ agreed with the reporter after affected supported versions and mitigations are k
 
 ## Supported versions
 
-`0.1.0-rc.3` is the current release-candidate line. Published availability is recorded in the
+`0.1.0-rc.4` is the current release-candidate line. Published availability is recorded in the
 [live repository status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md). Until that
 status records a public RC, source receives best-effort fixes.
 After publication, the newest RC is supported for security fixes; older pre-release lines are

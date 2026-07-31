@@ -1,4 +1,4 @@
-# `v0.1.0-rc.3` release runbook
+# `v0.1.0-rc.4` release runbook
 
 This runbook is tied to the current [workspace manifest](../Cargo.toml),
 [Python package metadata](../crates/meshquill-python/pyproject.toml), [CI workflow](../.github/workflows/ci.yml),
@@ -8,15 +8,15 @@ a Bash shell unless a command says otherwise.
 
 The release has two version spellings:
 
-- Rust crates and the Git tag use `0.1.0-rc.3` and `v0.1.0-rc.3`.
-- The PyPI distribution uses the PEP 440 version `0.1.0rc3`; its distribution name is
+- Rust crates and the Git tag use `0.1.0-rc.4` and `v0.1.0-rc.4`.
+- The PyPI distribution uses the PEP 440 version `0.1.0rc4`; its distribution name is
   `meshquill-sdk` and its import name is `meshcore_sdk`.
 
 The tag workflow builds and tests artifacts and creates a **draft prerelease** on GitHub. It does not
 publish to crates.io or PyPI, and it has no PyPI trusted-publisher job. Registry publication is a
 separate, manual maintainer action.
 
-This runbook describes the complete RC3 procedure, not current availability. Consult
+This runbook describes the complete RC4 procedure, not current availability. Consult
 [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) for the authoritative
 state of the tag, draft, assets, registries, and public prerelease. A source checkout or packaged
 copy of this runbook does not prove that any step has completed. A successful workflow draft is
@@ -49,7 +49,7 @@ Set the release constants and require the release commit to be the clean, pushed
 
 ```bash
 set -euo pipefail
-export MESHQUILL_VERSION=0.1.0-rc.3
+export MESHQUILL_VERSION=0.1.0-rc.4
 export MESHQUILL_TAG="v${MESHQUILL_VERSION}"
 export MESHQUILL_SHA="$(git rev-parse HEAD)"
 
@@ -63,7 +63,7 @@ Verify the exact version contract enforced by the tag workflow:
 
 ```bash
 test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "$MESHQUILL_VERSION"
-test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/meshquill-python/pyproject.toml | head -1)" = 0.1.0rc3
+test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/meshquill-python/pyproject.toml | head -1)" = 0.1.0rc4
 grep -Fqx "## [${MESHQUILL_VERSION}] - 2026-07-31" CHANGELOG.md
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 cargo metadata --locked --manifest-path fuzz/Cargo.toml --no-deps --format-version 1 >/dev/null
@@ -160,18 +160,18 @@ export MESHQUILL_ARTIFACT_DIR="$(mktemp -d)"
 gh release download "$MESHQUILL_TAG" --dir "$MESHQUILL_ARTIFACT_DIR"
 
 native_archives=(
-  meshquill-v0.1.0-rc.3-aarch64-apple-darwin.tar.gz
-  meshquill-v0.1.0-rc.3-aarch64-unknown-linux-gnu.tar.gz
-  meshquill-v0.1.0-rc.3-x86_64-apple-darwin.tar.gz
-  meshquill-v0.1.0-rc.3-x86_64-pc-windows-msvc.zip
-  meshquill-v0.1.0-rc.3-x86_64-unknown-linux-gnu.tar.gz
+  meshquill-v0.1.0-rc.4-aarch64-apple-darwin.tar.gz
+  meshquill-v0.1.0-rc.4-aarch64-unknown-linux-gnu.tar.gz
+  meshquill-v0.1.0-rc.4-x86_64-apple-darwin.tar.gz
+  meshquill-v0.1.0-rc.4-x86_64-pc-windows-msvc.zip
+  meshquill-v0.1.0-rc.4-x86_64-unknown-linux-gnu.tar.gz
 )
 wheel_assets=(
-  meshquill_sdk-0.1.0rc3-cp39-abi3-macosx_10_12_x86_64.whl
-  meshquill_sdk-0.1.0rc3-cp39-abi3-macosx_11_0_arm64.whl
-  meshquill_sdk-0.1.0rc3-cp39-abi3-manylinux_2_28_aarch64.whl
-  meshquill_sdk-0.1.0rc3-cp39-abi3-manylinux_2_28_x86_64.whl
-  meshquill_sdk-0.1.0rc3-cp39-abi3-win_amd64.whl
+  meshquill_sdk-0.1.0rc4-cp39-abi3-macosx_10_12_x86_64.whl
+  meshquill_sdk-0.1.0rc4-cp39-abi3-macosx_11_0_arm64.whl
+  meshquill_sdk-0.1.0rc4-cp39-abi3-manylinux_2_28_aarch64.whl
+  meshquill_sdk-0.1.0rc4-cp39-abi3-manylinux_2_28_x86_64.whl
+  meshquill_sdk-0.1.0rc4-cp39-abi3-win_amd64.whl
 )
 expected_assets=(SHA256SUMS "${native_archives[@]}" "${wheel_assets[@]}")
 for archive in "${native_archives[@]}"; do
@@ -218,7 +218,7 @@ version and workflow run.
 
 The workspace contains seven crates intended for crates.io and one Rust package that is not:
 `meshquill-python` has `publish = false` because it is delivered as the Python wheel. Internal Rust
-dependencies use the exact requirement `=0.1.0-rc.3`, so publish in this order and wait for each
+dependencies use the exact requirement `=0.1.0-rc.4`, so publish in this order and wait for each
 crate to appear in the crates.io index before publishing a dependent crate.
 
 For every crate, the dry run and real publication must use the tagged, clean checkout. Do not use
@@ -272,7 +272,7 @@ and run the deterministic smoke flow:
 
 ```bash
 export MESHQUILL_CARGO_SMOKE="$(mktemp -d)"
-cargo install --locked --version 0.1.0-rc.3 \
+cargo install --locked --version 0.1.0-rc.4 \
   --root "$MESHQUILL_CARGO_SMOKE/install" meshquill
 export MESHQUILL_CARGO_SMOKE_CONFIG="$MESHQUILL_CARGO_SMOKE/config.toml"
 "$MESHQUILL_CARGO_SMOKE/install/bin/meshquill" \
@@ -295,9 +295,9 @@ wheel set:
 python -m pip install "maturin==1.11.5"
 test -n "${MATURIN_PYPI_TOKEN:-}"
 test "$(find "$MESHQUILL_ARTIFACT_DIR" -maxdepth 1 -type f \
-  -name 'meshquill_sdk-0.1.0rc3-*.whl' | wc -l)" -eq 5
+  -name 'meshquill_sdk-0.1.0rc4-*.whl' | wc -l)" -eq 5
 maturin upload --non-interactive \
-  "$MESHQUILL_ARTIFACT_DIR"/meshquill_sdk-0.1.0rc3-*.whl
+  "$MESHQUILL_ARTIFACT_DIR"/meshquill_sdk-0.1.0rc4-*.whl
 unset MATURIN_PYPI_TOKEN
 ```
 
@@ -313,13 +313,13 @@ spellings:
 export MESHQUILL_PYPI_SMOKE="$(mktemp -d)"
 python -m venv "$MESHQUILL_PYPI_SMOKE/venv"
 "$MESHQUILL_PYPI_SMOKE/venv/bin/python" -m pip install \
-  --pre "meshquill-sdk==0.1.0rc3"
+  --pre "meshquill-sdk==0.1.0rc4"
 "$MESHQUILL_PYPI_SMOKE/venv/bin/python" - <<'PY'
 import importlib.metadata
 import meshcore_sdk
 
-assert importlib.metadata.version("meshquill-sdk") == "0.1.0rc3"
-assert meshcore_sdk.__version__ == "0.1.0-rc.3"
+assert importlib.metadata.version("meshquill-sdk") == "0.1.0rc4"
+assert meshcore_sdk.__version__ == "0.1.0-rc.4"
 PY
 ```
 
@@ -358,25 +358,25 @@ fresh download of the published GitHub archive against its sibling checksum.
 - After the tag is pushed, leave the GitHub release in draft until the tag workflow and artifact
   inspection pass. Rerun only demonstrably transient jobs against the same commit. For a code,
   version, metadata, or packaging defect, create a new RC; do not move or overwrite
-  `v0.1.0-rc.3`. Missing registry credentials follow section 7 and do not change the tag or assets.
+  `v0.1.0-rc.4`. Missing registry credentials follow section 7 and do not change the tag or assets.
 - Published crates and PyPI files cannot be replaced in place. Never upload locally rebuilt artifacts
   under the same version.
 - For a crates.io defect, yank the affected public package and every published dependent. For a
   whole-release defect, yank in reverse dependency order:
 
   ```bash
-  cargo yank --registry crates-io --version 0.1.0-rc.3 meshquill
-  cargo yank --registry crates-io --version 0.1.0-rc.3 meshquill-store
-  cargo yank --registry crates-io --version 0.1.0-rc.3 meshquill-test-support
-  cargo yank --registry crates-io --version 0.1.0-rc.3 meshquill-transport
-  cargo yank --registry crates-io --version 0.1.0-rc.3 meshquill-mqtt
-  cargo yank --registry crates-io --version 0.1.0-rc.3 meshquill-hooks
-  cargo yank --registry crates-io --version 0.1.0-rc.3 meshquill-core
+  cargo yank --registry crates-io --version 0.1.0-rc.4 meshquill
+  cargo yank --registry crates-io --version 0.1.0-rc.4 meshquill-store
+  cargo yank --registry crates-io --version 0.1.0-rc.4 meshquill-test-support
+  cargo yank --registry crates-io --version 0.1.0-rc.4 meshquill-transport
+  cargo yank --registry crates-io --version 0.1.0-rc.4 meshquill-mqtt
+  cargo yank --registry crates-io --version 0.1.0-rc.4 meshquill-hooks
+  cargo yank --registry crates-io --version 0.1.0-rc.4 meshquill-core
   ```
 
   Yanking blocks new dependency resolution but does not erase downloads or existing lockfile use, so
   publish an advisory and a corrected RC.
-- For a PyPI defect, use the PyPI project release page to yank `0.1.0rc3`; do not delete and recreate
+- For a PyPI defect, use the PyPI project release page to yank `0.1.0rc4`; do not delete and recreate
   files. A yank does not remove already downloaded wheels.
 - If the GitHub release is still a draft, keep it unpublished. If it is already public, preserve the
   tag and assets, add a prominent advisory to the notes, and publish a corrected RC. Do not silently
