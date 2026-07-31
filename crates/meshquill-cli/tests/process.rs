@@ -1405,7 +1405,7 @@ fn explicit_default_config_uses_and_clears_the_implicit_history_namespace() {
 
     let sent = invoke_with_envs(&["send", "Alice", "same namespace", "--wait"], &environment);
     assert_eq!(sent.status.code(), Some(0), "{}", text(&sent.stderr));
-    let canonical = app_root.join("history/demo.jsonl");
+    let canonical = app_root.join("history").join("demo.jsonl");
     assert!(canonical.exists());
 
     let listed = invoke_with_envs(
