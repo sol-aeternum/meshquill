@@ -22,11 +22,10 @@ Source installation is always available from a checkout:
 cargo install --path crates/meshquill-cli --locked
 ```
 
-When [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published
-`v0.1.0-rc.4` prerelease, its archives contain
-the binary, four shell completions, man pages and licences. Each checksum is a separate sibling
-`.sha256` release asset; `SHA256SUMS` is another release asset covering the native archives and
-Python wheels. The corresponding tagged-source installation is:
+The published [`v0.1.0-rc.4` prerelease](https://github.com/sol-aeternum/meshquill/releases/tag/v0.1.0-rc.4)
+contains the binary, four shell completions, man pages and licences. Each checksum is a separate
+sibling `.sha256` release asset; `SHA256SUMS` is another release asset covering the native archives
+and Python wheels. The corresponding tagged-source installation is:
 
 ```console
 cargo install --locked --git https://github.com/sol-aeternum/meshquill \

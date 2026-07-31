@@ -87,12 +87,13 @@ fresh candidate-specific gates below; prior-candidate results are not carried fo
       that were incompatible, incomplete, unexercised, or behavior-regressing for this candidate.
 - [x] Prepare RC4 with the release-wheel test scope corrected while retaining full CLI/schema
       coverage in the prerequisite CI workflow.
-- [ ] Complete exact-source RC4 CI/supply-chain gates, create immutable annotated `v0.1.0-rc.4`,
+- [x] Complete exact-source RC4 CI/supply-chain gates, create immutable annotated `v0.1.0-rc.4`,
       and inspect all five archives, five wheels, checksums, and packaged docs. Fresh local RC4
       delta validation is complete.
+- [x] Obtain separate explicit maintainer approval, publish the inspected RC4 draft as a public
+      prerelease without marking it latest stable, and pass an anonymous checksum/download smoke.
 - [ ] Run the separate physical-hardware suite and add actual device/firmware/transport rows.
-- [ ] Publish registry packages in dependency order when credentials exist, and request explicit
-      maintainer approval before changing the tested RC4 GitHub draft to a public prerelease.
+- [ ] Publish registry packages in dependency order when credentials exist.
 
 ## Current blockers
 
@@ -102,6 +103,6 @@ fresh candidate-specific gates below; prior-candidate results are not carried fo
    repository. This blocks only those two registry uploads; it does not block the tagged artifacts
    or public GitHub prerelease.
 
-The GitHub repository and superseded RC1/RC2 drafts exist, RC3's immutable failed tag is preserved,
-authentication is active, and RC4 is being gated. Artifact and publication work proceeds in the
-exact order kept in [the release runbook](docs/release.md).
+The public GitHub repository and RC4 prerelease exist, the superseded RC1/RC2 drafts remain private,
+and RC3's immutable failed tag is preserved. Only the unavailable physical-hardware matrix and
+credential-blocked registry publications remain open; neither is claimed as completed.

@@ -6,14 +6,12 @@ the same implementation used by the native CLI; the package has no runtime depen
 legacy Python MeshCore client.
 
 The API supports CPython 3.9 and newer through one stable-ABI wheel per operating-system and CPU
-target. The release workflow stages those wheels in a private draft. Until
-[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records a published RC4
-prerelease, build the source checkout; a successful workflow draft alone is not a public download.
+target. All five wheels are available from the published
+[`v0.1.0-rc.4` prerelease](https://github.com/sol-aeternum/meshquill/releases/tag/v0.1.0-rc.4).
 
 ## Install
 
-After current status records a published prerelease, install a downloaded wheel in an isolated
-environment:
+Install the downloaded wheel in an isolated environment:
 
 ```console
 python -m venv .venv

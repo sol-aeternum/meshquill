@@ -2,10 +2,10 @@
 
 ## Release archives
 
-Consult [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) for authoritative
-`v0.1.0-rc.4` tag, artifact, and public-prerelease availability. A source checkout or packaged copy
-of this page does not itself prove publication. If the release is not yet public, use the source
-installation below; the asset names and download commands apply once status records publication.
+The [`v0.1.0-rc.4` GitHub prerelease](https://github.com/sol-aeternum/meshquill/releases/tag/v0.1.0-rc.4)
+is public with native archives, sibling checksums, `SHA256SUMS`, and Python wheels. Consult
+[live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) for the exact release and
+verification evidence; a packaged copy of this page alone is not availability evidence.
 
 When run for the `v0.1.0-rc.4` tag, the release workflow builds:
 
@@ -21,8 +21,7 @@ The macOS and Windows artifacts are not code-signed in this RC. Their older-OS m
 been independently hardware-tested. Each archive has a sibling `.sha256`; the release also contains
 `SHA256SUMS` covering native archives and Python wheels.
 
-After the prerelease is published, download both the archive and its sibling `.sha256` asset, then
-verify and install a Unix archive:
+Download both the archive and its sibling `.sha256` asset, then verify and install a Unix archive:
 
 ```console
 sha256sum --check meshquill-v0.1.0-rc.4-x86_64-unknown-linux-gnu.tar.gz.sha256
@@ -60,8 +59,7 @@ Rust 1.88 or newer is supported. Install the current source checkout with:
 cargo install --path crates/meshquill-cli --locked
 ```
 
-When [live status](https://github.com/sol-aeternum/meshquill/blob/main/STATUS.md) records that the
-`v0.1.0-rc.4` tag exists, the tagged-source command is:
+The published `v0.1.0-rc.4` tag supports this tagged-source command:
 
 ```console
 cargo install --locked --git https://github.com/sol-aeternum/meshquill \
@@ -87,9 +85,8 @@ Bluetooth-service checks.
 
 ## Python wheel
 
-For the currently available source checkout, use the source-build procedure in the
-[Python SDK guide](python-sdk.md#install). After live status records a published RC4 GitHub
-prerelease, download the wheel matching your platform and install that file directly:
+Download the wheel matching your platform from the RC4 GitHub prerelease and install that file
+directly. The [Python SDK guide](python-sdk.md#install) also documents source builds:
 
 ```console
 python -m pip install ./meshquill_sdk-0.1.0rc4-*.whl

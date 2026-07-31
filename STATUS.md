@@ -2,12 +2,34 @@
 
 Last updated: 2026-07-31
 
-## RC4 candidate summary
+## RC4 public prerelease summary
 
-The current checkout is the `0.1.0-rc.4` release candidate. It carries RC3's product behavior
-unchanged and corrects one release-only orchestration defect: cross-platform installed-wheel jobs
-exercise the SDK test module, while their prerequisite full CI continues to build the native CLI
-and run the complete Python and CLI-schema integration suite.
+Meshquill `0.1.0-rc.4` is a public GitHub prerelease. The immutable annotated
+`v0.1.0-rc.4` tag peels to `a21de0bce20539ce4b1bd58e097adbbd7bf4b7cb`. That exact commit
+passed [CI run 30621246007](https://github.com/sol-aeternum/meshquill/actions/runs/30621246007)
+and [supply-chain run 30621246029](https://github.com/sol-aeternum/meshquill/actions/runs/30621246029)
+before tagging.
+
+The [tagged release workflow](https://github.com/sol-aeternum/meshquill/actions/runs/30621805240)
+completed successfully with all 24 jobs green. Its first attempt passed 12 of 13 prerequisite gates
+but one Windows process test exceeded a fixed three-second harness deadline after emitting every
+expected reconnect, incoming-message, sent, and acknowledgement event. The identical commit had
+passed the same Windows test minutes earlier, the failing runner used an older image and took twice
+as long for the process suite, and the repository runbook permits one demonstrably transient
+failed-job rerun. That single rerun passed the complete Windows suite; no second retry was used.
+
+The [public `v0.1.0-rc.4` prerelease](https://github.com/sol-aeternum/meshquill/releases/tag/v0.1.0-rc.4)
+was published at `2026-07-31T10:30:58Z` with `isPrerelease: true` and is not the latest stable
+release. Its exact 16 assets comprise four `.tar.gz` archives, one `.zip`, five sibling `.sha256`
+files, five CPython `abi3` wheels, and `SHA256SUMS`. Private inspection verified every GitHub digest,
+aggregate and sibling checksum, safe archive path, native architecture, inventory, wheel tag,
+metadata, licence, and target-runner smoke result. A subsequent anonymous public download of the
+Linux x86-64 archive and checksum matched the inspected digest and passed version, isolated init,
+device-info, and acknowledged-send smoke tests.
+
+RC4 carries RC3's product behavior unchanged and corrects one release-only orchestration defect:
+cross-platform installed-wheel jobs exercise the SDK test module, while their prerequisite full CI
+continues to build the native CLI and run the complete Python and CLI-schema integration suite.
 
 The immutable annotated `v0.1.0-rc.3` tag peels to
 `b72135fc0edf390fe89811587c7c5363fe8d368b`. Its
@@ -18,19 +40,19 @@ CLI schema integration test without building the expected debug CLI, so draft as
 No RC3 GitHub release, release asset, registry package, or public prerelease was created, and the
 tag was not moved or replaced.
 
-RC4 is an unpublished candidate. Its immutable source snapshot intentionally does not assert a
-future tag or publication state: consult this file on `main` for live state. Before tagging, the
-exact candidate commit must pass fresh CI and supply-chain workflows. A successful tag workflow
-creates a private draft prerelease; making that draft public remains a separate maintainer decision
-after all 16 assets are inspected.
-
 No physical MeshCore companion was available, so no BLE, serial, or over-the-air radio result is
 claimed. No crates.io or PyPI credential is available; those independent registry uploads remain
-unpublished and do not block a public GitHub prerelease.
+unpublished. GitHub artifacts and tagged-source installation are the public delivery paths for RC4.
 
 ## Publication baseline
 
 - Public source repository: <https://github.com/sol-aeternum/meshquill>.
+- Public prerelease: <https://github.com/sol-aeternum/meshquill/releases/tag/v0.1.0-rc.4>.
+- The pushed annotated `v0.1.0-rc.4` tag peels to
+  `a21de0bce20539ce4b1bd58e097adbbd7bf4b7cb`; its successful
+  [release workflow](https://github.com/sol-aeternum/meshquill/actions/runs/30621805240) built,
+  target-smoked, and assembled all 16 inspected assets before explicit maintainer approval made the
+  draft public as a prerelease.
 - The pushed annotated `v0.1.0-rc.2` tag peels to
   `0f33edbec475819ea7737c8fd03808312237f468`. Its successful
   [release workflow](https://github.com/sol-aeternum/meshquill/actions/runs/30594223032) assembled
@@ -43,8 +65,7 @@ unpublished and do not block a public GitHub prerelease.
 - The pushed annotated `v0.1.0-rc.1` tag points to
   `5c6c1233143ae95337fe8e064d78b42727e7daf8`; its 16-asset release also remains a private draft.
 - RC3 has the immutable tag and failed workflow recorded above, but no GitHub release or release
-  assets. No `v0.1.0-rc.4` tag or release exists at candidate preparation time. No `meshquill`
-  crates.io package or `meshquill-sdk` PyPI release is claimed.
+  assets. No `meshquill` crates.io package or `meshquill-sdk` PyPI release is claimed for RC4.
 
 ## Verification environment
 
@@ -60,7 +81,7 @@ unpublished and do not block a public GitHub prerelease.
 TCP loopbacks and the deterministic companion are software evidence, not physical-device evidence.
 The physical matrix remains in [hardware testing](docs/hardware-testing.md).
 
-## Fresh local RC4 delta evidence
+## RC4 verification evidence
 
 RC4 changes only release orchestration and versioned metadata; the broader unchanged product
 behavior remains covered by the historical RC3 evidence below.
@@ -74,12 +95,13 @@ behavior remains covered by the historical RC3 evidence below.
 | Dependencies/licences | `cargo audit --no-fetch` and `cargo deny check` passed for root and fuzz lockfiles; a current online Pip Audit reported no known vulnerabilities in the exact Python requirements |
 | Workflows/docs | Actionlint 1.7.12, shell package syntax, and `git diff --check` passed; Lychee 0.24.2 validated all 165 tracked source Markdown links |
 | Native package | The RC4 shell package produced a verified archive and sibling checksum. Safe clean extraction found 130 regular files, no links or unsafe paths, both licences, 26 docs, one example, nine schemas/fixtures, four completions, and 83 man pages. The extracted binary reported RC4 and passed init, device info, contacts, ACKed send, inbox, and bounded JSONL watch |
-| Remote source matrix | Passed for pushed source candidate `24f8f5745d12e7e05526d33713e60a540d8f6723`: [CI run 30620791102](https://github.com/sol-aeternum/meshquill/actions/runs/30620791102) and [supply-chain run 30620791160](https://github.com/sol-aeternum/meshquill/actions/runs/30620791160) both completed successfully. This evidence-only status commit must receive its own exact-SHA CI and supply-chain success before tagging |
+| Remote source matrix | Passed for final tagged commit `a21de0bce20539ce4b1bd58e097adbbd7bf4b7cb`: [CI run 30621246007](https://github.com/sol-aeternum/meshquill/actions/runs/30621246007) and [supply-chain run 30621246029](https://github.com/sol-aeternum/meshquill/actions/runs/30621246029) both completed successfully |
+| Tagged artifact matrix | [Release run 30621805240](https://github.com/sol-aeternum/meshquill/actions/runs/30621805240) passed all 24 jobs after one runbook-authorized retry of a demonstrably transient Windows harness timeout. Five native archives and five installed wheels passed their Linux x86-64/ARM64, macOS Intel/ARM64, and Windows x86-64 target checks; Linux compatibility, exact versions, licences, examples, and the corrected 28-test SDK wheel scope passed |
+| Release inspection | All 16 private-draft assets matched GitHub's SHA-256 digests and the aggregate/sibling checksum files. Safe extraction found 130 regular files per native archive, no links or unsafe paths, correct native architectures, two licences, 26 docs, nine schemas/fixtures, four completions, 83 man pages, and one example. All wheel metadata/tags/licences passed strict Twine checks; the downloaded Linux wheel passed fresh CPython 3.9 and 3.14 installs and examples |
+| Public release smoke | The prerelease is anonymously visible with 16 assets. A fresh unauthenticated download of the Linux x86-64 archive and sibling checksum matched digest `99c5fea37b8ad3066cb865d5fa17f5f7e28a295722be0f74f86ec33821bd18bc`; its extracted binary reported RC4 and passed isolated init, device info, and acknowledged send |
 
-The local archive was built on a rolling Linux host and is local smoke evidence only; it is not a
-substitute for any tagged CI artifact. Tagged CI must build and validate all five native targets,
-enforce the Linux glibc ceiling, build and audit all five wheels, and assemble the exact 16-asset
-private draft.
+The local archive built on a rolling Linux host remains local smoke evidence only. The public
+delivery consists exclusively of the tagged CI artifacts inspected and recorded above.
 
 ## Historical local RC3 evidence
 
@@ -195,7 +217,7 @@ diagnostic while connecting, waiting for an ACK, waiting for line input, and wat
 bounded user-visible cancellation and no automatic replay; they do not claim physical transport
 disconnect instrumentation.
 
-## Known limitations and remaining RC4 release gates
+## Known limitations
 
 - The companion protocol supplies no globally unique, durable message ID. Meshquill preserves every
   separately decoded occurrence and coalesces only return/event clones carrying the same ephemeral
@@ -207,12 +229,9 @@ disconnect instrumentation.
   are disabled by default and broker ACLs remain a security boundary.
 - Release archives and wheels use SHA-256 integrity checks but are unsigned; macOS and Windows
   binaries are not code-signed.
-- RC4 still requires: successful CI and supply-chain runs for the exact final source SHA, an
-  immutable annotated tag, successful
-  five-target artifact jobs, inspection of all 16 private-draft assets and packaged documentation,
-  explicit approval before public GitHub prerelease publication, and a fresh public
-  checksum/download smoke. Physical hardware and registry publication remain separately recorded
-  limitations.
+- RC4's GitHub release gates, explicit publication approval, and anonymous public-download smoke are
+  complete. Physical hardware verification and crates.io/PyPI publication remain unavailable and
+  are not claimed.
 
 ## Historical RC1 evidence
 
