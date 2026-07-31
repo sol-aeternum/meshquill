@@ -39,7 +39,7 @@ bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive", "env", "string", "wrap_help"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 directories = "6"
 futures = "0.3"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
