@@ -1369,15 +1369,20 @@ fn opt_in_history_tracks_delivery_receive_and_confirmed_clear() {
 #[test]
 fn explicit_default_config_uses_and_clears_the_implicit_history_namespace() {
     let directory = TempDir::new().expect("temporary directory");
-    let config_root = directory.path().join("config-root");
-    let data_root = directory.path().join("data-root");
-    let config_root_text = config_root.display().to_string();
-    let data_root_text = data_root.display().to_string();
+    let home = directory.path().join("home");
+    let platform_root = home.join("Library").join("Application Support");
+    let home_text = home.display().to_string();
+    let platform_root_text = platform_root.display().to_string();
     let environment = [
-        ("XDG_CONFIG_HOME", config_root_text.as_str()),
-        ("XDG_DATA_HOME", data_root_text.as_str()),
+        ("HOME", home_text.as_str()),
+        ("USERPROFILE", home_text.as_str()),
+        ("XDG_CONFIG_HOME", platform_root_text.as_str()),
+        ("XDG_DATA_HOME", platform_root_text.as_str()),
+        ("APPDATA", platform_root_text.as_str()),
+        ("LOCALAPPDATA", platform_root_text.as_str()),
     ];
-    let default_config = config_root.join("meshquill/config.toml");
+    let app_root = platform_root.join("meshquill");
+    let default_config = app_root.join("config.toml");
 
     let initialized = invoke_with_envs(
         &[
@@ -1400,7 +1405,7 @@ fn explicit_default_config_uses_and_clears_the_implicit_history_namespace() {
 
     let sent = invoke_with_envs(&["send", "Alice", "same namespace", "--wait"], &environment);
     assert_eq!(sent.status.code(), Some(0), "{}", text(&sent.stderr));
-    let canonical = data_root.join("meshquill/history/demo.jsonl");
+    let canonical = app_root.join("history/demo.jsonl");
     assert!(canonical.exists());
 
     let listed = invoke_with_envs(
