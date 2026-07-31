@@ -190,11 +190,14 @@ owns the endpoint. Do not assume a port other than the one in the profile.
   `timeout.request_timeout_ms` (or the profile request override) for slow companion responses.
 - `--timeout` separately bounds operations such as BLE scan phases and direct ACK waits.
 - A finite `send` fails after a connection error and never automatically retries.
-- Line chat makes one reconnect attempt only after a reconnectable outbound-send failure. It retains
-  the draft and requires `/send`; it never silently replays the ambiguous write.
-- `watch` does not run a user-configurable reconnect loop.
+- Line chat and `watch` make at most three reconnect attempts: immediate, then after the configured
+  retry delay and twice that delay, capped by the connect timeout. They reconnect only the session.
+- Chat never auto-resends. After a reconnectable failure before companion acceptance was observed,
+  it retains the exact unconfirmed text and original destination and requires `/send` or `/discard`.
+  `/send` starts a new explicit send and can duplicate delivery if the original write succeeded but
+  its response was lost; `/discard` avoids that risk.
 
-See [messaging and chat](messaging-and-chat.md#one-shot-reconnect-without-automatic-resend).
+See [messaging and chat](messaging-and-chat.md#bounded-reconnect-without-automatic-resend).
 
 ## Protocol or firmware errors
 

@@ -1,7 +1,9 @@
 # Automation contract
 
 Meshquill separates finite command results from live event streams. This page documents the
-`meshquill.cli/v1` contract implemented by `0.1.0-rc.1`.
+`meshquill.cli/v1` contract implemented by the current `0.1.0-rc.2` source checkout. Until
+[status](../../STATUS.md) records a published RC2 prerelease, this is a source contract rather than
+a claim that released RC2 artifacts are available.
 
 ## Output modes
 
@@ -36,6 +38,12 @@ requires a new schema identifier. Fields explicitly described as keys, key prefi
 paths, signatures, acknowledgement codes, or opaque payloads are generally lowercase hexadecimal.
 Do not assume every byte-bearing field is a hex string: for example, the current `self_info`
 representation serializes its public key as a JSON byte array.
+
+The checked-in [Draft 2020-12 envelope schema](../../schemas/meshquill-cli-v1.schema.json) is the
+normative machine-readable contract. A [finite-result fixture](../../schemas/compat/cli-v1-result.json)
+and [JSONL stream fixture](../../schemas/compat/cli-v1-stream.jsonl) provide representative records
+for compatibility checks. The schema intentionally leaves fields under `data` open so compatible
+releases can add nested data without changing the envelope version.
 
 ## Representative result types
 

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 use zeroize::Zeroizing;
 
@@ -19,6 +19,7 @@ use crate::transport::{ReconnectableTransport, Transport};
 pub const MANAGED_CLIENT_COMMAND_CAPACITY: usize = 32;
 
 const IDLE_ERROR_BACKOFF: Duration = Duration::from_millis(25);
+const INTERRUPTED_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 type Reply<T> = oneshot::Sender<Result<T, CoreError>>;
 
@@ -36,8 +37,9 @@ type Reply<T> = oneshot::Sender<Result<T, CoreError>>;
 /// aborted connections, and unexpected EOF) instead transition to disconnected state.
 #[derive(Clone)]
 pub struct ManagedClient {
-    command_tx: mpsc::Sender<ActorCommand>,
+    command_tx: mpsc::Sender<QueuedCommand>,
     event_tx: broadcast::Sender<Event>,
+    cancellation_epoch: watch::Sender<u64>,
 }
 
 impl ManagedClient {
@@ -85,10 +87,12 @@ impl ManagedClient {
     {
         let event_tx = client.event_sender();
         let (command_tx, command_rx) = mpsc::channel(command_capacity);
-        std::mem::drop(tokio::spawn(run_actor(client, command_rx)));
+        let (interrupt_tx, interrupt_rx) = watch::channel(0_u64);
+        std::mem::drop(tokio::spawn(run_actor(client, command_rx, interrupt_rx)));
         Self {
             command_tx,
             event_tx,
+            cancellation_epoch: interrupt_tx,
         }
     }
 
@@ -101,6 +105,19 @@ impl ManagedClient {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
+    }
+
+    /// Cancels operations submitted before this call without replaying them.
+    ///
+    /// An active acknowledgement wait is dropped at its cancellation-safe transport read and the
+    /// session remains usable for cleanup. Other active operations may have written an ambiguous
+    /// command or be part-way through connection setup, so the actor closes that transport within
+    /// one second before accepting cleanup commands. Already queued operations from the same
+    /// generation are discarded. Callers awaiting a discarded operation receive
+    /// [`CoreError::ActorStopped`].
+    pub fn cancel_pending_operations(&self) {
+        self.cancellation_epoch
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Connects the transport and performs the `APP_START` handshake.
@@ -832,12 +849,21 @@ impl ManagedClient {
         F: FnOnce(Reply<R>) -> ActorCommand,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let generation = *self.cancellation_epoch.borrow();
         self.command_tx
-            .send(make_command(reply_tx))
+            .send(QueuedCommand {
+                command: make_command(reply_tx),
+                generation,
+            })
             .await
             .map_err(|_| CoreError::ActorStopped)?;
         reply_rx.await.map_err(|_| CoreError::ActorStopped)?
     }
+}
+
+struct QueuedCommand {
+    command: ActorCommand,
+    generation: u64,
 }
 
 enum ActorCommand {
@@ -1043,8 +1069,11 @@ enum ActorCommand {
     Shutdown(Reply<()>),
 }
 
-async fn run_actor<T>(mut client: Client<T>, mut command_rx: mpsc::Receiver<ActorCommand>)
-where
+async fn run_actor<T>(
+    mut client: Client<T>,
+    mut command_rx: mpsc::Receiver<QueuedCommand>,
+    mut interrupt_rx: watch::Receiver<u64>,
+) where
     T: ReconnectableTransport + Send + 'static,
 {
     let mut running = true;
@@ -1053,22 +1082,42 @@ where
             tokio::select! {
                 biased;
                 command = command_rx.recv() => {
-                    running = handle_optional_command(&mut client, command).await;
+                    running = handle_optional_command(
+                        &mut client,
+                        command,
+                        &mut interrupt_rx,
+                    ).await;
                 }
+                _ = interrupt_rx.changed() => {}
                 event_result = client.next_event() => {
                     if event_result.is_err() && client.is_connected() {
                         tokio::select! {
                             biased;
                             command = command_rx.recv() => {
-                                running = handle_optional_command(&mut client, command).await;
+                                running = handle_optional_command(
+                                    &mut client,
+                                    command,
+                                    &mut interrupt_rx,
+                                ).await;
                             }
+                            _ = interrupt_rx.changed() => {}
                             () = sleep(IDLE_ERROR_BACKOFF) => {}
                         }
                     }
                 }
             }
         } else {
-            running = handle_optional_command(&mut client, command_rx.recv().await).await;
+            tokio::select! {
+                biased;
+                command = command_rx.recv() => {
+                    running = handle_optional_command(
+                        &mut client,
+                        command,
+                        &mut interrupt_rx,
+                    ).await;
+                }
+                _ = interrupt_rx.changed() => {}
+            }
         }
     }
 
@@ -1077,14 +1126,44 @@ where
     }
 }
 
-async fn handle_optional_command<T>(client: &mut Client<T>, command: Option<ActorCommand>) -> bool
+async fn handle_optional_command<T>(
+    client: &mut Client<T>,
+    queued: Option<QueuedCommand>,
+    interrupt_rx: &mut watch::Receiver<u64>,
+) -> bool
 where
     T: ReconnectableTransport + Send,
 {
-    match command {
-        Some(command) => handle_command(client, command).await,
-        None => false,
+    let Some(queued) = queued else {
+        return false;
+    };
+    let current_generation = *interrupt_rx.borrow_and_update();
+    if queued.generation != current_generation {
+        return true;
     }
+
+    let disconnect_on_interrupt = !matches!(&queued.command, ActorCommand::WaitForAck { .. });
+    {
+        let operation = handle_command(client, queued.command);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            running = &mut operation => return running,
+            changed = interrupt_rx.changed() => {
+                if changed.is_err() {
+                    return operation.await;
+                }
+            }
+        }
+    }
+
+    if !disconnect_on_interrupt {
+        return true;
+    }
+
+    timeout(INTERRUPTED_DISCONNECT_TIMEOUT, client.disconnect())
+        .await
+        .is_ok()
 }
 
 // Keeping the actor's exhaustive dispatch in one match makes the no-replay serialization boundary
@@ -1633,7 +1712,10 @@ mod tests {
     }
 
     fn managed_client(transport: ActorTestTransport) -> ManagedClient {
-        ManagedClient::spawn(Client::with_timeout(transport, Duration::from_millis(100)))
+        ManagedClient::spawn(
+            Client::with_timeout(transport, Duration::from_millis(100))
+                .expect("valid actor test timeout"),
+        )
     }
 
     async fn join_ok<T>(task: JoinHandle<Result<T, CoreError>>) -> T
@@ -1954,6 +2036,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_cancellation_releases_ack_wait_without_replaying_or_disconnect() {
+        let (transport, mut driver) = actor_test_transport(false);
+        let client = managed_client(transport);
+        let _ = connect_client(&client, &mut driver).await;
+
+        let send_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.send_direct_text(&[7; 6], 0, "once").await }
+        });
+        match driver.next_observation().await {
+            Observation::Write(payload) => assert_eq!(
+                payload.first().copied(),
+                Some(CommandCode::SendTxtMsg.to_u8())
+            ),
+            other => panic!("expected direct send, got {other:?}"),
+        }
+        driver.packet(message_sent_packet(ACK_ONE));
+        let tracking = join_ok(send_task).await;
+
+        let wait_task = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .wait_for_ack(tracking.ack_code, Some(Duration::from_secs(60)))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        client.cancel_pending_operations();
+        match timeout(TEST_TIMEOUT, wait_task).await {
+            Ok(Ok(Err(CoreError::ActorStopped))) => {}
+            other => panic!("cancelled ACK wait did not finish promptly: {other:?}"),
+        }
+
+        let query_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.query_device_info().await }
+        });
+        driver.expect_write(&Command::device_query().encode()).await;
+        driver.packet(device_info_packet());
+        let _ = join_ok(query_task).await;
+        driver.expect_no_observation().await;
+
+        shutdown_client(&client, &mut driver).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_disconnects_an_incomplete_handshake() {
+        let (transport, mut driver) = actor_test_transport(false);
+        let client = managed_client(transport);
+        let connect_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect().await }
+        });
+        driver.expect_connect().await;
+        driver.expect_write(&Command::app_start().encode()).await;
+
+        client.cancel_pending_operations();
+        driver.expect_disconnect().await;
+        match timeout(TEST_TIMEOUT, connect_task).await {
+            Ok(Ok(Err(CoreError::ActorStopped))) => {}
+            other => panic!("cancelled connect did not finish promptly: {other:?}"),
+        }
+
+        let _ = connect_client(&client, &mut driver).await;
+        shutdown_client(&client, &mut driver).await;
+    }
+
+    #[tokio::test]
     async fn explicit_reconnect_handshakes_without_replaying_prior_send() {
         let (transport, mut driver) = actor_test_transport(false);
         let client = managed_client(transport);
@@ -2002,8 +2153,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_is_bounded_and_last_handle_drop_disconnects() {
         let (hanging_transport, mut hanging_driver) = actor_test_transport(true);
-        let hanging_client =
-            ManagedClient::spawn(Client::with_timeout(hanging_transport, SHORT_TIMEOUT));
+        let hanging_client = ManagedClient::spawn(
+            Client::with_timeout(hanging_transport, SHORT_TIMEOUT)
+                .expect("valid shutdown test timeout"),
+        );
         let _ = connect_client(&hanging_client, &mut hanging_driver).await;
 
         let shutdown_task = tokio::spawn({

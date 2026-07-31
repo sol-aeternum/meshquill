@@ -10,7 +10,7 @@ use meshquill_core::{
 use tokio::{io::AsyncWriteExt, net::TcpStream, time};
 
 use crate::{
-    discovery::{TargetError, TransportTarget, format_tcp_endpoint, validate_nonzero},
+    discovery::{TargetError, TransportTarget, format_tcp_endpoint, validate_timeout},
     framed::{
         FramedReadState, invalidate_on_terminal_read_error, validate_payload, write_framed_bounded,
     },
@@ -34,7 +34,8 @@ impl TcpTransport {
     /// and bounds each provider connect, framed-write, and shutdown operation.
     ///
     /// # Errors
-    /// Returns [`TargetError`] when the host is blank, the port is zero, or the timeout is zero.
+    /// Returns [`TargetError`] when the host is blank, the port is zero, or the timeout is zero or
+    /// greater than 24 hours.
     pub fn new(
         host: impl Into<String>,
         port: u16,
@@ -46,7 +47,7 @@ impl TcpTransport {
             port,
         };
         target.validate()?;
-        validate_timeout(connect_timeout)?;
+        validate_timeout("connect_timeout", connect_timeout)?;
 
         Ok(Self {
             host,
@@ -195,10 +196,6 @@ impl Transport for TcpTransport {
 
 impl ReconnectableTransport for TcpTransport {}
 
-fn validate_timeout(timeout: Duration) -> Result<(), TargetError> {
-    validate_nonzero("connect_timeout", timeout.as_nanos())
-}
-
 fn timeout_error(operation: &str, endpoint: &str, timeout: Duration) -> TransportError {
     TransportError::Io(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -229,6 +226,14 @@ mod tests {
         assert!(TcpTransport::new("", 5_000, Duration::from_secs(1)).is_err());
         assert!(TcpTransport::new("localhost", 0, Duration::from_secs(1)).is_err());
         assert!(TcpTransport::new("localhost", 5_000, Duration::ZERO).is_err());
+        assert!(
+            TcpTransport::new(
+                "localhost",
+                5_000,
+                meshquill_core::MAX_OPERATION_TIMEOUT.saturating_add(Duration::from_nanos(1)),
+            )
+            .is_err()
+        );
 
         let transport = TcpTransport::new("localhost", 5_000, Duration::from_secs(2))
             .expect("valid TCP target");

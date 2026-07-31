@@ -21,6 +21,8 @@ use crate::transport::{ReconnectableTransport, Transport};
 pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default outbound event buffer size.
 pub const CLIENT_EVENT_CAPACITY: usize = 256;
+/// Largest caller-controlled operation timeout accepted by the core client (24 hours).
+pub const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 const CLIENT_COMPLETED_ACK_CAPACITY: usize = 256;
 const CLIENT_PENDING_ACK_CAPACITY: usize = 256;
@@ -51,11 +53,19 @@ where
 {
     /// Constructs a client with default timeouts and capacity.
     pub fn new(transport: T) -> Self {
-        Self::with_timeout(transport, CLIENT_REQUEST_TIMEOUT)
+        Self::with_valid_timeout(transport, CLIENT_REQUEST_TIMEOUT)
     }
 
     /// Constructs a client with a custom request timeout.
-    pub fn with_timeout(transport: T, request_timeout: Duration) -> Self {
+    ///
+    /// # Errors
+    /// Returns [`CoreError::InvalidArgument`] when the timeout is zero or exceeds 24 hours.
+    pub fn with_timeout(transport: T, request_timeout: Duration) -> Result<Self, CoreError> {
+        validate_operation_timeout(request_timeout)?;
+        Ok(Self::with_valid_timeout(transport, request_timeout))
+    }
+
+    fn with_valid_timeout(transport: T, request_timeout: Duration) -> Self {
         let (event_tx, _) = broadcast::channel(CLIENT_EVENT_CAPACITY);
         Self {
             transport,
@@ -196,11 +206,11 @@ where
         self.ensure_connected()?;
         let packet = self.read_next_packet().await?;
         self.update_tracking(&packet);
-        let event = packet.into_event();
-        if let Some(event) = event.as_ref() {
-            let _ = self.event_tx.send(event.clone());
-        }
-        Ok(event)
+        let Some(event) = packet.into_event() else {
+            return Ok(None);
+        };
+        self.publish_domain_event(&event);
+        Ok(Some(event))
     }
 
     /// Lists contacts from firmware.
@@ -1105,7 +1115,6 @@ where
     pub async fn sync_next_message(&mut self) -> Result<Option<Message>, CoreError> {
         self.ensure_connected()?;
         self.send_only(Command::sync_next_message()).await?;
-
         loop {
             let packet = self.read_next_packet_with_timeout().await?;
             match packet {
@@ -1142,6 +1151,9 @@ where
         ack_code: [u8; 4],
         request_timeout: Option<Duration>,
     ) -> Result<Ack, CoreError> {
+        if let Some(request_timeout) = request_timeout {
+            validate_operation_timeout(request_timeout)?;
+        }
         self.ensure_connected()?;
         if let Some(ack) = self.take_completed_ack(ack_code) {
             return Ok(ack);
@@ -1403,8 +1415,12 @@ where
 
     fn publish_event(&self, packet: &Packet) {
         if let Some(event) = packet.clone().into_event() {
-            let _ = self.event_tx.send(event);
+            self.publish_domain_event(&event);
         }
+    }
+
+    fn publish_domain_event(&self, event: &Event) {
+        let _ = self.event_tx.send(event.clone());
     }
 
     fn update_tracking(&mut self, packet: &Packet) {
@@ -1506,6 +1522,16 @@ where
     }
 }
 
+fn validate_operation_timeout(timeout: Duration) -> Result<(), CoreError> {
+    if timeout.is_zero() || timeout > MAX_OPERATION_TIMEOUT {
+        return Err(CoreError::InvalidArgument {
+            field: "timeout",
+            message: "must be greater than zero and at most 24 hours".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn is_disconnect_error(error: &TransportError) -> bool {
     match error {
         TransportError::NotConnected | TransportError::Closed => true,
@@ -1604,6 +1630,16 @@ mod tests {
         raw
     }
 
+    fn contact_message_packet(route: u8, timestamp: u32, text: &str) -> Vec<u8> {
+        let mut raw = vec![PacketCode::ContactMsgRecv.to_u8()];
+        raw.extend_from_slice(&[0x42; 6]);
+        raw.push(route);
+        raw.push(0);
+        raw.extend_from_slice(&timestamp.to_le_bytes());
+        raw.extend_from_slice(text.as_bytes());
+        raw
+    }
+
     struct ReadErrorTransport {
         kind: io::ErrorKind,
     }
@@ -1668,6 +1704,114 @@ mod tests {
         assert!(validate_text("ok", 2, "text").is_ok());
         assert!(validate_text("", 2, "text").is_err());
         assert!(validate_text("é", 1, "text").is_err());
+    }
+
+    #[test]
+    fn request_timeout_bounds_are_strict() {
+        assert!(Client::with_timeout(ScriptedTransport::new(), MAX_OPERATION_TIMEOUT).is_ok());
+        assert!(Client::with_timeout(ScriptedTransport::new(), Duration::ZERO).is_err());
+        assert!(
+            Client::with_timeout(
+                ScriptedTransport::new(),
+                MAX_OPERATION_TIMEOUT.saturating_add(Duration::from_nanos(1)),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_timeout_is_validated_before_io() {
+        let mut client = Client::new(ScriptedTransport::new());
+        assert!(matches!(
+            client
+                .wait_for_ack(
+                    [1, 2, 3, 4],
+                    Some(MAX_OPERATION_TIMEOUT.saturating_add(Duration::from_nanos(1))),
+                )
+                .await,
+            Err(CoreError::InvalidArgument {
+                field: "timeout",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_logical_messages_are_never_silently_dropped() {
+        let frames = [
+            contact_message_packet(u8::MAX, 42, "same payload"),
+            contact_message_packet(1, 42, "same payload"),
+        ];
+        let mut client = Client::new(ScriptedTransport::with_inbound_frames(frames));
+        client.connected = true;
+        let mut events = client.subscribe();
+
+        assert!(matches!(
+            client.next_event().await,
+            Ok(Some(Event::Message(Message {
+                sender_timestamp: 42,
+                ..
+            })))
+        ));
+        assert!(matches!(
+            client.next_event().await,
+            Ok(Some(Event::Message(Message {
+                sender_timestamp: 42,
+                ..
+            })))
+        ));
+        assert!(matches!(events.try_recv(), Ok(Event::Message(_))));
+        assert!(matches!(events.try_recv(), Ok(Event::Message(_))));
+    }
+
+    #[tokio::test]
+    async fn sync_uses_exactly_one_command_for_each_queue_response() {
+        let frames = [
+            contact_message_packet(u8::MAX, 42, "same payload"),
+            contact_message_packet(1, 42, "same payload"),
+            vec![PacketCode::NoMoreMsgs.to_u8()],
+        ];
+        let mut client = Client::new(ScriptedTransport::with_inbound_frames(frames));
+        client.connected = true;
+        let mut events = client.subscribe();
+
+        assert!(matches!(
+            client.sync_next_message().await,
+            Ok(Some(Message {
+                sender_timestamp: 42,
+                ..
+            }))
+        ));
+        assert_eq!(client.transport.outbound_frames().len(), 1);
+        assert!(matches!(
+            client.sync_next_message().await,
+            Ok(Some(Message {
+                sender_timestamp: 42,
+                ..
+            }))
+        ));
+        assert_eq!(client.transport.outbound_frames().len(), 2);
+        assert!(matches!(client.sync_next_message().await, Ok(None)));
+        assert_eq!(client.transport.outbound_frames().len(), 3);
+        assert!(matches!(events.try_recv(), Ok(Event::Message(_))));
+        assert!(matches!(events.try_recv(), Ok(Event::Message(_))));
+    }
+
+    #[tokio::test]
+    async fn prior_live_delivery_never_causes_an_extra_sync_command() {
+        let frames = [
+            contact_message_packet(u8::MAX, 42, "same payload"),
+            contact_message_packet(u8::MAX, 42, "same payload"),
+        ];
+        let mut client = Client::new(ScriptedTransport::with_inbound_frames(frames));
+        client.connected = true;
+
+        assert!(matches!(
+            client.next_event().await,
+            Ok(Some(Event::Message(_)))
+        ));
+        assert!(matches!(client.sync_next_message().await, Ok(Some(_))));
+        assert_eq!(client.transport.outbound_frames().len(), 1);
     }
 
     #[tokio::test]

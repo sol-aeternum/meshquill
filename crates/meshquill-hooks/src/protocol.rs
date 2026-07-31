@@ -126,7 +126,8 @@ pub struct OnMessagePayload {
     pub source: String,
     /// Message text.
     pub text: String,
-    /// Optional caller-assigned message identifier.
+    /// Optional Meshquill-local workflow UUID relating local hook/history events. It is not a
+    /// `MeshCore` message ID, cross-restart durable identity, or deduplication key.
     pub message_id: Option<String>,
 }
 
@@ -207,7 +208,8 @@ pub struct AfterSendPayload {
     pub destination: String,
     /// Submitted message text.
     pub text: String,
-    /// Optional caller-assigned message identifier.
+    /// Optional Meshquill-local workflow UUID relating local hook/history events. It is not a
+    /// `MeshCore` message ID, cross-restart durable identity, or deduplication key.
     pub message_id: Option<String>,
 }
 
@@ -220,7 +222,8 @@ redacted_debug!(AfterSendPayload {
 /// Details about a received acknowledgement.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OnAckPayload {
-    /// Identifier of the acknowledged message.
+    /// Meshquill-local workflow UUID relating local hook/history events. It is not a `MeshCore`
+    /// message ID, cross-restart durable identity, or deduplication key.
     pub message_id: String,
     /// Optional acknowledgement source.
     pub source: Option<String>,
@@ -247,7 +250,8 @@ impl fmt::Debug for OnAckPayload {
 pub struct OnTimeoutPayload {
     /// Name of the operation that timed out.
     pub operation: String,
-    /// Optional related message identifier.
+    /// Optional Meshquill-local workflow UUID relating local hook/history events. It is not a
+    /// `MeshCore` message ID, cross-restart durable identity, or deduplication key.
     pub message_id: Option<String>,
 }
 

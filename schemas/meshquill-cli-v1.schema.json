@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Meshquill CLI v1 envelope",
+  "description": "The stable envelope shared by finite JSON results and JSONL stream records.",
+  "type": "object",
+  "required": [
+    "schema",
+    "type",
+    "data"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "meshquill.cli/v1"
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

@@ -1004,6 +1004,55 @@ pub struct Message {
     pub status: MessageStatus,
 }
 
+impl Message {
+    /// Returns a payload fingerprint for bounded correlation of likely duplicate delivery
+    /// observations.
+    ///
+    /// The fingerprint covers the logical sender/channel, message type, sender timestamp,
+    /// optional signature, and text. It deliberately excludes route, signal strength, and local
+    /// delivery status because firmware can report the same radio payload through multiple paths.
+    /// `MeshCore` exposes no globally unique message identifier: channel packets omit sender identity,
+    /// and timestamps have one-second resolution. Equal fingerprints therefore do not prove the
+    /// same occurrence or a retransmission; a distinct identical opposite-path occurrence inside
+    /// the correlation window can collide.
+    ///
+    /// The CLI pairs only opposite live/queued paths within one connection, five seconds, and 256
+    /// retained entries. Each match consumes one entry, preserving multiplicity, and same-path
+    /// repeats remain distinct. This value is neither an authentication token nor a permanent
+    /// identity or unbounded deduplication key.
+    #[must_use]
+    pub fn delivery_fingerprint(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"meshquill-message-delivery-v1\0");
+        match &self.source {
+            MessageSource::Direct { pubkey_prefix } => {
+                hasher.update([0]);
+                let prefix = pubkey_prefix.as_bytes();
+                hasher.update(
+                    u64::try_from(prefix.len())
+                        .unwrap_or(u64::MAX)
+                        .to_le_bytes(),
+                );
+                hasher.update(prefix);
+            }
+            MessageSource::Channel { channel_idx } => {
+                hasher.update([1, *channel_idx]);
+            }
+        }
+        hasher.update([self.txt_type]);
+        hasher.update(self.sender_timestamp.to_le_bytes());
+        match self.signature {
+            Some(signature) => {
+                hasher.update([1]);
+                hasher.update(signature);
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update(self.text.as_bytes());
+        hasher.finalize().into()
+    }
+}
+
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Message")

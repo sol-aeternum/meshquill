@@ -124,6 +124,23 @@ pub enum VirtualCompanionFault {
     CleanDisconnect,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DirectSendWriteFault {
+    #[default]
+    None,
+    DisconnectBeforeWrite,
+}
+
+/// Behavior when `read` finds no inbound packet or configured fault.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VirtualCompanionIdleReadMode {
+    /// Return [`TransportError::Timeout`] immediately.
+    #[default]
+    Timeout,
+    /// Remain pending until the caller cancels the read future.
+    Pending,
+}
+
 /// Errors from configuration APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualCompanionError {
@@ -201,7 +218,12 @@ struct VirtualCompanionState {
     sync_queue: VecDeque<Vec<u8>>,
     channels: Vec<ChannelSlot>,
     reconnect_count: usize,
+    reconnect_failures_remaining: usize,
+    next_reconnect_push: Option<Vec<u8>>,
     next_fault: Option<VirtualCompanionFault>,
+    idle_disconnects_remaining: usize,
+    direct_send_write_fault: DirectSendWriteFault,
+    idle_read_mode: VirtualCompanionIdleReadMode,
     duplicate_next_inbound: bool,
     send_txt_ack: [u8; 4],
     send_txt_timeout_ms: u32,
@@ -229,7 +251,12 @@ impl VirtualCompanionState {
             sync_queue: VecDeque::new(),
             channels,
             reconnect_count: 0,
+            reconnect_failures_remaining: 0,
+            next_reconnect_push: None,
             next_fault: None,
+            idle_disconnects_remaining: 0,
+            direct_send_write_fault: DirectSendWriteFault::None,
+            idle_read_mode: VirtualCompanionIdleReadMode::default(),
             duplicate_next_inbound: false,
             send_txt_ack: DEFAULT_ACK_CODE,
             send_txt_timeout_ms: DEFAULT_ACK_TIMEOUT_MS,
@@ -463,6 +490,12 @@ impl VirtualCompanion {
         state.emit_send_txt_ack = emit_ack_packet;
     }
 
+    /// Configures how `read` behaves when the inbound queue is empty.
+    pub fn set_idle_read_mode(&self, mode: VirtualCompanionIdleReadMode) {
+        let mut state = lock_state(&self.state);
+        state.idle_read_mode = mode;
+    }
+
     /// Returns and clears all observed outbound command packets.
     #[must_use]
     pub fn drain_outbound(&self) -> Vec<Vec<u8>> {
@@ -482,6 +515,54 @@ impl VirtualCompanion {
     pub fn reconnect_count(&self) -> usize {
         let state = lock_state(&self.state);
         state.reconnect_count
+    }
+
+    /// Schedules one clean disconnect after all currently queued inbound packets are read.
+    ///
+    /// Unlike [`Self::set_next_read_fault`], this control never interrupts a queued command
+    /// response. Repeated calls before the disconnect remain a single bounded one-shot request.
+    pub fn disconnect_on_next_idle_read(&self) {
+        let mut state = lock_state(&self.state);
+        state.idle_disconnects_remaining = 1;
+    }
+
+    /// Disconnects before accepting the next direct-text command write.
+    ///
+    /// The one-shot command is not recorded and no response is queued, so tests can distinguish a
+    /// known-unsent draft from an ambiguous failure after transport acceptance.
+    pub fn disconnect_before_next_direct_send(&self) {
+        let mut state = lock_state(&self.state);
+        state.direct_send_write_fault = DirectSendWriteFault::DisconnectBeforeWrite;
+    }
+
+    /// Makes exactly `count` subsequent reconnect attempts fail deterministically.
+    ///
+    /// A later call replaces the remaining failure count. Every attempted reconnect still
+    /// increments [`Self::reconnect_count`].
+    pub fn fail_next_reconnects(&self, count: usize) {
+        let mut state = lock_state(&self.state);
+        state.reconnect_failures_remaining = count;
+    }
+
+    /// Retains one unsolicited packet for delivery on the next successful reconnect.
+    ///
+    /// A later call replaces the previously retained packet, keeping this fixture state bounded.
+    /// The packet is queued before the reconnecting client's `APP_START` response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the packet exceeds the protocol payload bound.
+    pub fn set_next_reconnect_push(&self, packet: Vec<u8>) -> Result<(), VirtualCompanionError> {
+        if packet.len() > MAX_INNER_PAYLOAD {
+            return Err(VirtualCompanionError::PacketTooLarge {
+                max: MAX_INNER_PAYLOAD,
+                actual: packet.len(),
+            });
+        }
+
+        let mut state = lock_state(&self.state);
+        state.next_reconnect_push = Some(packet);
+        Ok(())
     }
 
     /// Schedules a deterministic fault for the next `read` call.
@@ -1480,6 +1561,9 @@ impl Transport for VirtualCompanion {
     async fn disconnect(&mut self) -> Result<(), TransportError> {
         let mut state = lock_state(&self.state);
         state.connected = false;
+        // Transport-session packets cannot be consumed after a physical disconnect. Clearing them
+        // also prevents a failed handshake response from poisoning a later explicit reconnect.
+        state.inbound.clear();
         Ok(())
     }
 
@@ -1496,6 +1580,17 @@ impl Transport for VirtualCompanion {
             });
         }
 
+        let is_direct_send = payload.first().copied().is_some_and(|command| {
+            matches!(CommandCode::try_from(command), Ok(CommandCode::SendTxtMsg))
+        });
+        if state.direct_send_write_fault == DirectSendWriteFault::DisconnectBeforeWrite
+            && is_direct_send
+        {
+            state.direct_send_write_fault = DirectSendWriteFault::None;
+            state.connected = false;
+            return Err(TransportError::Closed);
+        }
+
         state
             .ensure_outbound_capacity()
             .map_err(transport_queue_error)?;
@@ -1507,38 +1602,79 @@ impl Transport for VirtualCompanion {
     }
 
     async fn read(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
-        let mut state = lock_state(&self.state);
-        if !state.connected {
-            return Err(TransportError::NotConnected);
-        }
+        let idle_read_mode = {
+            let mut state = lock_state(&self.state);
+            if !state.connected {
+                return Err(TransportError::NotConnected);
+            }
 
-        if let Some(fault) = state.next_fault.take() {
-            return match fault {
-                VirtualCompanionFault::Timeout => Err(TransportError::Timeout),
-                VirtualCompanionFault::CleanDisconnect => {
-                    state.connected = false;
-                    Ok(None)
-                }
-            };
-        }
+            if let Some(fault) = state.next_fault.take() {
+                return match fault {
+                    VirtualCompanionFault::Timeout => Err(TransportError::Timeout),
+                    VirtualCompanionFault::CleanDisconnect => {
+                        state.connected = false;
+                        Ok(None)
+                    }
+                };
+            }
 
-        if let Some(payload) = state.inbound.pop_front() {
-            return Ok(Some(payload));
-        }
+            if let Some(payload) = state.inbound.pop_front() {
+                return Ok(Some(payload));
+            }
 
-        Err(TransportError::Timeout)
+            if state.idle_disconnects_remaining > 0 {
+                state.idle_disconnects_remaining -= 1;
+                state.connected = false;
+                return Ok(None);
+            }
+
+            state.idle_read_mode
+        };
+
+        match idle_read_mode {
+            VirtualCompanionIdleReadMode::Timeout => Err(TransportError::Timeout),
+            VirtualCompanionIdleReadMode::Pending => std::future::pending().await,
+        }
     }
 }
 
 #[async_trait]
 impl ReconnectableTransport for VirtualCompanion {
     async fn reconnect(&mut self) -> Result<(), TransportError> {
-        {
+        let should_fail = {
             let mut state = lock_state(&self.state);
             state.reconnect_count = state.reconnect_count.saturating_add(1);
-        }
+            if state.reconnect_failures_remaining == 0 {
+                false
+            } else {
+                state.reconnect_failures_remaining -= 1;
+                true
+            }
+        };
         self.disconnect().await?;
-        self.connect().await
+        if should_fail {
+            return Err(TransportError::ReconnectFailed {
+                message: "deterministic virtual companion reconnect failure",
+            });
+        }
+
+        self.connect().await?;
+        let queue_result = {
+            let mut state = lock_state(&self.state);
+            let packet = state.next_reconnect_push.take();
+            let result = packet.map_or(Ok(()), |packet| state.queue_inbound(&[packet]));
+            if result.is_err() {
+                // The retained packet belonged to this reconnect attempt. Do not let a failed
+                // enqueue arm duplication for the following APP_START handshake.
+                state.duplicate_next_inbound = false;
+            }
+            result
+        };
+        if let Err(error) = queue_result {
+            self.disconnect().await?;
+            return Err(transport_queue_error(error));
+        }
+        Ok(())
     }
 }
 
@@ -1747,7 +1883,7 @@ fn scale_coordinate(
 mod tests {
     use super::*;
     use meshquill_core::{
-        Client,
+        Client, CoreError, Event,
         domain::Path,
         protocol::Packet as CorePacket,
         remote::{
@@ -1795,6 +1931,264 @@ mod tests {
         assert_eq!(outbound.len(), 1);
         assert_eq!(outbound[0], APP_START_COMMAND.to_vec());
         assert!(format!("{companion:?}").contains("reconnects"));
+    }
+
+    #[tokio::test]
+    async fn default_idle_read_returns_timeout_immediately() {
+        let mut companion = VirtualCompanion::new();
+        must_ok(companion.connect().await, "connect failed");
+
+        let read = tokio::time::timeout(std::time::Duration::from_millis(20), companion.read())
+            .await
+            .expect("default idle read remained pending");
+        assert!(matches!(read, Err(TransportError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn configured_pending_idle_read_is_cancellation_safe() {
+        let mut companion = VirtualCompanion::new();
+        companion.set_idle_read_mode(VirtualCompanionIdleReadMode::Pending);
+        must_ok(companion.connect().await, "connect failed");
+
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(10), companion.read()).await;
+        assert!(read.is_err(), "configured idle read unexpectedly completed");
+        assert!(companion.is_connected());
+
+        let expected = must_ok(
+            make_direct_message_packet(u8::MAX, "after cancelled idle read"),
+            "direct fixture failed",
+        );
+        must_ok(
+            companion.enqueue_push(expected.clone()),
+            "inbound enqueue failed",
+        );
+        let read = tokio::time::timeout(std::time::Duration::from_millis(20), companion.read())
+            .await
+            .expect("fresh read remained pending after enqueue");
+        assert_eq!(
+            must_some(must_ok(read, "fresh read failed"), "stream closed"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_packet_wins_over_pending_idle_read_mode() {
+        let mut companion = VirtualCompanion::new();
+        companion.set_idle_read_mode(VirtualCompanionIdleReadMode::Pending);
+        let expected = must_ok(
+            make_direct_message_packet(u8::MAX, "queued before pending"),
+            "direct fixture failed",
+        );
+        must_ok(
+            companion.enqueue_push(expected.clone()),
+            "inbound enqueue failed",
+        );
+        must_ok(companion.connect().await, "connect failed");
+
+        let read = tokio::time::timeout(std::time::Duration::from_millis(20), companion.read())
+            .await
+            .expect("queued packet was blocked by idle mode");
+        assert_eq!(
+            must_some(must_ok(read, "queued read failed"), "stream closed"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_waits_until_after_the_handshake_response() {
+        let companion = VirtualCompanion::new();
+        companion.disconnect_on_next_idle_read();
+        let mut client = Client::new(companion.clone());
+
+        let info = must_ok(client.connect().await, "handshake failed");
+        assert_eq!(info.public_key.as_bytes()[0], 1);
+        assert!(companion.is_connected());
+
+        assert!(matches!(
+            client.next_event().await,
+            Err(CoreError::Disconnected)
+        ));
+        assert!(!companion.is_connected());
+        assert_eq!(companion.outbound_packets(), [APP_START_COMMAND.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn direct_send_disconnect_is_one_shot_and_happens_before_acceptance() {
+        let companion = VirtualCompanion::new();
+        let mut client = Client::new(companion.clone());
+        let _ = must_ok(client.connect().await, "handshake failed");
+        companion.disconnect_before_next_direct_send();
+
+        assert!(matches!(
+            client.send_direct_text(&[0x22; 6], 0, "known unsent").await,
+            Err(CoreError::Transport(TransportError::Closed))
+        ));
+        assert_eq!(companion.outbound_packets(), [APP_START_COMMAND.to_vec()]);
+
+        let _ = must_ok(client.reconnect().await, "reconnect failed");
+        let _ = must_ok(
+            client
+                .send_direct_text(&[0x22; 6], 0, "deliberate retry")
+                .await,
+            "retry failed",
+        );
+        let direct_sends = companion
+            .outbound_packets()
+            .into_iter()
+            .filter(|packet| {
+                packet.first().copied().is_some_and(|command| {
+                    matches!(CommandCode::try_from(command), Ok(CommandCode::SendTxtMsg))
+                })
+            })
+            .count();
+        assert_eq!(direct_sends, 1);
+    }
+
+    #[tokio::test]
+    async fn configured_reconnect_failures_are_exact_and_count_every_attempt() {
+        let companion = VirtualCompanion::new();
+        let mut client = Client::new(companion.clone());
+        let _ = must_ok(client.connect().await, "handshake failed");
+        companion.fail_next_reconnects(2);
+
+        for expected_count in 1..=2 {
+            let error = client
+                .reconnect()
+                .await
+                .expect_err("configured reconnect should fail");
+            assert!(matches!(
+                error,
+                CoreError::Transport(TransportError::ReconnectFailed { .. })
+            ));
+            assert_eq!(companion.reconnect_count(), expected_count);
+            assert!(!companion.is_connected());
+        }
+
+        let info = must_ok(client.reconnect().await, "third reconnect should succeed");
+        assert_eq!(info.public_key.as_bytes()[0], 1);
+        assert_eq!(companion.reconnect_count(), 3);
+        assert!(companion.is_connected());
+    }
+
+    #[tokio::test]
+    async fn successful_reconnect_delivers_the_retained_push_before_self_info() {
+        const RECONNECTED_MESSAGE: &str = "live message after deterministic reconnect";
+
+        let companion = VirtualCompanion::new();
+        companion.disconnect_on_next_idle_read();
+        let mut client = Client::new(companion.clone());
+        let _ = must_ok(client.connect().await, "handshake failed");
+        assert!(matches!(
+            client.next_event().await,
+            Err(CoreError::Disconnected)
+        ));
+
+        assert!(matches!(
+            companion.set_next_reconnect_push(vec![0; MAX_INNER_PAYLOAD + 1]),
+            Err(VirtualCompanionError::PacketTooLarge { .. })
+        ));
+        must_ok(
+            companion.set_next_reconnect_push(must_ok(
+                make_direct_message_packet(u8::MAX, "superseded reconnect message"),
+                "superseded direct fixture failed",
+            )),
+            "initial reconnect push failed",
+        );
+        must_ok(
+            companion.set_next_reconnect_push(must_ok(
+                make_direct_message_packet(u8::MAX, RECONNECTED_MESSAGE),
+                "direct fixture failed",
+            )),
+            "replacement reconnect push failed",
+        );
+        companion.fail_next_reconnects(1);
+
+        let mut events = client.subscribe();
+        assert!(matches!(
+            client.reconnect().await,
+            Err(CoreError::Transport(TransportError::ReconnectFailed { .. }))
+        ));
+        let _ = must_ok(client.reconnect().await, "second reconnect should succeed");
+
+        let pushed = must_ok(events.try_recv(), "missing reconnect push event");
+        let Event::Message(message) = pushed else {
+            panic!("reconnect push was not published before SELF_INFO");
+        };
+        assert_eq!(message.text, RECONNECTED_MESSAGE);
+        assert!(matches!(
+            must_ok(events.try_recv(), "missing reconnect SELF_INFO event"),
+            Event::SelfInfo(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_push_uses_the_normal_duplicate_queue_path() {
+        let companion = VirtualCompanion::new();
+        companion.disconnect_on_next_idle_read();
+        let mut client = Client::new(companion.clone());
+        let _ = must_ok(client.connect().await, "handshake failed");
+        assert!(matches!(
+            client.next_event().await,
+            Err(CoreError::Disconnected)
+        ));
+
+        must_ok(
+            companion.set_next_reconnect_push(must_ok(
+                make_direct_message_packet(u8::MAX, "duplicated reconnect push"),
+                "direct fixture failed",
+            )),
+            "reconnect push setup failed",
+        );
+        companion.duplicate_next_inbound_packet();
+        let mut events = client.subscribe();
+        let _ = must_ok(client.reconnect().await, "reconnect failed");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                must_ok(events.try_recv(), "missing duplicated reconnect push"),
+                Event::Message(_)
+            ));
+        }
+        assert!(matches!(
+            must_ok(events.try_recv(), "missing reconnect SELF_INFO event"),
+            Event::SelfInfo(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_reconnect_handshake_does_not_poison_the_next_attempt() {
+        let limits = VirtualCompanionCapacities::new(8, 1, 1, 1);
+        let companion = VirtualCompanion::with_capacities(limits);
+        companion.disconnect_on_next_idle_read();
+        let mut client = Client::new(companion.clone());
+        let _ = must_ok(client.connect().await, "handshake failed");
+        assert!(matches!(
+            client.next_event().await,
+            Err(CoreError::Disconnected)
+        ));
+        must_ok(
+            companion.set_next_reconnect_push(must_ok(
+                make_direct_message_packet(u8::MAX, "fills the one-slot queue"),
+                "direct fixture failed",
+            )),
+            "reconnect push setup failed",
+        );
+
+        assert!(matches!(
+            client.reconnect().await,
+            Err(CoreError::Transport(TransportError::Backpressure {
+                queue: "inbound_queue",
+                capacity: 1
+            }))
+        ));
+        assert!(!companion.is_connected());
+
+        let _ = must_ok(
+            client.reconnect().await,
+            "clean reconnect after failed handshake should succeed",
+        );
+        assert!(companion.is_connected());
     }
 
     #[tokio::test]

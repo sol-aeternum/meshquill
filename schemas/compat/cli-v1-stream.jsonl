@@ -1,0 +1,2 @@
+{"schema":"meshquill.cli/v1","type":"event","data":{"event":"self_info","data":{"name":"","public_key":"0101010101010101010101010101010101010101010101010101010101010101"}}}
+{"schema":"meshquill.cli/v1","type":"event","data":{"event":"connected","data":{}}}

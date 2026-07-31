@@ -86,6 +86,14 @@ $ meshquill inbox --limit 10
 In JSON output, `drained` is `true` only when the companion's empty marker was reached. It is
 normally `false` when `--limit` stopped the loop first.
 
+MeshCore receive packets do not provide a globally unique message identifier. Meshquill therefore
+uses a payload fingerprint only for bounded, connection-local heuristic correlation. One matching
+live observation and one queued observation may be paired within five seconds while at most 256
+unmatched observations are retained. A match consumes one observation from each path, preserving
+multiplicity; same-path repeats stay distinct. This only identifies a likely duplicate delivery
+observation, not proof of the same occurrence or a retransmission. Distinct identical occurrences
+seen on opposite paths within the window can collide. Reconnecting clears the correlation state.
+
 ## Watch live events
 
 `watch` is a stream. Human output is the default; automation must use JSONL:
@@ -99,6 +107,11 @@ $ meshquill --output jsonl watch --event connection --count 5
 Filters may be repeated and include `message`, `ack`, `contact`, `connection`, `telemetry`, and
 `error`. With no filters, all public events are emitted. `--count` stops after that many matching
 events. A lagging consumer receives a diagnostic that bounded events were skipped.
+
+After a device disconnect event, `watch` re-establishes only the companion session. It makes at
+most three reconnect attempts: one immediate attempt, then delays of `retry_timeout_ms` and twice
+that value, each capped by `connect_timeout_ms`. It never replays a command or radio send. Exhausted
+or unsupported reconnects end the stream with connection status.
 
 ## Use line chat
 
@@ -118,40 +131,57 @@ direct contact. With an interactive terminal, omitting the destination prompts o
 $ printf 'hello\n/quit\n' | meshquill --output jsonl chat Alice --line
 ```
 
-The line commands are deliberately small:
+The line commands are:
 
-- `/quit` exits.
-- `/send` submits a draft retained after a reconnectable failure before companion acceptance and
-  otherwise does nothing.
-- A blank line is ignored.
-- Every other line is message text; there are no TUI navigation commands or in-process shell pipes.
+- `/help` shows the commands and the current target.
+- `/contacts [query]` lists contacts, optionally filtering names case-insensitively.
+- `/to <contact>` switches to an exact contact name or unique key prefix.
+- `/channel <0..255>` switches to a numeric channel.
+- `/history [N]` shows up to 100 newest retained entries for the current conversation; history must
+  already be enabled explicitly.
+- `/send` starts a new explicit send of the exact text and original destination retained after a
+  reconnectable failure before companion acceptance was observed. It can duplicate delivery if the
+  original write succeeded but its response was lost.
+- `/discard` drops that retained message without transmitting it, avoiding that duplicate-send risk.
+- `/quit` exits, and `//text` sends message text beginning with `/`.
 
-Before reading each input line, chat drains the companion's queued incoming messages. Incoming
-display is not filtered to the selected destination. Input reading itself is blocking, so a newly
-queued message is displayed before the next line rather than concurrently while the process waits
-for typing.
+Blank lines are ignored. Unknown or malformed commands produce a structured `command_error` and a
+close-command suggestion where one is safe; they are never sent as message text. Each input line is
+bounded to 4096 UTF-8 bytes before allocation. The actual device text limit is usually lower and is
+validated separately.
+
+Chat subscribes before connecting, drains the queued inbox while applying the bounded live/queued
+occurrence correlation described above, then keeps the event stream active while a dedicated
+bounded reader waits for keyboard or piped input. Incoming messages are therefore displayed while
+the user is typing. Incoming display is not filtered to the selected destination, but `/history` is
+conversation-filtered.
 
 Direct chat reports `sent` after companion acceptance, then waits once for the matching delivery
 ACK and reports `acknowledged` or `timed_out`. The deadline is the smaller of the firmware
 suggestion and global `--timeout`. An ACK timeout keeps the chat loop alive without retransmitting
 the message. Numeric channel chat has no direct ACK tracking and reports only `sent`.
 
-### One-shot reconnect without automatic resend
+### Bounded reconnect without automatic resend
 
-Reconnect handling is limited to a reconnectable failure while chat is attempting an outbound
-send or waiting for its ACK. For a failure before companion acceptance, Meshquill:
+Chat never automatically resends. It uses the same three-attempt companion reconnect policy as
+`watch` after a disconnect event, a reconnectable failure while attempting an outbound send, or a
+reconnectable ACK wait failure. It re-establishes only the session and never invokes the failed
+mutation. For a failure before companion acceptance was observed, Meshquill:
 
 1. marks that outgoing attempt failed in enabled history;
 2. records the workflow disconnect;
-3. attempts one reconnect and fresh handshake;
-4. retains the unsent text if reconnect succeeds; and
-5. requires `/send` before transmitting the retained draft.
+3. makes up to three bounded reconnect attempts and a fresh handshake;
+4. retains the exact unconfirmed text and its original destination if reconnect succeeds; and
+5. blocks new message text until `/send` starts a new explicit send or `/discard` drops the retained
+   message. Switching the visible target does not retarget it.
+
+The original wire outcome can be ambiguous: `/send` can duplicate delivery if the write succeeded
+but the companion response was lost. `/discard` avoids that risk.
 
 If a reconnectable ACK wait fails after `sent`, Meshquill marks the tracking attempt failed and
-attempts the same single reconnect, but does not retain or retransmit the already-sent message.
-There is no retry/backoff loop and no automatic retransmission, including after cancellation. If
-the single reconnect fails, chat exits. Failures while polling incoming messages do not use this
-outbound-send reconnect path.
+attempts the same bounded reconnect, but does not retain or retransmit the already-sent message.
+Cancellation never retransmits. If all attempts fail, the transport does not support reconnect, or
+the managed actor has stopped, chat exits rather than spinning.
 
 ## Plaintext local history
 
@@ -167,8 +197,14 @@ max_messages = 256
 The equivalent temporary overrides are `MESHQUILL_HISTORY_ENABLED=true` and
 `MESHQUILL_HISTORY_MAX_MESSAGES=256`. When enabled, Meshquill writes
 `history/<profile>.jsonl` beside the selected configuration. Each versioned record can contain the
-peer/source label, channel, full message text, direction, timestamp, status, and acknowledgement
-correlation. Statuses include `pending`, `acknowledged`, `timed_out`, `failed`, and `received`.
+peer/source label, channel, full message text, local direction and status, local-host record time,
+and acknowledgement correlation. Incoming records do not retain the sender timestamp, route, SNR,
+or signature. The stable `id` identifies only that local history record, not a MeshCore protocol
+message or event.
+
+Directions and statuses are local bookkeeping, not wire truth. `outgoing` means a local outgoing
+attempt, `pending` means no terminal local result was recorded, and `failed` means a local failure
+whose wire outcome may be ambiguous. Other statuses are `acknowledged`, `timed_out`, and `received`.
 
 `send`, `chat`, `inbox`, and incoming `watch` messages use this history workflow. A finite send
 without an acknowledgement wait and a channel chat acceptance remain `pending`; direct

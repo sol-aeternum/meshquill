@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "async-trait",
  "battalion-rumqttc",
@@ -1220,6 +1220,7 @@ dependencies = [
  "meshquill-store",
  "meshquill-test-support",
  "meshquill-transport",
+ "nix 0.31.3",
  "rpassword",
  "secrecy",
  "serde",
@@ -1237,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-core"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1254,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-hooks"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1266,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-mqtt"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "battalion-rumqttc",
  "meshquill-core",
@@ -1284,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-python"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "async-trait",
  "hex",
@@ -1299,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-store"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "keyring",
  "meshquill-hooks",
@@ -1315,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-test-support"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "async-trait",
  "meshquill-core",
@@ -1324,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "meshquill-transport"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "async-trait",
  "btleplug",

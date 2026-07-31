@@ -294,6 +294,12 @@ impl MqttConfig {
                 "is only supported by MQTT 5",
             ));
         }
+        if self.allow_send && !self.session.clean {
+            return Err(ConfigError::invalid(
+                "session.clean",
+                "must be true when allow_send is enabled because command deduplication is process-local",
+            ));
+        }
         validate_reconnect(self.reconnect)?;
         validate_dedupe(self.dedupe)?;
         validate_command_limits(self.command_limits, self.max_payload_bytes)?;
@@ -775,6 +781,34 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn inbound_sends_require_a_clean_broker_session() {
+        let config = MqttConfig {
+            allow_send: true,
+            session: SessionConfig {
+                clean: false,
+                expiry_secs: None,
+            },
+            ..MqttConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidField {
+                field: "session.clean",
+                ..
+            })
+        ));
+
+        let safe = MqttConfig {
+            session: SessionConfig {
+                clean: true,
+                expiry_secs: None,
+            },
+            ..config
+        };
+        assert!(safe.validate().is_ok());
     }
 
     #[test]

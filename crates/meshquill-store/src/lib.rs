@@ -24,6 +24,12 @@ pub const CONFIG_VERSION: u8 = 1;
 /// Config file name used by [`ConfigStore`].
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 
+/// Largest configuration document read from disk (one MiB).
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Largest caller-controlled operation timeout persisted in configuration (24 hours).
+pub const MAX_OPERATION_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+
 /// Directory containing explicitly enabled plaintext message-history files.
 pub const HISTORY_DIR_NAME: &str = "history";
 
@@ -181,12 +187,22 @@ impl ConfigStore {
             return Ok(LoadOutcome::Missing);
         }
 
-        let mut raw = String::new();
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .open(&self.path)
-            .and_then(|mut f| f.read_to_string(&mut raw))
             .map_err(StoreError::Io)?;
+        let mut raw = String::new();
+        file.take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
+            .read_to_string(&mut raw)
+            .map_err(StoreError::Io)?;
+        if u64::try_from(raw.len()).unwrap_or(u64::MAX) > MAX_CONFIG_FILE_BYTES {
+            return Err(StoreError::Validation {
+                field: "config.file".to_owned(),
+                message: format!(
+                    "configuration exceeds the {MAX_CONFIG_FILE_BYTES}-byte input bound"
+                ),
+            });
+        }
 
         let value: toml::Value = toml::from_str(&raw).map_err(|err| StoreError::Parse {
             path: self.path.clone(),
@@ -513,6 +529,9 @@ pub struct DeviceProfile {
 impl DeviceProfile {
     fn validate(&self) -> Result<(), StoreError> {
         self.transport.validate()?;
+        if let Some(overrides) = &self.transport_overrides {
+            overrides.validate()?;
+        }
         if let Some(secret) = &self.secret {
             secret.validate("device_profiles.secret")?;
         }
@@ -623,6 +642,21 @@ pub struct TransportOverrides {
     pub request_timeout_ms: Option<u64>,
 }
 
+impl TransportOverrides {
+    fn validate(&self) -> Result<(), StoreError> {
+        if self
+            .request_timeout_ms
+            .is_some_and(|value| !(1..=MAX_OPERATION_TIMEOUT_MS).contains(&value))
+        {
+            return Err(StoreError::Validation {
+                field: "device_profiles.transport_overrides.request_timeout_ms".to_owned(),
+                message: "must be between 1 and 86400000".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// Timeout knobs used by transport and request flow.
 pub struct TimeoutSettings {
@@ -661,13 +695,14 @@ impl Default for TimeoutSettings {
 
 impl TimeoutSettings {
     fn validate(&self) -> Result<(), StoreError> {
-        if self.connect_timeout_ms == 0
-            || self.request_timeout_ms == 0
-            || self.retry_timeout_ms == 0
+        if !(1..=MAX_OPERATION_TIMEOUT_MS).contains(&self.connect_timeout_ms)
+            || !(1..=MAX_OPERATION_TIMEOUT_MS).contains(&self.request_timeout_ms)
+            || !(1..=MAX_OPERATION_TIMEOUT_MS).contains(&self.retry_timeout_ms)
         {
             return Err(StoreError::Validation {
                 field: "timeout".to_string(),
-                message: "all timeout values must be positive".to_string(),
+                message: "all timeout values must be between 1 and 86400000 milliseconds"
+                    .to_string(),
             });
         }
         Ok(())
@@ -715,41 +750,44 @@ impl HistorySettings {
     }
 }
 
-/// Direction of a persisted message-history record.
+/// Local direction of a persisted message-history record.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryDirection {
-    /// Message received from the mesh.
+    /// Incoming message observation recorded locally.
     Incoming,
-    /// Message submitted to the companion for transmission.
+    /// Local outgoing attempt.
     Outgoing,
 }
 
-/// Delivery state retained for one optional local-history record.
+/// Local workflow state retained for one optional history record, not wire-delivery truth.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryStatus {
-    /// The companion accepted the message for transmission.
+    /// No terminal local result has been recorded for the outgoing attempt.
     Pending,
-    /// A matching acknowledgement arrived.
+    /// A matching acknowledgement was observed locally.
     Acknowledged,
-    /// The acknowledgement deadline expired.
+    /// The local acknowledgement deadline expired.
     TimedOut,
-    /// Sending failed before acknowledgement.
+    /// A local failure occurred; the wire outcome may be ambiguous.
     Failed,
-    /// The message was received from the mesh.
+    /// An incoming message observation was recorded locally.
     Received,
 }
 
 /// One versioned plaintext JSONL entry in the opt-in local message history.
+///
+/// Its timestamp is local-host record time. Sender timestamp, route, SNR, and signature are not
+/// retained.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
     /// On-disk record schema version.
     pub version: u8,
-    /// Stable event identifier used to update delivery state without duplicating an entry.
+    /// Stable local record ID used for status updates, not protocol or event identity.
     pub id: Uuid,
-    /// Host time in Unix milliseconds when the entry was first recorded.
+    /// Local-host time in Unix milliseconds when the entry was first recorded.
     pub recorded_at_unix_ms: u64,
     /// Incoming or outgoing direction.
     pub direction: HistoryDirection,
@@ -759,14 +797,14 @@ pub struct HistoryEntry {
     pub channel: Option<u8>,
     /// Plaintext message body. History is disabled by default because this is sensitive.
     pub text: String,
-    /// Current delivery state.
+    /// Current local workflow state, not wire-delivery truth.
     pub status: HistoryStatus,
     /// Optional non-secret companion acknowledgement correlation code.
     pub acknowledgement: Option<[u8; 4]>,
 }
 
 impl HistoryEntry {
-    /// Construct a validated record with a new sortable identifier and current host time.
+    /// Construct a validated record with a new sortable local ID and current local-host time.
     ///
     /// # Errors
     /// Returns [`StoreError::Validation`] for empty, NUL-containing, or oversized fields, an
@@ -963,7 +1001,7 @@ impl HistoryStore {
         Ok(entries)
     }
 
-    /// Insert a record or replace the matching event identifier, retaining newest entries only.
+    /// Insert a record or replace the matching local record ID, retaining newest entries only.
     ///
     /// # Errors
     /// Returns validation, I/O, serialization, or atomic replacement errors.
@@ -1189,10 +1227,11 @@ impl HookSettings {
                 message: "must not be empty".to_string(),
             });
         }
-        if self.timeout_ms == 0 || self.max_concurrency == 0 {
+        if !(1..=MAX_OPERATION_TIMEOUT_MS).contains(&self.timeout_ms) || self.max_concurrency == 0 {
             return Err(StoreError::Validation {
                 field: "hook".to_string(),
-                message: "timeout and concurrency must be positive".to_string(),
+                message: "timeout must be between 1 and 86400000 milliseconds and concurrency must be positive"
+                    .to_string(),
             });
         }
         if self.enabled {
@@ -1871,6 +1910,72 @@ mod tests {
         let text = assert_ok(config.to_toml_string(), "serialize config");
         let parsed: Config = assert_ok(toml::from_str(&text), "parse config");
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn config_file_input_bound_is_inclusive() {
+        let dir = assert_ok(TempDir::new(), "temp dir");
+        let store = ConfigStore::new(dir.path().join("config.toml"));
+        let maximum = usize::try_from(MAX_CONFIG_FILE_BYTES).expect("config bound fits usize");
+        let mut raw = "version = 1\n".to_owned();
+        raw.push_str(&"#".repeat(maximum.saturating_sub(raw.len())));
+        assert_eq!(raw.len(), maximum);
+        assert_ok(fs::write(store.path(), &raw), "write exact-bound config");
+        assert!(matches!(
+            store.load_with_overrides(&HashMap::new()),
+            Ok(LoadOutcome::Loaded(_))
+        ));
+
+        raw.push('#');
+        assert_ok(fs::write(store.path(), raw), "write oversized config");
+        assert!(matches!(
+            store.load_with_overrides(&HashMap::new()),
+            Err(StoreError::Validation { field, .. }) if field == "config.file"
+        ));
+    }
+
+    #[test]
+    fn persisted_timeout_bounds_are_strict() {
+        let mut config = Config {
+            timeout: TimeoutSettings {
+                connect_timeout_ms: MAX_OPERATION_TIMEOUT_MS,
+                request_timeout_ms: MAX_OPERATION_TIMEOUT_MS,
+                retry_timeout_ms: MAX_OPERATION_TIMEOUT_MS,
+            },
+            hook: HookSettings {
+                timeout_ms: MAX_OPERATION_TIMEOUT_MS,
+                ..HookSettings::default()
+            },
+            ..Config::default()
+        };
+        config.device_profiles.insert(
+            "bounded".to_owned(),
+            DeviceProfile {
+                transport: TransportConfig::Mock {
+                    scenario: "demo".to_owned(),
+                },
+                transport_overrides: Some(TransportOverrides {
+                    request_timeout_ms: Some(MAX_OPERATION_TIMEOUT_MS),
+                }),
+                secret: None,
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config.timeout.connect_timeout_ms = u64::MAX;
+        assert!(config.validate().is_err());
+        config.timeout.connect_timeout_ms = MAX_OPERATION_TIMEOUT_MS;
+        config.hook.timeout_ms = MAX_OPERATION_TIMEOUT_MS.saturating_add(1);
+        assert!(config.validate().is_err());
+        config.hook.timeout_ms = MAX_OPERATION_TIMEOUT_MS;
+        config
+            .device_profiles
+            .get_mut("bounded")
+            .expect("bounded profile")
+            .transport_overrides = Some(TransportOverrides {
+            request_timeout_ms: Some(0),
+        });
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -1,9 +1,11 @@
 # Getting started
 
-Meshquill `0.1.0-rc.1` is a pre-release command-line client. No crates.io package, Python package,
-or downloadable binary archive has been published from this repository. The commands below use a
-binary built from the current checkout. Physical BLE and serial verification has not yet been run;
-the deterministic demo is software-only. See [current status](../STATUS.md) and the
+Meshquill `0.1.0-rc.2` is a pre-release command-line client in the current source checkout. Until
+[current status](../STATUS.md) records a published `v0.1.0-rc.2` prerelease, its GitHub tag,
+checksummed assets and tagged-install commands are future delivery paths, and no crates.io or PyPI
+package is assumed available. Build the current checkout below; [installation](installation.md)
+also documents the conditional release-asset flow. Physical BLE and serial verification has not
+yet been run; the deterministic demo is software-only. See the
 [hardware matrix](hardware-testing.md) for the recorded evidence.
 
 ## Build the CLI from this checkout
@@ -70,9 +72,10 @@ $ meshquill --profile demo chat Alice --line
 ```
 
 The demo's queued incoming message is displayed before the first input line. Type `hello` to send,
-then `/quit` to exit. Every other non-empty line is sent. See
-[messaging and chat](messaging-and-chat.md) for channel targets, incoming-message polling, and the
-one-shot reconnect behavior.
+then `/quit` to exit. Other slash-prefixed lines are chat commands; ordinary non-empty lines are
+message text. See
+[messaging and chat](messaging-and-chat.md) for channel targets, concurrent incoming events, chat
+commands, and bounded reconnect behavior.
 
 ## Create a physical or TCP profile
 

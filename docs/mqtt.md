@@ -35,6 +35,8 @@ meshquill --profile demo --output jsonl mqtt bridge
 The bridge is a foreground streaming command and requires `--output jsonl` for machine output.
 Ctrl-C stops both the MeshCore client and broker session. Broker reconnect uses bounded exponential
 backoff. The application never retransmits a radio message merely because the device reconnects.
+MQTT 3.1.1 and MQTT 5 are both supported; protocol selection changes the broker session, not the
+versioned application payload schema.
 
 ## Safe outbound commands
 
@@ -55,6 +57,12 @@ For a channel, use `"type":"send_channel"` and
 event IDs, unknown fields, malformed/oversized payloads, invalid destinations, channels above 7,
 and any non-allowlisted type. The default duplicate cache retains 4096 IDs for 15 minutes.
 
+Deduplication is deliberately process-local. A configuration with `allow_send = true` therefore
+must use a clean broker session; validation rejects a persistent session that could redeliver old
+commands after the process cache is lost. Broker credentials and mTLS identify the client, but the
+broker's topic ACL remains a security boundary: grant publish access to the outbound topic only to
+the operators that are allowed to cause radio sends.
+
 ## Topics and payloads
 
 See [the v1 schema reference](reference/mqtt-schema-v1.md). Under a configured prefix `P`, the
@@ -73,5 +81,13 @@ explicitly enabled. MQTT QoS improves broker delivery semantics; it is not a Mes
 
 Unit tests cover TLS configuration, credentials, topic validation, schemas, payload bounds,
 allowlisting, loop prevention, duplicate expiry, both MQTT protocol versions and reconnect bounds.
-The ignored integration suites run against a disposable Eclipse Mosquitto 2 broker in CI; the
-release-candidate host run and exact command are recorded in [STATUS.md](../STATUS.md).
+The ignored CI integration suite is designed to use digest-pinned disposable Eclipse Mosquitto 2
+brokers and assert real publish/subscribe command round trips over MQTT 3.1.1 and MQTT 5, the
+CLI-to-radio allowlist bridge, and a secured broker requiring a private CA, username/password and
+client certificate. The secured case is designed to assert that unrelated trust roots, a wrong
+password, a missing client identity and a mismatched server name do not reach `Connected`.
+
+Broker-restart behavior is covered by the maintained client's reconnect state machine and bounded
+unit tests, but this RC does not claim a live container-restart endurance test. Until
+[STATUS.md](../STATUS.md) records a fresh successful RC2 CI run, the integration-suite description
+above is validation design, not a claim that RC2 executed it.

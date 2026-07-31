@@ -2,7 +2,11 @@
 
 ## Release archives
 
-The `v0.1.0-rc.1` workflow builds:
+No `v0.1.0-rc.2` tag or public prerelease is claimed by this source snapshot. Until
+[status](../STATUS.md) records that publication, build the current checkout; the asset names and
+downloaded-archive commands in this section describe the future RC2 delivery.
+
+When run for the `v0.1.0-rc.2` tag, the release workflow builds:
 
 | Target | Archive | Build/runtime note |
 | --- | --- | --- |
@@ -16,13 +20,14 @@ The macOS and Windows artifacts are not code-signed in this RC. Their older-OS m
 been independently hardware-tested. Each archive has a sibling `.sha256`; the release also contains
 `SHA256SUMS` covering native archives and Python wheels.
 
-Verify and install a Unix archive:
+After the prerelease is published, download both the archive and its sibling `.sha256` asset, then
+verify and install a Unix archive:
 
 ```console
-sha256sum --check meshquill-v0.1.0-rc.1-x86_64-unknown-linux-gnu.tar.gz.sha256
-# macOS: shasum -a 256 -c meshquill-v0.1.0-rc.1-x86_64-apple-darwin.tar.gz.sha256
-tar -xzf meshquill-v0.1.0-rc.1-x86_64-unknown-linux-gnu.tar.gz
-cd meshquill-v0.1.0-rc.1-x86_64-unknown-linux-gnu
+sha256sum --check meshquill-v0.1.0-rc.2-x86_64-unknown-linux-gnu.tar.gz.sha256
+# macOS: shasum -a 256 -c meshquill-v0.1.0-rc.2-x86_64-apple-darwin.tar.gz.sha256
+tar -xzf meshquill-v0.1.0-rc.2-x86_64-unknown-linux-gnu.tar.gz
+cd meshquill-v0.1.0-rc.2-x86_64-unknown-linux-gnu
 ./bin/meshquill --version
 mkdir -p "$HOME/.local/bin"
 install -m 0755 bin/meshquill "$HOME/.local/bin/meshquill"
@@ -48,19 +53,22 @@ directory on `PATH`.
 
 ## Install with Cargo
 
-Rust 1.88 or newer is supported. Until the component crates are published to crates.io, install
-from the tagged Git repository:
-
-```console
-cargo install --locked --git https://github.com/sol-aeternum/meshquill \
-  --tag v0.1.0-rc.1 meshquill
-```
-
-From a checkout:
+Rust 1.88 or newer is supported. Install the current source checkout with:
 
 ```console
 cargo install --path crates/meshquill-cli --locked
 ```
+
+Only after [status](../STATUS.md) records that the `v0.1.0-rc.2` tag exists will this tagged-source
+command work:
+
+```console
+cargo install --locked --git https://github.com/sol-aeternum/meshquill \
+  --tag v0.1.0-rc.2 meshquill
+```
+
+Do not assume the unqualified crates.io `cargo install meshquill` route exists unless status records
+that separate registry publication.
 
 Linux build dependencies:
 
@@ -78,15 +86,23 @@ Bluetooth-service checks.
 
 ## Python wheel
 
-Install the wheel matching your platform from the release:
+For the currently available source checkout, use the source-build procedure in the
+[Python SDK guide](python-sdk.md#install). After status records a published RC2 GitHub prerelease,
+download the wheel matching your platform and install that file directly:
 
 ```console
-python -m pip install ./meshquill_sdk-0.1.0rc1-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc2-*.whl
 python -c "import meshcore_sdk; print(meshcore_sdk.__version__)"
 ```
 
-The wheel uses PyO3's `abi3-py39` interface and supports CPython 3.9+. See the
-[Python SDK guide](python-sdk.md) for source builds and a complete smoke test.
+That wheel uses PyO3's `abi3-py39` interface and supports CPython 3.9+. Only if status separately
+records the `0.1.0rc2` PyPI publication should the exact index install be used:
+
+```console
+python -m pip install --pre "meshquill-sdk==0.1.0rc2"
+```
+
+See the [Python SDK guide](python-sdk.md) for source builds and a complete smoke test.
 
 ## Isolated installation smoke test
 

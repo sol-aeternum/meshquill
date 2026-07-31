@@ -1,6 +1,10 @@
 /target/
 /fuzz/target/
-/fuzz/corpus/
+/fuzz/corpus/**
+!/fuzz/corpus/remote_payloads/
+!/fuzz/corpus/remote_payloads/**
+!/fuzz/corpus/mqtt_commands/
+!/fuzz/corpus/mqtt_commands/**
 /fuzz/artifacts/
 /.venv/
 /.pytest_cache/

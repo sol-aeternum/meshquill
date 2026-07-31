@@ -1,6 +1,6 @@
 # Production plan
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 This plan distinguishes locally completed release work from operations that require GitHub
 credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
@@ -31,8 +31,9 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
 - [x] Device, contact, channel, scope, messaging, ACK, history, remote, sensor, network, and batch
       operations with explicit destructive-action policy.
 - [x] Portable line chat with visible target, incoming indication, ACK state, nonfatal timeout, and
-      retained unsent draft. A full-screen TUI was deliberately deferred because it is not required
-      for a usable keyboard-only RC and would add terminal-state risk without hardware evidence.
+      retained unconfirmed draft with explicit resend/discard handling. A full-screen TUI was
+      deliberately deferred because it is not required for a usable keyboard-only RC and would add
+      terminal-state risk without hardware evidence.
 - [x] Doctor checks, completions, 77 man pages, examples, command suggestions, output contracts,
       redaction, and stable exit statuses.
 
@@ -61,21 +62,27 @@ credentials or physical hardware. Evidence is recorded in [STATUS](STATUS.md).
       abi3 wheel.
 - [x] Run the exact pushed commit through pre-tag CI on Linux x86-64, macOS Intel/ARM64, and Windows
       x86-64, plus Python, MSRV, fuzz, broker, documentation, audit, and licence gates.
-- [ ] Run the prepared GitHub Actions matrix on Linux x86-64/ARM64, macOS Intel/ARM64, and Windows
-      x86-64; inspect its five native archives and five wheels.
+- [x] Publish the public repository and immutable `v0.1.0-rc.1` tag; run and inspect its five native
+      archives and five wheels without moving or replacing the tag.
+- [x] Harden RC2 reconnect/no-replay behavior, bounded live/queued correlation with documented
+      collision limits, SIGINT cleanup, line chat, input/timeout/config bounds, output schemas,
+      remote/MQTT fuzzing, real-broker security cases, and exact Python tool pins.
+- [ ] Run RC2 pre-tag CI and supply-chain gates, push the annotated `v0.1.0-rc.2` tag, then run its
+      tagged Linux x86-64/ARM64, macOS Intel/ARM64, and Windows x86-64 artifact matrix; inspect all
+      five archives and five wheels without moving or replacing the tag.
 - [ ] Run the separate physical-hardware suite and add actual device/firmware/transport rows.
-- [ ] Publish the repository, push the annotated `v0.1.0-rc.1` tag, inspect the draft artifacts,
-      publish registry packages in dependency order, and publish the GitHub prerelease.
+- [ ] Inspect the RC2 draft artifacts, publish registry packages in dependency order when
+      credentials exist, and publish the GitHub prerelease regardless of independent registry
+      credential availability.
 
 ## Current blockers
 
 1. No physical MeshCore companion is exposed to the environment. BLE/USB/radio smoke testing cannot
    be represented by the deterministic or TCP-loopback results.
 2. No crates.io credential-provider token or PyPI upload token is available locally or in the
-   repository. The tagged artifact workflow and draft inspection can proceed with GitHub authority,
-   but registry and public prerelease publication cannot pass the runbook boundary without those
-   independently scoped credentials.
+   repository. This blocks only those two registry uploads; it does not block the tagged artifacts
+   or public GitHub prerelease.
 
-The GitHub repository now exists, authentication is active, and the pre-tag remote gates passed.
-Artifact and publication work proceeds in the exact order kept in
+The GitHub repository and RC1 draft exist, authentication is active, and the corrected RC2 source
+is being gated. Artifact and publication work proceeds in the exact order kept in
 [the release runbook](docs/release.md).

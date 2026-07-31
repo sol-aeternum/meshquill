@@ -19,7 +19,7 @@ pub mod remote;
 /// Transport trait definitions and in-process scripted transport implementation.
 pub mod transport;
 
-pub use client::Client;
+pub use client::{Client, MAX_OPERATION_TIMEOUT};
 pub use domain::{
     Ack, AdvertPath, AutoAddConfig, BatteryInfo, BinaryResponse, Contact, ContactRoute,
     ContactType, ContactUri, ControlData, CustomVariable, CustomVariables, DefaultFloodScope,

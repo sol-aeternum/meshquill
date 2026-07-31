@@ -34,7 +34,8 @@ pub enum EventKind {
 pub struct EventEnvelope {
     /// Exact schema identifier. It must equal `meshquill.mqtt/v1`.
     pub schema: String,
-    /// Globally unique event identity used for bounded deduplication.
+    /// Non-nil producer-assigned ID used as a bounded, process-local deduplication key. The producer
+    /// owns uniqueness.
     pub event_id: Uuid,
     /// Stable identifier of the producing application instance.
     pub origin: String,

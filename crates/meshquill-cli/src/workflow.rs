@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::config::SelectedProfile;
 use meshquill_core::{Message, domain::MessageSource};
@@ -10,8 +14,7 @@ use meshquill_hooks::{
 use meshquill_store::{
     HistoryDirection, HistoryEntry, HistoryStatus, HistoryStore, TransportConfig,
 };
-use sha2::{Digest, Sha256};
-use tokio::task;
+use tokio::{sync::Mutex, task};
 
 use crate::error::CliError;
 use crate::output::ExitStatus;
@@ -19,8 +22,63 @@ use crate::output::ExitStatus;
 pub(crate) struct WorkflowServices {
     hook_runtime: Option<HookRuntime>,
     history_store: Option<Arc<HistoryStore>>,
+    incoming_tracker: Arc<Mutex<IncomingTracker>>,
     transport_kind: &'static str,
     profile_name: String,
+}
+
+const INCOMING_CORRELATION_CAPACITY: usize = 256;
+const INCOMING_CORRELATION_WINDOW: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IncomingOrigin {
+    Live,
+    Queue,
+}
+
+#[derive(Debug)]
+struct IncomingOccurrence {
+    fingerprint: [u8; 32],
+    origin: IncomingOrigin,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct IncomingTracker {
+    occurrences: VecDeque<IncomingOccurrence>,
+}
+
+impl IncomingTracker {
+    fn observe(&mut self, fingerprint: [u8; 32], origin: IncomingOrigin) -> bool {
+        self.observe_at(fingerprint, origin, Instant::now())
+    }
+
+    fn observe_at(&mut self, fingerprint: [u8; 32], origin: IncomingOrigin, now: Instant) -> bool {
+        self.occurrences.retain(|occurrence| {
+            now.saturating_duration_since(occurrence.observed_at) <= INCOMING_CORRELATION_WINDOW
+        });
+
+        if let Some(position) = self.occurrences.iter().position(|occurrence| {
+            occurrence.fingerprint == fingerprint && occurrence.origin != origin
+        }) {
+            self.occurrences.remove(position);
+            return false;
+        }
+
+        if self.occurrences.len() == INCOMING_CORRELATION_CAPACITY {
+            self.occurrences.pop_front();
+        }
+        self.occurrences.push_back(IncomingOccurrence {
+            fingerprint,
+            origin,
+            observed_at: now,
+        });
+        true
+    }
+
+    fn clear(&mut self) {
+        self.occurrences.clear();
+    }
 }
 
 #[derive(Debug)]
@@ -70,6 +128,7 @@ impl WorkflowServices {
         Ok(Self {
             hook_runtime,
             history_store,
+            incoming_tracker: Arc::new(Mutex::new(IncomingTracker::default())),
             transport_kind: transport_kind(&selected.profile.transport),
             profile_name: selected.name.clone(),
         })
@@ -101,7 +160,15 @@ impl WorkflowServices {
         }
     }
 
+    pub(crate) async fn load_history(&self) -> Result<Option<Vec<HistoryEntry>>, CliError> {
+        let Some(store) = &self.history_store else {
+            return Ok(None);
+        };
+        load_history(store).await.map(Some)
+    }
+
     pub(crate) async fn connected(&self, peer: &str) -> Result<(), CliError> {
+        self.incoming_tracker.lock().await.clear();
         let peer = if peer.is_empty() {
             Some(self.profile_name.clone())
         } else {
@@ -168,13 +235,14 @@ impl WorkflowServices {
         destination: &str,
         text: &str,
         message_id: &str,
-        ack_code: [u8; 4],
+        ack_code: Option<[u8; 4]>,
     ) -> Result<(), CliError> {
         if let Some(store) = &self.history_store
             && let Some(history_id) = record.history_message_id()
             && let Some(mut entry) = load_history_entry(store, history_id).await?
         {
-            entry.acknowledgement = Some(ack_code);
+            entry.peer = destination.to_owned();
+            entry.acknowledgement = ack_code;
             store_upsert(store, &entry).await?;
         }
 
@@ -267,8 +335,29 @@ impl WorkflowServices {
         Ok(())
     }
 
-    pub(crate) async fn incoming(&self, message: &Message) -> Result<String, CliError> {
-        let id = incoming_message_id(message);
+    /// Records one incoming-message observation unless heuristically coalesced with a likely
+    /// duplicate delivery observation from the opposite path.
+    ///
+    /// A matching payload fingerprint pairs only one live and one queued observation within the
+    /// current connection, five seconds, and 256 retained entries. Each match consumes one entry,
+    /// preserving multiplicity; same-path repeats remain distinct. Because `MeshCore` supplies no
+    /// globally unique message ID, a distinct identical opposite-path occurrence can collide. A
+    /// match is not proof of the same occurrence or a retransmission.
+    pub(crate) async fn incoming(
+        &self,
+        message: &Message,
+        origin: IncomingOrigin,
+    ) -> Result<Option<String>, CliError> {
+        let is_new = self
+            .incoming_tracker
+            .lock()
+            .await
+            .observe(message.delivery_fingerprint(), origin);
+        if !is_new {
+            return Ok(None);
+        }
+
+        let id = uuid::Uuid::now_v7().to_string();
         if let Some(store) = &self.history_store {
             let peer = message_source(message);
             let channel = match message.source {
@@ -301,7 +390,7 @@ impl WorkflowServices {
                 .map_err(CliError::from)?;
         }
 
-        Ok(id)
+        Ok(Some(id))
     }
 
     pub(crate) async fn contact_updated(
@@ -351,31 +440,6 @@ fn message_source(message: &Message) -> String {
         MessageSource::Direct { pubkey_prefix } => format!("direct:{pubkey_prefix}"),
         MessageSource::Channel { channel_idx } => format!("channel:{channel_idx}"),
     }
-}
-
-fn incoming_message_id(message: &Message) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(message_source(message).as_bytes());
-    hasher.update([message.txt_type]);
-    match message.route {
-        meshquill_core::MessageRoute::Direct => hasher.update([0]),
-        meshquill_core::MessageRoute::Path {
-            hash_mode,
-            hop_count,
-        } => hasher.update([1, hash_mode, hop_count]),
-    }
-    hasher.update(message.sender_timestamp.to_le_bytes());
-    hasher.update([u8::from(message.signature.is_some())]);
-    if let Some(signature) = message.signature {
-        hasher.update(signature);
-    }
-    hasher.update(message.text.as_bytes());
-
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hasher.finalize()[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x80;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    uuid::Uuid::from_bytes(bytes).to_string()
 }
 
 async fn load_history_entry(
@@ -452,7 +516,10 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{WorkflowServices, history_store_for_selected};
+    use super::{
+        INCOMING_CORRELATION_CAPACITY, INCOMING_CORRELATION_WINDOW, IncomingOrigin,
+        IncomingTracker, WorkflowServices, history_store_for_selected,
+    };
     use crate::config::SelectedProfile;
 
     fn selected_profile(history_enabled: bool) -> (tempfile::TempDir, SelectedProfile) {
@@ -490,12 +557,19 @@ mod tests {
             .expect("prepare send");
         assert_eq!(prepared.destination, "alice");
         assert_eq!(prepared.text, "ping");
+        assert!(
+            services
+                .load_history()
+                .await
+                .expect("disabled history query")
+                .is_none()
+        );
 
         assert!(dir.path().read_dir().expect("read dir").next().is_none());
     }
 
     #[tokio::test]
-    async fn incoming_messages_are_deduplicated_by_deterministic_uuid() {
+    async fn repeated_same_origin_messages_are_preserved_as_distinct_occurrences() {
         let (_dir, selected) = selected_profile(true);
         let services = WorkflowServices::from_selected(&selected).expect("service");
 
@@ -512,44 +586,172 @@ mod tests {
             status: MessageStatus::Received,
         };
 
-        let first = services.incoming(&message).await.expect("first incoming");
-        let second = services.incoming(&message).await.expect("second incoming");
+        let first = services
+            .incoming(&message, IncomingOrigin::Live)
+            .await
+            .expect("first incoming")
+            .expect("first occurrence");
+        let second = services
+            .incoming(&message, IncomingOrigin::Live)
+            .await
+            .expect("second incoming")
+            .expect("second occurrence");
 
         let store = history_store_for_selected(&selected, true)
             .expect("history configuration")
             .expect("history");
         let entries = store.load().expect("load history");
 
-        assert_eq!(first, second);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id.to_string(), first);
-        assert_eq!(entries[0].direction, HistoryDirection::Incoming);
-        assert_eq!(entries[0].id.as_bytes()[6] >> 4, 8);
+        assert_ne!(first, second);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| {
+            entry.direction == HistoryDirection::Incoming && entry.id.as_bytes()[6] >> 4 == 7
+        }));
     }
 
     #[tokio::test]
-    async fn outgoing_pending_then_acknowledged_updates_without_duplicates() {
+    async fn live_and_queued_views_of_one_occurrence_are_correlated_once() {
         let (_dir, selected) = selected_profile(true);
         let services = WorkflowServices::from_selected(&selected).expect("service");
+        let direct = meshquill_core::Message {
+            source: meshquill_core::domain::MessageSource::Direct {
+                pubkey_prefix: "peer123".to_owned(),
+            },
+            route: MessageRoute::Direct,
+            txt_type: 0,
+            sender_timestamp: 9,
+            signature: Some([0xde, 0xad, 0xbe, 0xef]),
+            text: "hello".to_owned(),
+            snr: None,
+            status: MessageStatus::Received,
+        };
+        let rerouted = meshquill_core::Message {
+            route: MessageRoute::Path {
+                hash_mode: 1,
+                hop_count: 3,
+            },
+            snr: Some(-2.5),
+            ..direct.clone()
+        };
 
-        let mut record = services
-            .begin_outgoing("alice", None, "outbound")
+        let first = services
+            .incoming(&direct, IncomingOrigin::Live)
             .await
-            .expect("begin outgoing");
-        let ack = [0x01, 0x02, 0x03, 0x04];
-
-        services
-            .sent(&mut record, "alice", "outbound", "message-id-1", ack)
+            .expect("first incoming");
+        let second = services
+            .incoming(&rerouted, IncomingOrigin::Queue)
             .await
-            .expect("sent");
+            .expect("rerouted incoming");
+        assert!(first.is_some());
+        assert!(second.is_none());
 
         let store = history_store_for_selected(&selected, true)
             .expect("history configuration")
             .expect("history");
+        assert_eq!(store.load().expect("load history").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_starts_a_fresh_incoming_correlation_scope() {
+        let (_dir, selected) = selected_profile(true);
+        let services = WorkflowServices::from_selected(&selected).expect("service");
+        let message = meshquill_core::Message {
+            source: meshquill_core::domain::MessageSource::Channel { channel_idx: 1 },
+            route: MessageRoute::Direct,
+            txt_type: 0,
+            sender_timestamp: 9,
+            signature: None,
+            text: "same text".to_owned(),
+            snr: None,
+            status: MessageStatus::Received,
+        };
+
+        assert!(
+            services
+                .incoming(&message, IncomingOrigin::Live)
+                .await
+                .expect("live message")
+                .is_some()
+        );
+        services
+            .connected("reconnected peer")
+            .await
+            .expect("connect");
+        assert!(
+            services
+                .incoming(&message, IncomingOrigin::Queue)
+                .await
+                .expect("queued message")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn incoming_tracker_pairs_only_opposite_origin_occurrences() {
+        let mut tracker = IncomingTracker::default();
+        let first = [0x11; 32];
+        assert!(tracker.observe(first, IncomingOrigin::Queue));
+        assert!(!tracker.observe(first, IncomingOrigin::Live));
+
+        let repeated = [0x22; 32];
+        assert!(tracker.observe(repeated, IncomingOrigin::Live));
+        assert!(tracker.observe(repeated, IncomingOrigin::Live));
+        assert!(!tracker.observe(repeated, IncomingOrigin::Queue));
+        assert!(!tracker.observe(repeated, IncomingOrigin::Queue));
+    }
+
+    #[test]
+    fn incoming_tracker_expires_and_evicts_bounded_correlation_state() {
+        let mut tracker = IncomingTracker::default();
+        let start = std::time::Instant::now();
+        let expired = [0x33; 32];
+        assert!(tracker.observe_at(expired, IncomingOrigin::Live, start));
+        assert!(tracker.observe_at(
+            expired,
+            IncomingOrigin::Queue,
+            start + INCOMING_CORRELATION_WINDOW + std::time::Duration::from_nanos(1),
+        ));
+
+        tracker.clear();
+        for value in 0..=INCOMING_CORRELATION_CAPACITY {
+            let mut fingerprint = [0_u8; 32];
+            fingerprint[..8].copy_from_slice(&value.to_le_bytes());
+            assert!(tracker.observe(fingerprint, IncomingOrigin::Live));
+        }
+        assert_eq!(tracker.occurrences.len(), INCOMING_CORRELATION_CAPACITY);
+        assert!(tracker.observe([0_u8; 32], IncomingOrigin::Queue));
+    }
+
+    #[tokio::test]
+    async fn outgoing_query_is_canonicalized_then_acknowledged_without_duplicates() {
+        let (_dir, selected) = selected_profile(true);
+        let services = WorkflowServices::from_selected(&selected).expect("service");
+
+        let mut record = services
+            .begin_outgoing("2222", None, "outbound")
+            .await
+            .expect("begin outgoing");
+        let ack = [0x01, 0x02, 0x03, 0x04];
+        let store = history_store_for_selected(&selected, true)
+            .expect("history configuration")
+            .expect("history");
+        let pending = store.load().expect("load pending history");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].peer, "2222");
+        assert_eq!(pending[0].text, "outbound");
+        assert_eq!(pending[0].acknowledgement, None);
+
+        services
+            .sent(&mut record, "Alice", "outbound", "message-id-1", Some(ack))
+            .await
+            .expect("sent");
+
         let after_send = store.load().expect("load history");
         assert_eq!(after_send.len(), 1);
         assert_eq!(after_send[0].status, HistoryStatus::Pending);
         assert_eq!(after_send[0].acknowledgement, Some(ack));
+        assert_eq!(after_send[0].peer, "Alice");
+        assert_eq!(after_send[0].text, "outbound");
 
         services
             .acknowledged(&mut record, "message-id-1", Some("demo"), Some(17), ack)
@@ -564,6 +766,30 @@ mod tests {
         let after_ack = store.load().expect("load history");
         assert_eq!(after_ack.len(), 1);
         assert_eq!(after_ack[0].status, HistoryStatus::Acknowledged);
+    }
+
+    #[tokio::test]
+    async fn channel_send_keeps_acknowledgement_empty() {
+        let (_dir, selected) = selected_profile(true);
+        let services = WorkflowServices::from_selected(&selected).expect("service");
+
+        let mut record = services
+            .begin_outgoing("7", Some(7), "channel outbound")
+            .await
+            .expect("begin outgoing");
+        services
+            .sent(&mut record, "7", "channel outbound", "message-id-2", None)
+            .await
+            .expect("sent");
+
+        let store = history_store_for_selected(&selected, true)
+            .expect("history configuration")
+            .expect("history");
+        let entries = store.load().expect("load history");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].channel, Some(7));
+        assert_eq!(entries[0].acknowledgement, None);
+        assert_eq!(entries[0].text, "channel outbound");
     }
 
     #[tokio::test]

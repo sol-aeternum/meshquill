@@ -6,17 +6,20 @@ the same implementation used by the native CLI; the package has no runtime depen
 legacy Python MeshCore client.
 
 The API supports CPython 3.9 and newer through one stable-ABI wheel per operating-system and CPU
-target. The RC wheels are attached to the GitHub release after its release workflow completes.
+target. The release workflow stages those wheels in a private draft. Until
+[current status](../STATUS.md) records a published RC2 prerelease, build the source checkout; a
+successful workflow draft alone is not a public download.
 
 ## Install
 
-Install a downloaded wheel in an isolated environment:
+After current status records a published prerelease, install a downloaded wheel in an isolated
+environment:
 
 ```console
 python -m venv .venv
 . .venv/bin/activate
 # Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install ./meshquill_sdk-0.1.0rc1-*.whl
+python -m pip install ./meshquill_sdk-0.1.0rc2-*.whl
 python -c "import meshcore_sdk; print(meshcore_sdk.__version__)"
 ```
 
@@ -26,10 +29,14 @@ listed in [installation](installation.md), then run:
 ```console
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install "maturin>=1.9,<2"
 cd crates/meshquill-python
+python -m pip install --requirement requirements-dev.txt
 maturin develop --locked
 ```
+
+The requirements file and package metadata exactly pin direct build/test tools. Cargo is locked;
+Python transitive dependencies are resolved and audited in CI but are not represented by a fully
+resolved checked-in lockfile in this RC.
 
 ## First message
 

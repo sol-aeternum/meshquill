@@ -2,11 +2,13 @@
 
 use std::error::Error;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use meshquill_mqtt::{
-    AcceptedCommand, EventEnvelope, EventKind, GatewayHandle, GatewayNotice, GatewayRunner,
-    MqttConfig, Publication, SCHEMA_VERSION, SendCommand, TelemetryData, TlsConfig, TopicSet,
+    AcceptedCommand, ConnectionStatus, EventEnvelope, EventKind, GatewayHandle, GatewayNotice,
+    GatewayRunner, MqttConfig, MqttPassword, MqttProtocol, Publication, SCHEMA_VERSION,
+    SendCommand, TelemetryData, TlsConfig, TopicSet,
 };
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use tokio::sync::mpsc;
@@ -32,6 +34,40 @@ impl BrokerTestSettings {
             .parse()?;
         Ok(Self { host, port })
     }
+}
+
+struct SecuredBrokerTestSettings {
+    broker: BrokerTestSettings,
+    wrong_host: String,
+    ca_path: PathBuf,
+    wrong_ca_path: PathBuf,
+    client_certificate_path: PathBuf,
+    client_private_key_path: PathBuf,
+    username: String,
+    password: String,
+}
+
+impl SecuredBrokerTestSettings {
+    fn from_env() -> TestResult<Self> {
+        Ok(Self {
+            broker: BrokerTestSettings {
+                host: required_env("MESHQUILL_MQTT_SECURE_TEST_HOST")?,
+                port: required_env("MESHQUILL_MQTT_SECURE_TEST_PORT")?.parse()?,
+            },
+            wrong_host: required_env("MESHQUILL_MQTT_SECURE_TEST_WRONG_HOST")?,
+            ca_path: required_env("MESHQUILL_MQTT_SECURE_TEST_CA")?.into(),
+            wrong_ca_path: required_env("MESHQUILL_MQTT_SECURE_TEST_WRONG_CA")?.into(),
+            client_certificate_path: required_env("MESHQUILL_MQTT_SECURE_TEST_CLIENT_CERT")?.into(),
+            client_private_key_path: required_env("MESHQUILL_MQTT_SECURE_TEST_CLIENT_KEY")?.into(),
+            username: required_env("MESHQUILL_MQTT_SECURE_TEST_USERNAME")?,
+            password: required_env("MESHQUILL_MQTT_SECURE_TEST_PASSWORD")?,
+        })
+    }
+}
+
+fn required_env(name: &'static str) -> TestResult<String> {
+    std::env::var(name)
+        .map_err(|_| io::Error::other(format!("set {name} to run this Mosquitto test")).into())
 }
 
 enum ObserverNotice {
@@ -116,9 +152,7 @@ async fn wait_for_gateway_command(handle: &mut GatewayHandle) -> TestResult<Acce
     }
 }
 
-#[tokio::test]
-#[ignore = "requires a real Mosquitto broker configured through MESHQUILL_MQTT_TEST_HOST"]
-async fn mosquitto_roundtrip_uses_real_subscription_and_publication() -> TestResult {
+async fn run_roundtrip(protocol: MqttProtocol) -> TestResult {
     let broker = BrokerTestSettings::from_env()?;
     let namespace = format!("meshquill-test/{}", Uuid::now_v7());
     let topics = TopicSet::new(&namespace)?;
@@ -146,6 +180,7 @@ async fn mosquitto_roundtrip_uses_real_subscription_and_publication() -> TestRes
         host: broker.host,
         port: broker.port,
         client_id: format!("meshquill-gateway-{}", Uuid::now_v7()),
+        protocol,
         tls: TlsConfig {
             enabled: false,
             ..TlsConfig::default()
@@ -212,5 +247,126 @@ async fn mosquitto_roundtrip_uses_real_subscription_and_publication() -> TestRes
     tokio::time::timeout(Duration::from_secs(10), runner_task).await???;
     observer_cancellation.cancel();
     tokio::time::timeout(Duration::from_secs(10), observer_task).await??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a real Mosquitto broker configured through MESHQUILL_MQTT_TEST_HOST"]
+async fn mosquitto_v311_roundtrip_uses_real_subscription_and_publication() -> TestResult {
+    run_roundtrip(MqttProtocol::V311).await
+}
+
+#[tokio::test]
+#[ignore = "requires a real Mosquitto broker configured through MESHQUILL_MQTT_TEST_HOST"]
+async fn mosquitto_v5_roundtrip_uses_real_subscription_and_publication() -> TestResult {
+    run_roundtrip(MqttProtocol::V5).await
+}
+
+fn secure_config(settings: &SecuredBrokerTestSettings, host: String) -> MqttConfig {
+    MqttConfig {
+        host,
+        port: settings.broker.port,
+        client_id: format!("meshquill-secure-test-{}", Uuid::now_v7()),
+        tls: TlsConfig {
+            enabled: true,
+            verify_server_certificate: true,
+            ca_path: Some(settings.ca_path.clone()),
+            client_certificate_path: Some(settings.client_certificate_path.clone()),
+            client_private_key_path: Some(settings.client_private_key_path.clone()),
+        },
+        username: Some(settings.username.clone()),
+        topic_prefix: format!("meshquill-secure-test/{}", Uuid::now_v7()),
+        origin: format!("secure-gateway-{}", Uuid::now_v7()),
+        ..MqttConfig::default()
+    }
+}
+
+async fn gateway_connects_within(
+    config: MqttConfig,
+    password: MqttPassword,
+    limit: Duration,
+) -> TestResult<bool> {
+    let cancellation = CancellationToken::new();
+    let (mut handle, runner) =
+        GatewayRunner::connect(config, Some(password), cancellation.clone()).await?;
+    let runner_task = tokio::spawn(runner.run());
+    let connected = tokio::time::timeout(limit, async {
+        while let Some(notice) = handle.recv_notice().await {
+            if matches!(
+                notice,
+                GatewayNotice::BrokerState(ConnectionStatus::Connected)
+            ) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    handle.cancel();
+    tokio::time::timeout(Duration::from_secs(10), runner_task).await???;
+    Ok(connected)
+}
+
+#[tokio::test]
+#[ignore = "requires the secured broker configured through MESHQUILL_MQTT_SECURE_TEST_*"]
+async fn mosquitto_tls_auth_and_mtls_enforce_all_peer_checks() -> TestResult {
+    let settings = SecuredBrokerTestSettings::from_env()?;
+    let connection_limit = Duration::from_secs(3);
+
+    assert!(
+        gateway_connects_within(
+            secure_config(&settings, settings.broker.host.clone()),
+            MqttPassword::new(settings.password.clone())?,
+            connection_limit,
+        )
+        .await?,
+        "the valid CA, server name, username/password, and client identity must connect"
+    );
+
+    let mut wrong_trust = secure_config(&settings, settings.broker.host.clone());
+    wrong_trust.tls.ca_path = Some(settings.wrong_ca_path.clone());
+    assert!(
+        !gateway_connects_within(
+            wrong_trust,
+            MqttPassword::new(settings.password.clone())?,
+            connection_limit,
+        )
+        .await?,
+        "a client trusting a different CA must not connect"
+    );
+
+    assert!(
+        !gateway_connects_within(
+            secure_config(&settings, settings.broker.host.clone()),
+            MqttPassword::new("definitely-the-wrong-password")?,
+            connection_limit,
+        )
+        .await?,
+        "invalid broker credentials must not connect"
+    );
+
+    let mut missing_client_identity = secure_config(&settings, settings.broker.host.clone());
+    missing_client_identity.tls.client_certificate_path = None;
+    missing_client_identity.tls.client_private_key_path = None;
+    assert!(
+        !gateway_connects_within(
+            missing_client_identity,
+            MqttPassword::new(settings.password.clone())?,
+            connection_limit,
+        )
+        .await?,
+        "a broker requiring mTLS must reject a missing client identity"
+    );
+
+    assert!(
+        !gateway_connects_within(
+            secure_config(&settings, settings.wrong_host.clone()),
+            MqttPassword::new(settings.password)?,
+            connection_limit,
+        )
+        .await?,
+        "the server certificate must not validate for a different host name"
+    );
     Ok(())
 }

@@ -5,34 +5,38 @@ companion devices. It provides BLE, USB serial and TCP transports, clear interac
 interfaces, trusted local Python hooks, and an optional application-level MQTT gateway. The native
 CLI does not require Python.
 
-This repository is prepared as `v0.1.0-rc.1`. Its protocol model is based on MeshCore companion
-firmware v1.16.0, `meshcore_py` v2.3.8 and current upstream source pinned on 2026-07-30. No physical
-radio was available in the build environment, so BLE/serial/TCP code is simulated and host-tested
-but **not claimed as hardware-verified**. See [status and evidence](STATUS.md) and the
+The current source checkout identifies as `0.1.0-rc.2`; no corresponding tag or public RC2
+prerelease is claimed until [status and evidence](STATUS.md) records it. Its protocol model is based
+on MeshCore companion firmware v1.16.0, `meshcore_py` v2.3.8 and current upstream source pinned on
+2026-07-30. No physical radio was available in the build environment, so BLE/serial/TCP code is
+simulated and host-tested but **not claimed as hardware-verified**. See the
 [hardware matrix](docs/hardware-testing.md).
 
 ## Install
 
-Published release archives contain the binary, four shell completions, man pages, licences and a
-checksum. After the repository and RC tag are pushed:
-
-```console
-cargo install --locked --git https://github.com/sol-aeternum/meshquill \
-  --tag v0.1.0-rc.1 meshquill
-```
-
-From a source checkout:
+The currently available installation path is the source checkout:
 
 ```console
 cargo install --path crates/meshquill-cli --locked
+```
+
+After [status](STATUS.md) records a published `v0.1.0-rc.2` prerelease, its archives will contain
+the binary, four shell completions, man pages and licences. Each checksum is a separate sibling
+`.sha256` release asset; `SHA256SUMS` is another release asset covering the native archives and
+Python wheels. The tagged-source installation will then be:
+
+```console
+cargo install --locked --git https://github.com/sol-aeternum/meshquill \
+  --tag v0.1.0-rc.2 meshquill
 ```
 
 Linux source builds need a C compiler, `pkg-config`, D-Bus development headers and libudev
 development headers. Enabling libudev keeps serial enumeration fallible instead of relying on an
 upstream `/sys` fallback that can panic in restricted containers. Debian/Ubuntu uses
 `libdbus-1-dev libudev-dev pkg-config`.
-Release binaries are built for Linux x86-64/ARM64, macOS Intel/Apple Silicon and Windows x86-64;
-the exact runtime baselines and clean-install procedure are in [installation](docs/installation.md).
+The RC2 workflow is configured to build release binaries for Linux x86-64/ARM64, macOS
+Intel/Apple Silicon and Windows x86-64; the exact runtime baselines and conditional clean-install
+procedure are in [installation](docs/installation.md).
 
 ## First connection and message
 
@@ -83,9 +87,10 @@ radio transmission.
 
 Direct sends can wait for an acknowledgement; channel sends use `--channel`. `watch` emits live
 messages, ACKs, contact changes, telemetry, connection changes and sanitized errors. The portable
-line chat keeps the destination visible, reports delivery state, drains incoming events between
-input lines, and retains an unsent draft across a recoverable reconnect. It is not a full-screen
-TUI in this RC.
+line chat keeps the destination visible, reports delivery state, displays incoming events while
+waiting for input, supports contact switching/search and filtered history, and retains a
+destination-bound unconfirmed draft across a recoverable reconnect. It is not a full-screen TUI in
+this RC.
 
 Local message history is disabled by default. Enabling it writes bounded **plaintext JSONL** beside
 the selected configuration; use `meshquill history clear --yes` to delete it. Details are in
@@ -110,8 +115,8 @@ may still read stdin. See the [automation contract](docs/reference/automation.md
 
 ## Python SDK
 
-The optional `meshquill-sdk` wheel exposes the Rust core as `meshcore_sdk` with an async-first,
-typed API:
+The optional `meshquill-sdk` wheel, built from this checkout or downloaded after a GitHub
+prerelease is published, exposes the Rust core as `meshcore_sdk` with an async-first, typed API:
 
 ```python
 import asyncio
@@ -168,10 +173,11 @@ kind and flood-scope filters; scope changes used by one command are restored aft
 - Chat is deliberately line-oriented; there is no full-screen contact/history TUI yet.
 - Manual pending-contact acceptance is surfaced with an explicit unsupported diagnostic because a
   safe one-shot CLI cannot reconstruct firmware advertisement state it never observed.
-- Device reconnect is explicit and single-attempt; MQTT broker reconnect has bounded automatic
-  backoff. Meshquill never guesses whether an ambiguous radio send should be replayed.
-- Registry packages and GitHub artifacts exist only after maintainers publish the prepared tag;
-  source and locally generated release artifacts remain installable meanwhile.
+- `watch` and line chat make at most three companion reconnect attempts with bounded delay; finite
+  mutations do not retry. Meshquill never guesses whether an ambiguous radio send should be replayed.
+- The source checkout is the current RC2 delivery. GitHub archives become the primary RC
+  distribution only after [status](STATUS.md) records a published prerelease; crates.io and PyPI
+  commands likewise remain unavailable unless their separate publication is recorded there.
 
 Meshquill is independent community software and is not an official MeshCore package. It is dual
 licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

@@ -3,6 +3,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use meshquill_core::MAX_OPERATION_TIMEOUT;
 use serde::{Deserialize, Serialize};
 
 /// Independent Rust-first client for `MeshCore` companion radios.
@@ -855,7 +856,11 @@ pub struct ManpagesArgs {
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    humantime::parse_duration(value).map_err(|error| error.to_string())
+    let duration = humantime::parse_duration(value).map_err(|error| error.to_string())?;
+    if duration.is_zero() || duration > MAX_OPERATION_TIMEOUT {
+        return Err("must be greater than zero and at most 24 hours".to_owned());
+    }
+    Ok(duration)
 }
 
 fn parse_hash_bytes(value: &str) -> Result<u8, String> {
@@ -903,6 +908,23 @@ mod tests {
         assert_eq!(cli.timeout, Duration::from_millis(1_500));
         assert!(cli.non_interactive);
         assert!(matches!(cli.command, Command::Send(args) if args.wait));
+    }
+
+    #[test]
+    fn command_timeouts_have_an_inclusive_24_hour_bound() {
+        let maximum = Cli::try_parse_from(["meshquill", "--timeout", "86400s", "status"]);
+        assert!(maximum.is_ok());
+        assert!(Cli::try_parse_from(["meshquill", "--timeout", "0s", "status"]).is_err());
+        assert!(Cli::try_parse_from(["meshquill", "--timeout", "86401s", "status"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "meshquill",
+                "devices",
+                "--scan-timeout",
+                "18446744073709551615s",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

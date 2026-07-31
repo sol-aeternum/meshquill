@@ -13,7 +13,7 @@ use tokio_serial::{
 };
 
 use crate::{
-    discovery::{DiscoveredDevice, DiscoveryError, TargetError, TransportTarget, validate_nonzero},
+    discovery::{DiscoveredDevice, DiscoveryError, TargetError, TransportTarget, validate_timeout},
     framed::{
         FramedReadState, invalidate_on_terminal_read_error, validate_payload, write_framed_bounded,
     },
@@ -68,7 +68,7 @@ impl SerialTransport {
     ///
     /// # Errors
     /// Returns [`TargetError`] when the port is blank, the baud rate is zero, or the timeout is
-    /// zero.
+    /// zero or greater than 24 hours.
     pub fn new(
         port: impl Into<String>,
         baud: u32,
@@ -80,7 +80,7 @@ impl SerialTransport {
             baud,
         };
         target.validate()?;
-        validate_timeout(connect_timeout)?;
+        validate_timeout("connect_timeout", connect_timeout)?;
 
         Ok(Self {
             port,
@@ -319,10 +319,6 @@ fn usb_metadata(port_name: &str, usb: &UsbPortInfo) -> (String, String, Vec<Stri
     (id, display_name, notes)
 }
 
-fn validate_timeout(timeout: Duration) -> Result<(), TargetError> {
-    validate_nonzero("connect_timeout", timeout.as_nanos())
-}
-
 fn serial_provider_error(error: &tokio_serial::Error, operation: &str, port: &str) -> io::Error {
     let kind = match error.kind() {
         tokio_serial::ErrorKind::NoDevice => io::ErrorKind::NotFound,
@@ -409,6 +405,14 @@ mod tests {
         assert!(SerialTransport::new("", 115_200, Duration::from_secs(1)).is_err());
         assert!(SerialTransport::new("COM1", 0, Duration::from_secs(1)).is_err());
         assert!(SerialTransport::new("COM1", 115_200, Duration::ZERO).is_err());
+        assert!(
+            SerialTransport::new(
+                "COM1",
+                115_200,
+                meshquill_core::MAX_OPERATION_TIMEOUT.saturating_add(Duration::from_nanos(1)),
+            )
+            .is_err()
+        );
 
         let transport = SerialTransport::new("COM1", 115_200, Duration::from_secs(2))
             .expect("valid serial target");

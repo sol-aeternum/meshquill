@@ -568,11 +568,10 @@ async fn connect_transport<T>(
 where
     T: ReconnectableTransport + Send + 'static,
 {
-    let managed = ManagedClient::spawn_with_capacity(
-        CoreClient::with_timeout(transport, request_timeout),
-        command_capacity,
-    )
-    .map_err(|error| core_error(error, Operation::Read))?;
+    let core = CoreClient::with_timeout(transport, request_timeout)
+        .map_err(|error| core_error(error, Operation::Read))?;
+    let managed = ManagedClient::spawn_with_capacity(core, command_capacity)
+        .map_err(|error| core_error(error, Operation::Read))?;
     let (closed, _) = watch::channel(false);
     // Register the sole core receiver and start the bounded relay before connect publishes the
     // SelfInfo/Connected handshake or any intervening message packets.

@@ -35,7 +35,7 @@ install -m 0644 \
   README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md STATUS.md PLAN.md \
   LICENSE-APACHE LICENSE-MIT \
   "$stage_root/"
-cp -R docs examples "$stage_root/"
+cp -R docs examples schemas "$stage_root/"
 
 "$binary" completions bash >"$stage_root/share/completions/meshquill.bash"
 "$binary" completions zsh >"$stage_root/share/completions/_meshquill"

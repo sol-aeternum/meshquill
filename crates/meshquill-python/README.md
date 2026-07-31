@@ -9,8 +9,18 @@ Python, and the native CLI does not depend on Python.
 
 Python 3.9 or newer is supported through CPython's stable ABI.
 
+The current `0.1.0rc2` source is not claimed to be published on PyPI. Build this checkout using the
+[development steps](#development) below. After [project status](../../STATUS.md) records a published
+RC2 GitHub prerelease, install its downloaded platform wheel directly:
+
 ```console
-python -m pip install meshquill-sdk
+python -m pip install ./meshquill_sdk-0.1.0rc2-*.whl
+```
+
+Only after status records the separate PyPI publication will this exact index command work:
+
+```console
+python -m pip install --pre "meshquill-sdk==0.1.0rc2"
 ```
 
 The installed import remains `meshcore_sdk` in code examples below.
@@ -110,11 +120,17 @@ From this directory, build and test in an isolated environment:
 
 ```console
 python -m venv .venv
-.venv/bin/python -m pip install maturin ruff mypy pytest pytest-asyncio
-.venv/bin/maturin develop
+.venv/bin/python -m pip install --requirement requirements-dev.txt
+.venv/bin/maturin develop --locked
+.venv/bin/ruff format --check python examples tests
 .venv/bin/ruff check python examples tests
 .venv/bin/mypy
+.venv/bin/python -m mypy.stubtest meshcore_sdk
 .venv/bin/pytest
 ```
+
+The requirements file and `pyproject.toml` pin every direct build/test tool exactly. There is no
+checked-in fully resolved Python transitive lock in this RC; CI resolves those pins and audits the
+result with the exact `pip-audit` version from the same file. Cargo dependencies remain locked.
 
 The package includes complete `.pyi` declarations and `py.typed` for downstream type checkers.

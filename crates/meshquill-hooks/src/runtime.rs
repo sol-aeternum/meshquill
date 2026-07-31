@@ -40,6 +40,8 @@ const DEFAULT_MAX_REJECTION_REASON_BYTES: usize = 4 * 1024;
 const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
 const HARD_MAX_CONCURRENCY: usize = 1024;
+/// Largest caller-controlled hook operation timeout (24 hours).
+pub const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const SAFE_ENVIRONMENT: &[&str] = &[
     "PATH",
     "LANG",
@@ -489,7 +491,9 @@ impl HookRuntime {
     where
         T: Serialize + ?Sized,
     {
-        let deadline = Instant::now() + self.inner.config.timeout;
+        let deadline = Instant::now()
+            .checked_add(self.inner.config.timeout)
+            .ok_or(ConfigurationError::InvalidLimit { field: "timeout" })?;
         match timeout_at(deadline, self.validate_script_file()).await {
             Ok(result) => result?,
             Err(_) => return Err(self.timeout_error()),
@@ -1007,7 +1011,7 @@ fn validate_config(config: &HookConfig) -> Result<(), ConfigurationError> {
         "max_rejection_reason_bytes",
         config.max_rejection_reason_bytes,
     )?;
-    if config.timeout.is_zero() {
+    if config.timeout.is_zero() || config.timeout > MAX_OPERATION_TIMEOUT {
         return Err(ConfigurationError::InvalidLimit { field: "timeout" });
     }
     if config.max_concurrency == 0 || config.max_concurrency > HARD_MAX_CONCURRENCY {
@@ -1086,6 +1090,17 @@ mod tests {
     use std::{future, process::Stdio, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn hook_timeout_bound_is_inclusive() {
+        let mut config = HookConfig::new("unused.py");
+        config.timeout = MAX_OPERATION_TIMEOUT;
+        assert!(validate_config(&config).is_ok());
+        config.timeout = Duration::ZERO;
+        assert!(validate_config(&config).is_err());
+        config.timeout = MAX_OPERATION_TIMEOUT.saturating_add(Duration::from_nanos(1));
+        assert!(validate_config(&config).is_err());
+    }
 
     fn spawn_test_process(stdin: Stdio, stdout: Stdio, stderr: Stdio) -> Child {
         let executable = std::env::current_exe().expect("current test executable");

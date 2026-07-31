@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::{
     args::{Cli, InitArgs},
     error::CliError,
+    input::read_bounded_line,
     output::ExitStatus,
 };
 
@@ -56,6 +57,10 @@ impl SelectedProfile {
             .and_then(|overrides| overrides.request_timeout_ms)
             .unwrap_or(self.config.timeout.request_timeout_ms);
         Duration::from_millis(milliseconds)
+    }
+
+    pub(crate) fn retry_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.timeout.retry_timeout_ms)
     }
 }
 
@@ -275,10 +280,9 @@ fn prompt(label: &str) -> Result<String, CliError> {
         .and_then(|()| stderr.flush())
         .map_err(|_| CliError::new(ExitStatus::Protocol, "could not write the prompt"))?;
     drop(stderr);
-    let mut value = String::new();
-    io::stdin()
-        .read_line(&mut value)
-        .map_err(|_| CliError::new(ExitStatus::Protocol, "could not read interactive input"))?;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let value = read_bounded_line(&mut input, "interactive setup input")?.unwrap_or_default();
     Ok(value.trim().to_owned())
 }
 

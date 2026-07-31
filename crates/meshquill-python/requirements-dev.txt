@@ -1,0 +1,10 @@
+# Python >=3.10 quality/release tools are exact so CI cannot silently cross tool releases.
+# Python 3.9 compatibility jobs install only the exact Maturin build tool below.
+# Transitive dependencies are resolved and vulnerability-audited by the supply-chain job.
+maturin==1.11.5
+mypy==1.20.2
+pip-audit==2.10.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.0
+twine==7.0.0

@@ -47,5 +47,5 @@ pub use protocol::{
 };
 pub use runtime::{
     EnvironmentPolicy, FailurePolicy, HookConfig, HookExecutionStatus, HookReport, HookRuntime,
-    HookValidation,
+    HookValidation, MAX_OPERATION_TIMEOUT,
 };

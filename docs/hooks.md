@@ -46,7 +46,7 @@ supported. The envelope is:
   "event_id": "<opaque unique string>",
   "timestamp": 1785384000000,
   "event": "on_message",
-  "payload": {"source": "Alice", "text": "hello", "message_id": "1234"}
+  "payload": {"source": "Alice", "text": "hello", "message_id": "019ad1d5-9d22-7b11-83a7-6f58d6054ad6"}
 }
 ```
 
@@ -63,6 +63,10 @@ The supported handlers and payload fields are:
 | `on_timeout` | `operation`, optional `message_id` |
 | `on_contact_update` | `contact_id`, optional `display_name`, `change` (`added`, `updated`, or `removed`) |
 | `on_error` | `operation`, sanitized `message` |
+
+`message_id` is a Meshquill-local workflow UUID that relates local hook events and, when enabled,
+the corresponding history record. It is not a MeshCore message ID, a durable identity across
+process restarts, or a deduplication key.
 
 Observational return values are discarded. `before_send` may return `None`,
 `{"action":"allow"}`, `{"action":"modify","destination":"...","text":"..."}` (either

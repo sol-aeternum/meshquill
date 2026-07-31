@@ -5,6 +5,54 @@ This file follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0-rc.2] - 2026-07-31
+
+### Changed
+
+- Added bounded three-attempt companion reconnect for `watch` and line chat, connection-scoped
+  live/queued occurrence correlation, and host-level SIGINT cancellation tests. Reconnect never
+  replays a mutation or an ambiguous radio write; identical messages observed through the same
+  observation path remain distinct occurrences.
+- Expanded portable chat with live incoming display during input, contact search and target
+  switching, channel switching, conversation-filtered history, contextual help and suggestions,
+  literal slash messages, and destination-bound retained drafts with explicit `/send` or `/discard`.
+- Added a stable checked-in `meshquill.cli/v1` JSON schema and compatibility fixtures for finite and
+  streaming output.
+- Enforced a one-MiB configuration input bound, a 4096-byte line-input bound, and a 24-hour maximum
+  for stored, CLI, transport, core, hook and Python operation timeouts.
+- Added fuzz targets and corpora for every remote-payload parser family and the allowlisted MQTT
+  command processor, alongside the existing inner-packet and outer-frame targets.
+- Expanded real-broker CI to cover MQTT 3.1.1 and MQTT 5 round trips plus private-CA TLS,
+  username/password, mTLS, wrong-trust, wrong-password, missing-client-identity and hostname-failure
+  cases. Send-enabled MQTT now rejects persistent sessions because deduplication is process-local.
+- Exact-pinned Python build/test tools are shared by CI, wheel smoke tests and supply-chain audit;
+  release wheels are installed and exercised on both CPython 3.9 and 3.14 on every target.
+
+### Fixed
+
+- Added bounded, connection-local heuristic correlation for a likely live/queued double-observation
+  without globally discarding messages based on a non-unique payload fingerprint. Correlation is
+  limited by opposite observation path, multiplicity, five seconds, and 256 entries. Because the
+  protocol has no globally unique message ID, a distinct identical opposite-path occurrence inside
+  that window can collide.
+- Prevented a failed chat draft from being silently retargeted or overwritten, preserved typed text
+  through target/inbox reconnects, and made `/send` the only explicit resend path for an unconfirmed
+  draft. If the original write succeeded but its response was lost, `/send` can duplicate delivery;
+  `/discard` avoids that risk.
+- Added explicit managed-operation cancellation so SIGINT cleanup cannot remain queued behind a
+  dropped connect or ACK wait; preserved stale-event boundaries without automatic resend after
+  cancellation, timeout, or disconnect.
+
+### Known limitations
+
+- No physical companion or radio was available. BLE, serial and companion TCP behavior remains
+  host-tested and simulated rather than hardware-verified against a recorded firmware/device pair.
+- GitHub archives and wheels are unsigned, and macOS/Windows binaries are not code-signed.
+- Chat remains line-oriented; named-channel sending and manual pending-contact acceptance remain
+  deliberately unsupported in this RC.
+- crates.io and PyPI publication require independently scoped credentials that are not present in
+  the maintainer environment; the GitHub prerelease is publishable independently.
+
 ## [0.1.0-rc.1] - 2026-07-30
 
 ### Added

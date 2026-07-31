@@ -11,7 +11,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-meshquill-core = { version = "=0.1.0-rc.1", path = "../crates/meshquill-core" }
+meshquill-core = { version = "=0.1.0-rc.2", path = "../crates/meshquill-core" }
+meshquill-mqtt = { version = "=0.1.0-rc.2", path = "../crates/meshquill-mqtt" }
 
 [[bin]]
 name = "protocol_packet"
@@ -23,6 +24,20 @@ bench = false
 [[bin]]
 name = "outer_frames"
 path = "fuzz_targets/outer_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_payloads"
+path = "fuzz_targets/remote_payloads.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mqtt_commands"
+path = "fuzz_targets/mqtt_commands.rs"
 test = false
 doc = false
 bench = false

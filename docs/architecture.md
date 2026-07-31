@@ -45,25 +45,43 @@ control operations also validate their protocol tags. Push events and ACKs remai
 Queues and broadcasts are bounded; a slow subscriber receives an explicit lag error rather than
 causing unbounded memory growth.
 
+Receive packets have no protocol-wide unique message ID. The core publishes every representable
+message and never uses a payload fingerprint as permanent identity. At the CLI workflow boundary,
+fresh UUIDv7 IDs identify accepted local observations. Matching fingerprints pair only opposite-path
+live/queued observations within five seconds, 256 retained entries, and one connection. Each match
+consumes one entry, preserving multiplicity, while same-path repeats remain distinct. This heuristic
+identifies only a likely duplicate delivery observation: distinct identical opposite-path
+occurrences within the window can collide. Reconnection clears the correlation state.
+
 Transport writes are never automatically replayed. A cancellation or disconnect after a write can
 be ambiguous, and callers must reconcile before choosing another explicit send. Core reconnect is
-one explicit attempt followed by a fresh APP_START handshake. Line chat uses that attempt only after
-a disconnected send, retains the draft, and requires `/send`; it does not retransmit. MQTT broker
-reconnect is separate and uses bounded exponential backoff.
+one explicit transport reconnect followed by a fresh APP_START handshake. `watch` and line chat may
+call that operation at most three times under a bounded CLI delay policy. They never pass a mutation
+to the reconnect helper, and chat never auto-resends. A reconnectable failure before companion
+acceptance was observed retains the exact unconfirmed text and original destination. `/send` starts
+a new explicit send, which can duplicate delivery after a successful write whose response was lost;
+`/discard` avoids that risk. An ACK-stage failure is never retained. MQTT broker reconnect is separate
+and uses bounded exponential backoff.
 
 Message history states are `pending`, `acknowledged`, `timed_out`, `failed` and `received`; there is
-no invented protocol-level “unknown” delivery state. Error text explains ambiguous-send cases.
+no invented protocol-level “unknown” delivery state. Direction and status are local bookkeeping, not
+wire truth: `outgoing` is a local outgoing attempt, `pending` has no recorded terminal local result,
+and `failed` records a local failure with a possibly ambiguous wire outcome. Each ID is a stable
+local record ID, not protocol/event identity. Timestamps are local-host record time; sender
+timestamp, route, SNR and signature are not retained.
 
 ## Untrusted-input policy
 
 - Inner companion packets and serial/TCP frames are decoded separately.
-- The outer payload cap is 300 bytes; command strings, files, paths, broker payloads, hook I/O and
-  all queue sizes have independent bounds.
+- The outer payload cap is 300 bytes; the configuration input cap is one MiB, line input is 4096
+  bytes, operation timeouts are at most 24 hours, and command strings, paths, broker payloads, hook
+  I/O and queue sizes have independent bounds.
 - Lengths are checked before indexing/allocation; invalid UTF-8 returns a typed parse error and
   opaque bytes remain bytes.
 - Unknown/future packets are bounded and observable instead of guessed into a typed model.
-- Workspace Rust forbids `unsafe`; malformed-input tests reject truncation/oversize and two checked-in
-  fuzz targets exercise the highest-risk codecs. No property-test framework is claimed.
+- Workspace Rust forbids `unsafe`; malformed-input tests reject truncation/oversize and four
+  checked-in fuzz targets exercise inner packets, outer frames, remote payload families and MQTT
+  command parsing. No property-test framework is claimed.
 
 ## Configuration, secrets and history
 

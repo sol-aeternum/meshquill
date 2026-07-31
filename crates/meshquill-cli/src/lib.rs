@@ -11,9 +11,12 @@ mod batch_cli;
 mod config;
 mod error;
 mod hooks_cli;
+mod input;
+mod interrupt;
 mod mqtt_cli;
 /// Stable output serialization and exit-code contracts.
 pub mod output;
+mod reconnect;
 mod remote_cli;
 mod runtime;
 mod transport;
@@ -21,6 +24,16 @@ mod workflow;
 
 use args::{Cli, ColorMode};
 use output::{ExitStatus, OutputWriter};
+
+/// Enable native process-level interrupt delivery before starting CLI work.
+///
+/// The native binary invokes this before it starts asynchronous worker tasks.
+/// Embedders that already own a runtime may omit it and use the portable
+/// runtime signal handler instead.
+#[doc(hidden)]
+pub fn enable_process_interrupts() {
+    interrupt::enable_process_interrupts();
+}
 
 /// Run one already-parsed CLI invocation and return its stable status.
 ///

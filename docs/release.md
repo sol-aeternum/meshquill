@@ -1,4 +1,4 @@
-# `v0.1.0-rc.1` release runbook
+# `v0.1.0-rc.2` release runbook
 
 This runbook is tied to the current [workspace manifest](../Cargo.toml),
 [Python package metadata](../crates/meshquill-python/pyproject.toml), [CI workflow](../.github/workflows/ci.yml),
@@ -8,17 +8,23 @@ a Bash shell unless a command says otherwise.
 
 The release has two version spellings:
 
-- Rust crates and the Git tag use `0.1.0-rc.1` and `v0.1.0-rc.1`.
-- The PyPI distribution uses the PEP 440 version `0.1.0rc1`; its distribution name is
+- Rust crates and the Git tag use `0.1.0-rc.2` and `v0.1.0-rc.2`.
+- The PyPI distribution uses the PEP 440 version `0.1.0rc2`; its distribution name is
   `meshquill-sdk` and its import name is `meshcore_sdk`.
 
-The tag workflow builds and tests artifacts and creates a **draft** GitHub release. It does not
+The tag workflow builds and tests artifacts and creates a **draft prerelease** on GitHub. It does not
 publish to crates.io or PyPI, and it has no PyPI trusted-publisher job. Registry publication is a
 separate, manual maintainer action.
 
+This runbook describes the pending RC2 procedure, not current availability. Until
+[STATUS.md](../STATUS.md) records a published `v0.1.0-rc.2` prerelease, the current checkout is the
+RC2 delivery and all tag, draft, asset and registry publication steps below remain uncompleted. A
+successful workflow draft is private release staging, not a public downloadable delivery.
+
 ## 1. Credentials and release authority
 
-Use a maintainer workstation with a clean checkout and these independently scoped credentials:
+Use a maintainer workstation with a clean checkout. GitHub authority is required for the GitHub
+release; registry credentials are independently optional and gate only their respective uploads:
 
 - Git/GitHub authority to push the tag, inspect Actions, edit the draft, and publish the GitHub
   release. Confirm the intended account and repository with `gh auth status` and `gh repo view`.
@@ -42,7 +48,7 @@ Set the release constants and require the release commit to be the clean, pushed
 
 ```bash
 set -euo pipefail
-export MESHQUILL_VERSION=0.1.0-rc.1
+export MESHQUILL_VERSION=0.1.0-rc.2
 export MESHQUILL_TAG="v${MESHQUILL_VERSION}"
 export MESHQUILL_SHA="$(git rev-parse HEAD)"
 
@@ -56,9 +62,10 @@ Verify the exact version contract enforced by the tag workflow:
 
 ```bash
 test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "$MESHQUILL_VERSION"
-test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/meshquill-python/pyproject.toml | head -1)" = 0.1.0rc1
-grep -Fqx "## [${MESHQUILL_VERSION}] - 2026-07-30" CHANGELOG.md
+test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/meshquill-python/pyproject.toml | head -1)" = 0.1.0rc2
+grep -Fqx "## [${MESHQUILL_VERSION}] - 2026-07-31" CHANGELOG.md
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
+cargo metadata --locked --manifest-path fuzz/Cargo.toml --no-deps --format-version 1 >/dev/null
 git diff --check
 ```
 
@@ -82,8 +89,12 @@ Both conclusions must be `success`. Together they cover:
 - Rust 1.97.1 formatting, warnings-denied Clippy, all-target/all-feature checking, default-feature
   tests, and warnings-denied documentation on Ubuntu, both macOS architectures, and Windows;
 - the Rust 1.88.0 minimum-version check;
-- both parser fuzz targets on pinned nightly `2026-07-30`;
-- installed-wheel lint, type, and test jobs on Python 3.9 and 3.14;
+- all four fuzz targets on pinned nightly `2026-07-30`: the inner-packet and outer-frame codecs,
+  remote payload parsers, and MQTT command parser;
+- the lean Python 3.9 installed-wheel gate: import and Rust/Python version checks, licence
+  inventory, `pip check`, and both examples;
+- the full Python 3.14 gate: strict wheel metadata/Twine checks, formatting and lint, types and
+  generated-API drift, Pytest, stubtest, and both examples;
 - the real Mosquitto integration tests and Markdown link check; and
 - `cargo deny` and `cargo audit` for both the main and fuzz lockfiles.
 
@@ -124,7 +135,6 @@ The release run reruns both quality workflows, then builds and smoke-tests these
 - `abi3-py39` wheels for the same five platform/architecture combinations, built by Maturin 1.11.5;
   Linux wheels are additionally inspected with Auditwheel 6.7.0 and rejected when their actual
   symbol requirements are newer than `manylinux_2_28`, independent of the filename tag; and
-  and
 - a draft GitHub release containing four `.tar.gz` files, one `.zip`, five sibling `.sha256` files,
   five wheels, and `SHA256SUMS`.
 
@@ -147,17 +157,48 @@ gh release view "$MESHQUILL_TAG" \
 export MESHQUILL_ARTIFACT_DIR="$(mktemp -d)"
 gh release download "$MESHQUILL_TAG" --dir "$MESHQUILL_ARTIFACT_DIR"
 
-test "$(find "$MESHQUILL_ARTIFACT_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 4
-test "$(find "$MESHQUILL_ARTIFACT_DIR" -maxdepth 1 -type f -name '*.zip' | wc -l)" -eq 1
-test "$(find "$MESHQUILL_ARTIFACT_DIR" -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 5
-test "$(find "$MESHQUILL_ARTIFACT_DIR" -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
-test -s "$MESHQUILL_ARTIFACT_DIR/SHA256SUMS"
+native_archives=(
+  meshquill-v0.1.0-rc.2-aarch64-apple-darwin.tar.gz
+  meshquill-v0.1.0-rc.2-aarch64-unknown-linux-gnu.tar.gz
+  meshquill-v0.1.0-rc.2-x86_64-apple-darwin.tar.gz
+  meshquill-v0.1.0-rc.2-x86_64-pc-windows-msvc.zip
+  meshquill-v0.1.0-rc.2-x86_64-unknown-linux-gnu.tar.gz
+)
+wheel_assets=(
+  meshquill_sdk-0.1.0rc2-cp39-abi3-macosx_10_12_x86_64.whl
+  meshquill_sdk-0.1.0rc2-cp39-abi3-macosx_11_0_arm64.whl
+  meshquill_sdk-0.1.0rc2-cp39-abi3-manylinux_2_28_aarch64.whl
+  meshquill_sdk-0.1.0rc2-cp39-abi3-manylinux_2_28_x86_64.whl
+  meshquill_sdk-0.1.0rc2-cp39-abi3-win_amd64.whl
+)
+expected_assets=(SHA256SUMS "${native_archives[@]}" "${wheel_assets[@]}")
+for archive in "${native_archives[@]}"; do
+  expected_assets+=("${archive}.sha256")
+done
+
+test "${#expected_assets[@]}" -eq 16
+test "$(find "$MESHQUILL_ARTIFACT_DIR" -maxdepth 1 -type f | wc -l)" -eq 16
+for asset in "${expected_assets[@]}"; do
+  test -s "$MESHQUILL_ARTIFACT_DIR/$asset"
+done
+
+checksum_payloads=("${native_archives[@]}" "${wheel_assets[@]}")
+test "${#checksum_payloads[@]}" -eq 10
+test "$(wc -l < "$MESHQUILL_ARTIFACT_DIR/SHA256SUMS")" -eq 10
+for payload in "${checksum_payloads[@]}"; do
+  test "$(awk -v expected="$payload" \
+    '$2 == expected { matches++ } END { print matches + 0 }' \
+    "$MESHQUILL_ARTIFACT_DIR/SHA256SUMS")" -eq 1
+done
 
 (
   cd "$MESHQUILL_ARTIFACT_DIR"
   sha256sum --check SHA256SUMS
-  for checksum in ./*.sha256; do
-    sha256sum --check "${checksum#./}"
+  for archive in "${native_archives[@]}"; do
+    checksum="${archive}.sha256"
+    test "$(wc -l < "$checksum")" -eq 1
+    test "$(awk 'NF == 2 { print $2 }' "$checksum")" = "$archive"
+    sha256sum --check "$checksum"
   done
 )
 ```
@@ -175,7 +216,7 @@ version and workflow run.
 
 The workspace contains seven crates intended for crates.io and one Rust package that is not:
 `meshquill-python` has `publish = false` because it is delivered as the Python wheel. Internal Rust
-dependencies use the exact requirement `=0.1.0-rc.1`, so publish in this order and wait for each
+dependencies use the exact requirement `=0.1.0-rc.2`, so publish in this order and wait for each
 crate to appear in the crates.io index before publishing a dependent crate.
 
 For every crate, the dry run and real publication must use the tagged, clean checkout. Do not use
@@ -229,7 +270,7 @@ and run the deterministic smoke flow:
 
 ```bash
 export MESHQUILL_CARGO_SMOKE="$(mktemp -d)"
-cargo install --locked --version 0.1.0-rc.1 \
+cargo install --locked --version 0.1.0-rc.2 \
   --root "$MESHQUILL_CARGO_SMOKE/install" meshquill
 export MESHQUILL_CARGO_SMOKE_CONFIG="$MESHQUILL_CARGO_SMOKE/config.toml"
 "$MESHQUILL_CARGO_SMOKE/install/bin/meshquill" \
@@ -252,9 +293,9 @@ wheel set:
 python -m pip install "maturin==1.11.5"
 test -n "${MATURIN_PYPI_TOKEN:-}"
 test "$(find "$MESHQUILL_ARTIFACT_DIR" -maxdepth 1 -type f \
-  -name 'meshquill_sdk-0.1.0rc1-*.whl' | wc -l)" -eq 5
+  -name 'meshquill_sdk-0.1.0rc2-*.whl' | wc -l)" -eq 5
 maturin upload --non-interactive \
-  "$MESHQUILL_ARTIFACT_DIR"/meshquill_sdk-0.1.0rc1-*.whl
+  "$MESHQUILL_ARTIFACT_DIR"/meshquill_sdk-0.1.0rc2-*.whl
 unset MATURIN_PYPI_TOKEN
 ```
 
@@ -270,13 +311,13 @@ spellings:
 export MESHQUILL_PYPI_SMOKE="$(mktemp -d)"
 python -m venv "$MESHQUILL_PYPI_SMOKE/venv"
 "$MESHQUILL_PYPI_SMOKE/venv/bin/python" -m pip install \
-  --pre "meshquill-sdk==0.1.0rc1"
+  --pre "meshquill-sdk==0.1.0rc2"
 "$MESHQUILL_PYPI_SMOKE/venv/bin/python" - <<'PY'
 import importlib.metadata
 import meshcore_sdk
 
-assert importlib.metadata.version("meshquill-sdk") == "0.1.0rc1"
-assert meshcore_sdk.__version__ == "0.1.0-rc.1"
+assert importlib.metadata.version("meshquill-sdk") == "0.1.0rc2"
+assert meshcore_sdk.__version__ == "0.1.0-rc.2"
 PY
 ```
 
@@ -285,10 +326,13 @@ rebuild or upload differently named files.
 
 ## 7. Publish the GitHub release
 
-Keep the GitHub release as a draft until the full tag run, artifact inspection, crates.io sequence,
-PyPI upload, and registry install checks all pass. Review and, if necessary, replace the generated
-notes with an accurate summary of [the changelog](../CHANGELOG.md), the lack of physical-hardware
-testing, and the unsigned-artifact boundary; use
+Keep the GitHub release as a draft until the full tag run and artifact inspection pass. When
+crates.io/PyPI credentials are available, complete their sequences and registry install checks
+first. When either credential is unavailable, that is not a reason to withhold the tested GitHub
+artifacts: state the unavailable registry explicitly in the notes and publish the GitHub prerelease.
+Review and, if necessary, replace the generated notes with an accurate summary of
+[the changelog](../CHANGELOG.md), the lack of physical-hardware testing, the unsigned-artifact
+boundary, and actual registry availability; use
 `gh release edit "$MESHQUILL_TAG" --notes-file PATH` while it is a draft. Then publish it explicitly
 as a prerelease, not as the latest stable release:
 
@@ -306,27 +350,28 @@ fresh download of the published GitHub archive against its sibling checksum.
 ## 8. Failure, rollback, and yanking
 
 - Before the tag is pushed, fix the release commit and rerun every affected gate.
-- After the tag is pushed but before any registry publication, leave the GitHub release in draft.
-  Rerun only demonstrably transient jobs against the same commit. For a code, version, metadata, or
-  packaging defect, create a new RC; do not move or overwrite `v0.1.0-rc.1`.
+- After the tag is pushed, leave the GitHub release in draft until the tag workflow and artifact
+  inspection pass. Rerun only demonstrably transient jobs against the same commit. For a code,
+  version, metadata, or packaging defect, create a new RC; do not move or overwrite
+  `v0.1.0-rc.2`. Missing registry credentials follow section 7 and do not change the tag or assets.
 - Published crates and PyPI files cannot be replaced in place. Never upload locally rebuilt artifacts
   under the same version.
 - For a crates.io defect, yank the affected public package and every published dependent. For a
   whole-release defect, yank in reverse dependency order:
 
   ```bash
-  cargo yank --registry crates-io --version 0.1.0-rc.1 meshquill
-  cargo yank --registry crates-io --version 0.1.0-rc.1 meshquill-store
-  cargo yank --registry crates-io --version 0.1.0-rc.1 meshquill-test-support
-  cargo yank --registry crates-io --version 0.1.0-rc.1 meshquill-transport
-  cargo yank --registry crates-io --version 0.1.0-rc.1 meshquill-mqtt
-  cargo yank --registry crates-io --version 0.1.0-rc.1 meshquill-hooks
-  cargo yank --registry crates-io --version 0.1.0-rc.1 meshquill-core
+  cargo yank --registry crates-io --version 0.1.0-rc.2 meshquill
+  cargo yank --registry crates-io --version 0.1.0-rc.2 meshquill-store
+  cargo yank --registry crates-io --version 0.1.0-rc.2 meshquill-test-support
+  cargo yank --registry crates-io --version 0.1.0-rc.2 meshquill-transport
+  cargo yank --registry crates-io --version 0.1.0-rc.2 meshquill-mqtt
+  cargo yank --registry crates-io --version 0.1.0-rc.2 meshquill-hooks
+  cargo yank --registry crates-io --version 0.1.0-rc.2 meshquill-core
   ```
 
   Yanking blocks new dependency resolution but does not erase downloads or existing lockfile use, so
   publish an advisory and a corrected RC.
-- For a PyPI defect, use the PyPI project release page to yank `0.1.0rc1`; do not delete and recreate
+- For a PyPI defect, use the PyPI project release page to yank `0.1.0rc2`; do not delete and recreate
   files. A yank does not remove already downloaded wheels.
 - If the GitHub release is still a draft, keep it unpublished. If it is already public, preserve the
   tag and assets, add a prominent advisory to the notes, and publish a corrected RC. Do not silently

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use meshquill_core::{CoreError, Event, ManagedClient};
+use meshquill_core::{CoreError, Event, MAX_OPERATION_TIMEOUT, ManagedClient};
 use meshquill_mqtt::{
     AcceptedCommand, CommandError, ConfigError as MqttConfigError, ConnectionStatus, GatewayError,
     GatewayHandle, GatewayNotice, GatewayRunner, MqttPassword, MqttProtocol, MqttQos, Publication,
@@ -30,7 +30,7 @@ use crate::{
     error::CliError,
     output::{ExitStatus, OutputWriter},
     runtime::{make_client, resolve_contact, watch_human, watch_record},
-    workflow::{OutgoingRecord, WorkflowServices},
+    workflow::{IncomingOrigin, OutgoingRecord, WorkflowServices},
 };
 
 const MQTT_SCHEMA: &str = "meshquill.mqtt/v1";
@@ -498,7 +498,13 @@ async fn publish_core_event<W: Write>(
 ) -> Result<(), CliError> {
     match &event {
         Event::Message(message) => {
-            workflow.incoming(message).await?;
+            if workflow
+                .incoming(message, IncomingOrigin::Live)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
         }
         Event::Ack(ack) => {
             if let Some(position) = pending.iter().position(|item| item.ack_code == ack.code)
@@ -632,15 +638,17 @@ async fn execute_direct_command(
             &contact.adv_name,
             &prepared.text,
             &message_id,
-            tracking.ack_code,
+            Some(tracking.ack_code),
         )
         .await;
+    let acknowledgement_timeout =
+        Duration::from_millis(u64::from(tracking.timeout_ms)).min(MAX_OPERATION_TIMEOUT);
     let pending = PendingBrokerAck {
         record: outgoing,
         message_id,
         destination: contact.adv_name.clone(),
         ack_code: tracking.ack_code,
-        deadline: Instant::now() + Duration::from_millis(u64::from(tracking.timeout_ms)),
+        deadline: Instant::now() + acknowledgement_timeout,
     };
     if let Err(error) = workflow_result {
         tracing::warn!(error = %error, "MQTT direct send queued but after-send workflow failed");
@@ -701,7 +709,7 @@ async fn execute_channel_command(
             &prepared.destination,
             &prepared.text,
             &message_id,
-            [0; 4],
+            None,
         )
         .await
     {

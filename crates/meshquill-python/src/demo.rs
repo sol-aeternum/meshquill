@@ -90,7 +90,8 @@ mod tests {
     #[tokio::test]
     async fn seeded_demo_completes_a_managed_handshake() {
         let transport = DemoTransport::seeded().expect("seeded demo transport");
-        let client = Client::with_timeout(transport, Duration::from_secs(1));
+        let client =
+            Client::with_timeout(transport, Duration::from_secs(1)).expect("valid demo timeout");
         let managed = ManagedClient::spawn(client);
 
         let info = managed.connect().await.expect("demo handshake");

@@ -14,7 +14,7 @@ readme = "../../README.md"
 
 [dependencies]
 async-trait = { workspace = true }
-meshquill-core = { version = "=0.1.0-rc.1", path = "../meshquill-core" }
+meshquill-core = { version = "=0.1.0-rc.2", path = "../meshquill-core" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

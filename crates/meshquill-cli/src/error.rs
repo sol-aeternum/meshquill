@@ -172,7 +172,9 @@ impl From<CliTransportBuildError> for CliError {
                 ExitStatus::Configuration,
                 format!("unknown explicit mock scenario '{scenario}'"),
             )
-            .with_hint("Use scenario `demo` or `ack-timeout`."),
+            .with_hint(
+                "Use scenario `demo`, `ack-timeout`, `reconnect-demo`, `reconnect-fail`, or `send-disconnect`.",
+            ),
             CliTransportBuildError::InvalidTransportConfig { transport, message } => Self::new(
                 ExitStatus::Configuration,
                 format!("invalid {transport} profile: {message}"),

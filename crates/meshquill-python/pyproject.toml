@@ -1,10 +1,10 @@
 [build-system]
-requires = ["maturin>=1.9,<2"]
+requires = ["maturin==1.11.5"]
 build-backend = "maturin"
 
 [project]
 name = "meshquill-sdk"
-version = "0.1.0rc1"
+version = "0.1.0rc2"
 description = "Async Python SDK for MeshCore companions, backed by Meshquill's Rust core"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,11 +34,13 @@ Issues = "https://github.com/sol-aeternum/meshquill/issues"
 
 [dependency-groups]
 dev = [
-  "maturin>=1.9,<2",
-  "mypy>=1.13,<2",
-  "pytest>=8.3,<9",
-  "pytest-asyncio>=0.24,<2",
-  "ruff>=0.9",
+  "maturin==1.11.5",
+  "mypy==1.20.2",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.16.0",
+  "twine==7.0.0",
+  "pip-audit==2.10.0",
 ]
 
 [tool.maturin]
@@ -60,6 +62,20 @@ select = ["ASYNC", "B", "E", "F", "I", "RUF", "UP"]
 python_version = "3.9"
 strict = true
 files = ["python", "examples", "tests"]
+
+[[tool.mypy.overrides]]
+# Pytest 9 supports Python 3.10+, but Meshquill is checked against its Python 3.9 floor.
+# Skip only pytest modules that use structural pattern matching; keep the rest of its types.
+module = [
+  "_pytest.assertion.compare_text",
+  "_pytest.assertion.rewrite",
+  "_pytest.assertion.util",
+  "_pytest.logging",
+  "_pytest.raises",
+  "_pytest.terminal",
+  "_pytest.unittest",
+]
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

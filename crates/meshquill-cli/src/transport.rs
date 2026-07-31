@@ -11,10 +11,13 @@ use thiserror::Error;
 
 use meshquill_test_support::{
     ContactFixture, VirtualCompanion, VirtualCompanionCapacities, VirtualCompanionError,
-    make_contact_row, make_direct_message_packet,
+    VirtualCompanionIdleReadMode, make_contact_row, make_direct_message_packet,
 };
 
+use crate::reconnect::DEVICE_RECONNECT_ATTEMPTS;
+
 const DEMO_CONTACT_KEY: [u8; 32] = [0x22; 32];
+const RECONNECT_DEMO_MESSAGE: &str = "Live direct message after deterministic reconnect";
 
 /// CLI transport wrapper selecting and delegating concrete transport implementations.
 #[derive(Debug)]
@@ -41,7 +44,9 @@ pub(crate) enum CliTransportBuildError {
         message: String,
     },
     /// The mock profile scenario is unknown.
-    #[error("unsupported mock scenario {scenario}; expected one of: demo, ack-timeout")]
+    #[error(
+        "unsupported mock scenario {scenario}; expected one of: demo, ack-timeout, reconnect-demo, reconnect-fail, send-disconnect"
+    )]
     UnknownMockScenario {
         /// Scenario string provided by profile configuration.
         scenario: String,
@@ -92,7 +97,7 @@ impl CliTransport {
         scenario: &str,
     ) -> Result<VirtualCompanion, CliTransportBuildError> {
         let emit_send_txt_ack = match scenario {
-            "demo" => true,
+            "demo" | "reconnect-demo" | "reconnect-fail" | "send-disconnect" => true,
             "ack-timeout" => false,
             scenario => {
                 return Err(CliTransportBuildError::UnknownMockScenario {
@@ -120,6 +125,28 @@ impl CliTransport {
             "Demo direct packet for deterministic CLI tests",
         )?)?;
         companion.configure_send_txt_ack([0x12, 0x34, 0x56, 0x78], 1_000, emit_send_txt_ack);
+        match scenario {
+            "reconnect-demo" => {
+                companion.disconnect_on_next_idle_read();
+                companion.fail_next_reconnects(2);
+                companion.set_next_reconnect_push(make_direct_message_packet(
+                    u8::MAX,
+                    RECONNECT_DEMO_MESSAGE,
+                )?)?;
+            }
+            "reconnect-fail" => {
+                companion.disconnect_on_next_idle_read();
+                companion.fail_next_reconnects(DEVICE_RECONNECT_ATTEMPTS);
+            }
+            "send-disconnect" => {
+                companion.disconnect_before_next_direct_send();
+            }
+            "ack-timeout" => {
+                companion.set_idle_read_mode(VirtualCompanionIdleReadMode::Pending);
+            }
+            "demo" => {}
+            _ => unreachable!("scenario was validated before fixture construction"),
+        }
         Ok(companion)
     }
 }
@@ -187,6 +214,7 @@ impl ReconnectableTransport for CliTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshquill_core::{Client, CoreError};
 
     fn mock_profile(scenario: &str) -> DeviceProfile {
         DeviceProfile {
@@ -208,10 +236,19 @@ mod tests {
             CliTransportBuildError::UnknownMockScenario { .. }
         ));
 
-        let timeout =
-            CliTransport::from_profile(&mock_profile("ack-timeout"), Duration::from_millis(10))
-                .expect("ack-timeout scenario should construct");
-        assert!(matches!(timeout, CliTransport::VirtualCompanion(_)));
+        for scenario in [
+            "ack-timeout",
+            "reconnect-demo",
+            "reconnect-fail",
+            "send-disconnect",
+        ] {
+            let transport =
+                CliTransport::from_profile(&mock_profile(scenario), Duration::from_millis(10))
+                    .unwrap_or_else(|error| {
+                        panic!("{scenario} scenario should construct: {error}")
+                    });
+            assert!(matches!(transport, CliTransport::VirtualCompanion(_)));
+        }
     }
 
     #[test]
@@ -219,5 +256,44 @@ mod tests {
         let demo = CliTransport::from_profile(&mock_profile("demo"), Duration::from_millis(10))
             .expect("demo scenario should construct");
         assert!(matches!(demo, CliTransport::VirtualCompanion(_)));
+    }
+
+    #[tokio::test]
+    async fn ack_timeout_queues_no_ack_and_keeps_the_idle_read_pending() {
+        let transport =
+            CliTransport::from_profile(&mock_profile("ack-timeout"), Duration::from_millis(10))
+                .expect("ack-timeout scenario should construct");
+        let mut client = Client::new(transport);
+        let _ = client
+            .connect()
+            .await
+            .expect("mock handshake should succeed");
+        let tracking = client
+            .send_direct_text(&[0x22; 6], 0, "no acknowledgement")
+            .await
+            .expect("mock send should return MSG_SENT");
+
+        let idle = tokio::time::timeout(Duration::from_millis(10), client.next_event()).await;
+        assert!(idle.is_err(), "idle read returned an unexpected ACK");
+        let ack = client
+            .wait_for_ack(tracking.ack_code, Some(Duration::from_millis(10)))
+            .await;
+        assert!(matches!(ack, Err(CoreError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn demo_scenario_retains_immediate_idle_timeout() {
+        let mut transport =
+            CliTransport::from_profile(&mock_profile("demo"), Duration::from_millis(10))
+                .expect("demo scenario should construct");
+        transport
+            .connect()
+            .await
+            .expect("mock connect should succeed");
+
+        let idle = tokio::time::timeout(Duration::from_millis(20), transport.read())
+            .await
+            .expect("demo idle read remained pending");
+        assert!(matches!(idle, Err(TransportError::Timeout)));
     }
 }

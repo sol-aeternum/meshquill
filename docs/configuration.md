@@ -96,8 +96,12 @@ type = "mock"
 scenario = "demo"
 ```
 
-The CLI runtime accepts only the mock scenarios `demo` and `ack-timeout`. Mock profiles are explicit
-test/demo configuration; discovery never silently substitutes one for failed hardware.
+The CLI runtime accepts the mock scenarios `demo`, `ack-timeout`, `reconnect-demo`,
+`reconnect-fail`, and `send-disconnect`. The latter four are deterministic fault fixtures for
+timeout, bounded reconnect, exhausted reconnect, and send recovery tests. `send-disconnect` is a
+deterministic pre-write, known-unsent fixture; it does not cover ambiguous after-write response loss.
+Mock profiles are explicit test/demo configuration; discovery never silently substitutes one for
+failed hardware.
 
 ## Timeouts
 
@@ -118,12 +122,17 @@ request/response work and can be overridden for one profile:
 request_timeout_ms = 5000
 ```
 
-That profile value wins over the global request timeout. `retry_timeout_ms` is persisted and exposed
-as an override, but the current foreground chat reconnect path makes one immediate attempt and does
-not run a configurable backoff loop. The global CLI `--timeout` is a per-command deadline used by
-operations such as discovery and acknowledgement waits; it does not rewrite these values.
+That profile value wins over the global request timeout. For `watch` and line chat,
+`retry_timeout_ms` is the delay before the second reconnect attempt; the third delay is twice that
+value, and both are capped by `connect_timeout_ms`. The first of at most three attempts is immediate.
+This policy reconnects only the companion session and never replays a mutation. The global CLI
+`--timeout` is a per-command deadline used by operations such as discovery and acknowledgement
+waits; it does not rewrite these values.
 
-All stored timeout values must be positive.
+All stored timeout values must be positive and no greater than 24 hours (86,400,000 milliseconds).
+The same 24-hour ceiling applies to CLI duration arguments, transport setup, Rust client request
+timeouts, hook deadlines, and Python SDK timeout values. The configuration file itself is read with
+a one-MiB hard bound before TOML parsing.
 
 ## Opt in to plaintext message history
 

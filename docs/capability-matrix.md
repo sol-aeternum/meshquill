@@ -47,7 +47,7 @@ surface is classified as implemented, superseded, core-only, or explicitly unsup
 | Command files/chaining | `batch run FILE`, one shell-like command per line, no expansion/pipes, bounded/fail-fast | implemented; arbitrary chained positional grammar superseded |
 | In-process aliases/echo | ordinary shell aliases and command files | deliberately superseded; no embedded shell |
 | Per-command `.` JSON prefix | global `--output json`; streams require JSONL | superseded with versioned schema |
-| Interactive contextual chat | portable `chat DESTINATION --line`, visible destination, incoming drain, `/quit`, retained draft `/send` | implemented line mode; no full-screen TUI/contact search/history pane |
+| Interactive contextual chat | portable `chat DESTINATION --line`, visible destination and live incoming display; `/contacts`, `/to`, `/channel`, conversation-filtered `/history`, and destination-bound retained-draft `/send` and `/discard` | implemented line mode; no full-screen TUI |
 | Interactive `>`, `>>`, `|` | normal OS shell composition | deliberately superseded |
 | Startup `.init` files | explicit profiles, config and bounded batch files | superseded; no hidden commands run at startup |
 | Presentation preferences (`classic_prompt`, arrows/slashes, print/echo toggles) | stable human/JSON/JSONL contracts and TTY detection | superseded; legacy importer does not pretend to migrate them |

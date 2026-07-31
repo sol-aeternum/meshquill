@@ -5,10 +5,131 @@ use std::{
     io::Write as _,
     path::Path,
     process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
 use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::{
+    io::{BufRead as _, BufReader, Read as _},
+    process::{Child, Output},
+    sync::mpsc::{self, Receiver},
+};
+
+#[cfg(unix)]
+struct InterruptibleChild {
+    child: Child,
+    first_stdout: Receiver<Vec<u8>>,
+    stdout_task: thread::JoinHandle<Vec<u8>>,
+    stderr_task: thread::JoinHandle<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl InterruptibleChild {
+    fn spawn(arguments: &[&str]) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_meshquill"))
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to spawn interruptible meshquill: {error}"));
+        let stdout = child.stdout.take().expect("piped child stdout");
+        let stderr = child.stderr.take().expect("piped child stderr");
+        let (first_tx, first_stdout) = mpsc::sync_channel(1);
+        let stdout_task = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut output = Vec::new();
+            reader
+                .read_until(b'\n', &mut output)
+                .expect("read first child stdout line");
+            let _ = first_tx.send(output.clone());
+            reader
+                .read_to_end(&mut output)
+                .expect("read remaining child stdout");
+            output
+        });
+        let stderr_task = thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).expect("read child stderr");
+            output
+        });
+        Self {
+            child,
+            first_stdout,
+            stdout_task,
+            stderr_task,
+        }
+    }
+
+    fn wait_for_first_stdout(&mut self, timeout: Duration) -> Vec<u8> {
+        match self.first_stdout.recv_timeout(timeout) {
+            Ok(line) => line,
+            Err(error) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("meshquill did not emit a first line: {error}");
+            }
+        }
+    }
+
+    fn interrupt(&mut self) {
+        let signal = Command::new("kill")
+            .args(["-INT", &self.child.id().to_string()])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to invoke kill: {error}"));
+        assert!(
+            signal.status.success(),
+            "failed to interrupt meshquill: {}",
+            text(&signal.stderr)
+        );
+    }
+
+    fn wait(mut self, timeout: Duration) -> Output {
+        let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) => {
+                    timed_out = true;
+                    let _ = self.child.kill();
+                    break self
+                        .child
+                        .wait()
+                        .unwrap_or_else(|error| panic!("failed to reap meshquill: {error}"));
+                }
+                Err(error) => panic!("failed to poll interrupted meshquill: {error}"),
+            }
+        };
+        let stdout = self
+            .stdout_task
+            .join()
+            .unwrap_or_else(|_| panic!("child stdout collector panicked"));
+        let stderr = self
+            .stderr_task
+            .join()
+            .unwrap_or_else(|_| panic!("child stderr collector panicked"));
+        assert!(
+            !timed_out,
+            "interrupted meshquill did not exit within {timeout:?}; stdout: {}; stderr: {}",
+            text(&stdout),
+            text(&stderr)
+        );
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+}
 
 fn invoke(arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_meshquill"))
@@ -23,6 +144,132 @@ fn invoke_with_env(arguments: &[&str], name: &str, value: &str) -> std::process:
         .env(name, value)
         .output()
         .unwrap_or_else(|error| panic!("failed to run meshquill: {error}"))
+}
+
+fn invoke_with_env_timeout(
+    arguments: &[&str],
+    name: &str,
+    value: &str,
+    command_timeout: Duration,
+) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meshquill"))
+        .args(arguments)
+        .env(name, value)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn meshquill: {error}"));
+    let deadline = Instant::now() + command_timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("failed to collect meshquill output: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap_or_else(|error| {
+                    panic!("failed to reap timed-out meshquill process: {error}")
+                });
+                panic!(
+                    "meshquill exceeded {command_timeout:?}; stdout: {}; stderr: {}",
+                    text(&output.stdout),
+                    text(&output.stderr)
+                );
+            }
+            Err(error) => panic!("failed to poll meshquill process: {error}"),
+        }
+    }
+}
+
+fn invoke_with_input_env_timeout(
+    arguments: &[&str],
+    input: &[u8],
+    name: &str,
+    value: &str,
+    command_timeout: Duration,
+) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meshquill"))
+        .args(arguments)
+        .env(name, value)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn meshquill: {error}"));
+    let mut stdin = child.stdin.take().expect("piped child stdin");
+    stdin
+        .write_all(input)
+        .unwrap_or_else(|error| panic!("failed to write child stdin: {error}"));
+    drop(stdin);
+
+    let deadline = Instant::now() + command_timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("failed to collect meshquill output: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap_or_else(|error| {
+                    panic!("failed to reap timed-out meshquill process: {error}")
+                });
+                panic!(
+                    "meshquill exceeded {command_timeout:?}; stdout: {}; stderr: {}",
+                    text(&output.stdout),
+                    text(&output.stderr)
+                );
+            }
+            Err(error) => panic!("failed to poll meshquill process: {error}"),
+        }
+    }
+}
+
+fn invoke_with_open_stdin_env_timeout(
+    arguments: &[&str],
+    name: &str,
+    value: &str,
+    command_timeout: Duration,
+) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meshquill"))
+        .args(arguments)
+        .env(name, value)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn meshquill: {error}"));
+    let _stdin = child.stdin.take().expect("piped child stdin");
+    let deadline = Instant::now() + command_timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|error| panic!("failed to collect meshquill output: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap_or_else(|error| {
+                    panic!("failed to reap timed-out meshquill process: {error}")
+                });
+                panic!(
+                    "meshquill exceeded {command_timeout:?}; stdout: {}; stderr: {}",
+                    text(&output.stdout),
+                    text(&output.stderr)
+                );
+            }
+            Err(error) => panic!("failed to poll meshquill process: {error}"),
+        }
+    }
 }
 
 fn invoke_with_input(arguments: &[&str], input: &[u8]) -> std::process::Output {
@@ -105,6 +352,13 @@ fn init_demo(config: &str) {
         "--set-default",
     ]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+}
+
+fn set_mock_scenario(config: &str, scenario: &str) {
+    let current = fs::read_to_string(config).expect("demo configuration");
+    let updated = current.replace("scenario = \"demo\"", &format!("scenario = {scenario:?}"));
+    assert_ne!(updated, current, "demo mock scenario was not found");
+    fs::write(config, updated).expect("mock scenario configuration");
 }
 
 #[test]
@@ -717,6 +971,63 @@ fn scoped_send_and_advertise_work_and_cleanup_scope() {
     assert_eq!(parsed["data"]["flood"], true);
 }
 
+#[cfg(unix)]
+#[test]
+fn scoped_ack_wait_handles_sigint_without_success_or_replay() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    enable_history(&config);
+    set_mock_scenario(&config, "ack-timeout");
+    let history = directory.path().join("history/demo.jsonl");
+    let mut child = InterruptibleChild::spawn(&[
+        "--config",
+        &config,
+        "--timeout",
+        "5s",
+        "--output",
+        "json",
+        "send",
+        "Alice",
+        "interrupt once",
+        "--wait",
+        "--scope",
+        "#field",
+    ]);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if fs::read_to_string(&history).is_ok_and(|value| value.contains("\"status\":\"pending\""))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let observed_history = fs::read_to_string(&history);
+    if !observed_history
+        .as_ref()
+        .is_ok_and(|value| value.contains("\"status\":\"pending\""))
+    {
+        let _ = child.child.kill();
+        let _ = child.child.wait();
+        panic!("send did not reach its bounded acknowledgement wait: {observed_history:?}");
+    }
+    child.interrupt();
+    let output = child.wait(Duration::from_secs(3));
+    assert_eq!(output.status.code(), Some(130), "{}", text(&output.stderr));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("interrupted by user"));
+
+    let entries: Vec<Value> = fs::read_to_string(history)
+        .expect("interrupted history")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("history entry"))
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["status"], "pending");
+    assert_eq!(entries[0]["text"], "interrupt once");
+}
+
 #[test]
 fn invalid_network_scope_length_is_rejected_before_default_is_mutated() {
     let directory = TempDir::new().expect("temporary directory");
@@ -817,6 +1128,78 @@ fn bounded_watch_emits_jsonl_and_exits() {
     assert_eq!(lines.len(), 1);
     let parsed: Value = serde_json::from_str(&lines[0]).expect("JSONL event");
     assert_eq!(parsed["data"]["event"], "connected");
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_handles_sigint_with_stable_interrupted_status() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let mut child = InterruptibleChild::spawn(&[
+        "--config",
+        &config,
+        "--output",
+        "jsonl",
+        "watch",
+        "--event",
+        "connection",
+    ]);
+    let first = child.wait_for_first_stdout(Duration::from_secs(2));
+    let parsed: Value = serde_json::from_slice(&first).expect("first watch event");
+    assert_eq!(parsed["data"]["event"], "connected");
+    child.interrupt();
+    let output = child.wait(Duration::from_secs(2));
+    assert_eq!(output.status.code(), Some(130), "{}", text(&output.stderr));
+    assert!(text(&output.stderr).contains("interrupted by user"));
+}
+
+#[test]
+fn watch_recovers_after_bounded_reconnect_failures_and_emits_live_message() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    set_mock_scenario(&config, "reconnect-demo");
+
+    let output = invoke_with_env_timeout(
+        &[
+            "--config", &config, "--output", "jsonl", "watch", "--event", "message", "--count", "1",
+        ],
+        "MESHQUILL_TIMEOUT_RETRY_MS",
+        "1",
+        Duration::from_secs(3),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<_> = text(&output.stdout).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 1);
+    let parsed: Value = serde_json::from_str(&lines[0]).expect("JSONL reconnect event");
+    assert_eq!(parsed["schema"], "meshquill.cli/v1");
+    assert_eq!(parsed["type"], "event");
+    assert_eq!(parsed["data"]["event"], "message");
+    assert_eq!(
+        parsed["data"]["data"]["message"]["text"],
+        "Live direct message after deterministic reconnect"
+    );
+}
+
+#[test]
+fn watch_exits_with_connection_status_after_reconnect_attempts_are_exhausted() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    set_mock_scenario(&config, "reconnect-fail");
+
+    let output = invoke_with_env_timeout(
+        &[
+            "--config", &config, "--output", "jsonl", "watch", "--event", "message", "--count", "1",
+        ],
+        "MESHQUILL_TIMEOUT_RETRY_MS",
+        "1",
+        Duration::from_secs(3),
+    );
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(text(&output.stderr).contains("the companion connection is unavailable"));
 }
 
 #[test]
@@ -1031,6 +1414,294 @@ fn line_chat_accepts_piped_lines_without_a_tui() {
     );
     assert_eq!(lines[2]["data"]["state"], "sent");
     assert_eq!(lines[3]["data"]["state"], "acknowledged");
+}
+
+#[test]
+fn line_chat_reconnects_without_losing_or_replaying_piped_text() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    set_mock_scenario(&config, "reconnect-demo");
+
+    let output = invoke_with_input_env_timeout(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        b"hello after reconnect\n/quit\n",
+        "MESHQUILL_TIMEOUT_RETRY_MS",
+        "1",
+        Duration::from_secs(3),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat reconnect JSONL record"))
+        .collect();
+    let states: Vec<_> = lines
+        .iter()
+        .filter_map(|line| line["data"]["state"].as_str())
+        .collect();
+    assert!(states.contains(&"reconnected"), "{}", text(&output.stdout));
+    assert_eq!(
+        states.iter().filter(|state| **state == "sent").count(),
+        1,
+        "{}",
+        text(&output.stdout)
+    );
+    assert_eq!(
+        states
+            .iter()
+            .filter(|state| **state == "acknowledged")
+            .count(),
+        1,
+        "{}",
+        text(&output.stdout)
+    );
+    assert!(lines.iter().any(|line| {
+        line["data"]["state"] == "incoming"
+            && line["data"]["text"] == "Live direct message after deterministic reconnect"
+    }));
+}
+
+#[test]
+fn line_chat_retains_known_unsent_draft_until_explicit_retry() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    set_mock_scenario(&config, "send-disconnect");
+
+    let output = invoke_with_input_env_timeout(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        b"known unsent text\n/send\n/quit\n",
+        "MESHQUILL_TIMEOUT_RETRY_MS",
+        "1",
+        Duration::from_secs(3),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat draft JSONL record"))
+        .collect();
+    let states: Vec<_> = lines
+        .iter()
+        .filter_map(|line| line["data"]["state"].as_str())
+        .collect();
+    assert_eq!(
+        states.iter().filter(|state| **state == "sent").count(),
+        1,
+        "{}",
+        text(&output.stdout)
+    );
+    assert_eq!(
+        states
+            .iter()
+            .filter(|state| **state == "acknowledged")
+            .count(),
+        1,
+        "{}",
+        text(&output.stdout)
+    );
+    assert!(lines.iter().any(|line| {
+        line["data"]["state"] == "reconnected" && line["data"]["draft_retained"] == true
+    }));
+}
+
+#[test]
+fn failed_chat_reconnect_emits_one_disconnect_hook() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    set_mock_scenario(&config, "reconnect-fail");
+    let script = directory.path().join("disconnect_hook.py");
+    fs::write(
+        &script,
+        concat!(
+            "from pathlib import Path\n",
+            "\n",
+            "def on_disconnect(event):\n",
+            "    marker = Path(__file__).with_suffix('.disconnects')\n",
+            "    with marker.open('a', encoding='utf-8') as stream:\n",
+            "        stream.write(str(event['payload'].get('reason')) + '\\n')\n",
+        ),
+    )
+    .expect("write disconnect hook");
+    add_hook_config(&config, &script.display().to_string(), None);
+
+    let output = invoke_with_open_stdin_env_timeout(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        "MESHQUILL_TIMEOUT_RETRY_MS",
+        "1",
+        Duration::from_secs(3),
+    );
+    assert_eq!(output.status.code(), Some(5), "{}", text(&output.stderr));
+    let reasons =
+        fs::read_to_string(script.with_extension("disconnects")).expect("disconnect hook marker");
+    let reasons: Vec<_> = reasons.lines().collect();
+    assert_eq!(reasons.len(), 1, "disconnect hook ran more than once");
+    assert!(
+        matches!(
+            reasons[0],
+            "chat target lookup transport failed"
+                | "initial chat inbox transport failed"
+                | "chat device event"
+        ),
+        "unexpected disconnect reason: {}",
+        reasons[0]
+    );
+}
+
+#[test]
+fn line_chat_help_contacts_and_destination_changes_are_chat_events() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke_with_input(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        b"/help\n/contacts\n/contacts LIc\n/channel 7\n/to 2222\n/quit\n",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+        .collect();
+    assert_eq!(lines.len(), 7, "{}", text(&output.stdout));
+    assert!(lines.iter().all(|line| line["type"] == "chat"));
+    assert_eq!(lines[2]["data"]["state"], "help");
+    assert!(
+        lines[2]["data"]["commands"]
+            .as_array()
+            .expect("help commands")
+            .iter()
+            .any(|command| command.as_str() == Some("/channel <0..255>"))
+    );
+    assert_eq!(lines[3]["data"]["state"], "contacts");
+    assert_eq!(lines[3]["data"]["contacts"][0]["name"], "Alice");
+    assert_eq!(
+        lines[3]["data"]["contacts"][0]["public_key_prefix"],
+        "222222222222"
+    );
+    assert_eq!(lines[4]["data"]["state"], "contacts");
+    assert_eq!(lines[4]["data"]["query"], "LIc");
+    assert_eq!(lines[4]["data"]["contacts"][0]["name"], "Alice");
+    assert_eq!(lines[5]["data"]["state"], "destination_changed");
+    assert_eq!(lines[5]["data"]["destination"], "7");
+    assert_eq!(lines[6]["data"]["state"], "destination_changed");
+    assert_eq!(lines[6]["data"]["destination"], "Alice");
+    assert!(!lines.iter().any(|line| line["data"]["state"] == "sent"));
+}
+
+#[test]
+fn line_chat_command_errors_are_nonfatal_and_history_disabled_is_explicit() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let output = invoke_with_input(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        b"/hlep\n/channel nope\n/to alice\n/send\n/history\n/quit\n",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+        .collect();
+    assert_eq!(lines.len(), 7, "{}", text(&output.stdout));
+    assert!(lines.iter().all(|line| line["type"] == "chat"));
+    assert_eq!(lines[2]["data"]["state"], "command_error");
+    assert_eq!(lines[2]["data"]["command"], "/hlep");
+    assert_eq!(lines[2]["data"]["suggestion"], "/help");
+    assert_eq!(lines[3]["data"]["state"], "command_error");
+    assert_eq!(lines[3]["data"]["command"], "/channel");
+    assert!(lines[3]["data"].get("suggestion").is_none());
+    assert_eq!(lines[4]["data"]["state"], "command_error");
+    assert_eq!(lines[4]["data"]["command"], "/to");
+    assert_eq!(lines[4]["data"]["suggestion"], "Alice");
+    assert_eq!(lines[5]["data"]["state"], "command_error");
+    assert_eq!(lines[5]["data"]["command"], "/send");
+    assert_eq!(lines[6]["data"]["state"], "history");
+    assert_eq!(lines[6]["data"]["destination"], "Alice");
+    assert_eq!(lines[6]["data"]["enabled"], false);
+    assert_eq!(lines[6]["data"]["storage"], "plaintext_opt_in");
+    assert_eq!(lines[6]["data"]["entries"], Value::Array(Vec::new()));
+    assert!(!lines.iter().any(|line| line["data"]["state"] == "sent"));
+}
+
+#[test]
+fn line_chat_double_slash_sends_one_literal_slash() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    enable_history(&config);
+    let output = invoke_with_input(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        b"//help\n/quit\n",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+        .collect();
+    assert!(lines.iter().all(|line| line["type"] == "chat"));
+    assert!(lines.iter().any(|line| line["data"]["state"] == "sent"));
+    assert!(!lines.iter().any(|line| line["data"]["state"] == "help"));
+
+    let entries: Vec<Value> = fs::read_to_string(directory.path().join("history/demo.jsonl"))
+        .expect("chat history")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("history entry"))
+        .collect();
+    assert!(entries.iter().any(|entry| {
+        entry["direction"] == "outgoing" && entry["peer"] == "Alice" && entry["text"] == "/help"
+    }));
+}
+
+#[test]
+fn line_chat_rejects_oversized_piped_input_without_sending() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let mut input = vec![b'x'; 4_097];
+    input.push(b'\n');
+    let output = invoke_with_input(
+        &[
+            "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+        ],
+        &input,
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output.stderr));
+    assert!(text(&output.stderr).contains("4096-byte input bound"));
+    let lines: Vec<Value> = text(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("chat JSONL record"))
+        .collect();
+    assert!(!lines.iter().any(|line| line["data"]["state"] == "sent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn line_chat_handles_sigint_while_waiting_for_input() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config = config_path(&directory);
+    init_demo(&config);
+    let mut child = InterruptibleChild::spawn(&[
+        "--config", &config, "--output", "jsonl", "chat", "Alice", "--line",
+    ]);
+    let first = child.wait_for_first_stdout(Duration::from_secs(2));
+    let parsed: Value = serde_json::from_slice(&first).expect("first chat event");
+    assert_eq!(parsed["data"]["state"], "connected");
+    child.interrupt();
+    let output = child.wait(Duration::from_secs(2));
+    assert_eq!(output.status.code(), Some(130), "{}", text(&output.stderr));
+    assert!(text(&output.stderr).contains("interrupted by user"));
 }
 
 #[test]

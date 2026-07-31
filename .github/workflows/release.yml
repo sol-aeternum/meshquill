@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "release tags must be semantic versions such as v0.1.0-rc.1" >&2
+            echo "release tags must be semantic versions such as v0.1.0-rc.2" >&2
             exit 2
           fi
           expected=${GITHUB_REF_NAME#v}
@@ -99,6 +99,9 @@ jobs:
           test -s "$root/LICENSE-MIT"
           test -s "$root/LICENSE-APACHE"
           test -s "$root/docs/getting-started.md"
+          test -s "$root/schemas/meshquill-cli-v1.schema.json"
+          test -s "$root/schemas/compat/cli-v1-result.json"
+          test -s "$root/schemas/compat/cli-v1-stream.jsonl"
           test -s "$root/share/completions/meshquill.bash"
           grep -Fq "${GITHUB_REF_NAME#v}" "$root/share/man/man1/meshquill-send.1"
           "$binary" --config "$smoke/config.toml" --non-interactive init --name demo --demo --set-default
@@ -119,7 +122,7 @@ jobs:
           $binary = Join-Path $root "bin/meshquill.exe"
           $version = ($env:GITHUB_REF_NAME).Substring(1)
           if ((& $binary --version) -ne "meshquill $version") { throw "version mismatch" }
-          foreach ($required in @("LICENSE-MIT", "LICENSE-APACHE", "docs/getting-started.md", "share/completions/_meshquill.ps1", "share/man/man1/meshquill-send.1")) {
+          foreach ($required in @("LICENSE-MIT", "LICENSE-APACHE", "docs/getting-started.md", "schemas/meshquill-cli-v1.schema.json", "schemas/compat/cli-v1-result.json", "schemas/compat/cli-v1-stream.jsonl", "share/completions/_meshquill.ps1", "share/man/man1/meshquill-send.1")) {
             $requiredPath = Join-Path $root $required
             if (!(Test-Path -LiteralPath $requiredPath -PathType Leaf)) { throw "missing $required" }
             if ((Get-Item -LiteralPath $requiredPath).Length -eq 0) { throw "empty $required" }
@@ -181,10 +184,10 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           working-directory: crates/meshquill-python
           before-script-linux: dnf install -y dbus-devel systemd-devel pkgconf-pkg-config
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        if: matrix.smoke
+      - name: Set up Python 3.14 wheel audit and test environment
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Audit Linux wheel compatibility
         if: runner.os == 'Linux'
         shell: bash
@@ -200,7 +203,7 @@ jobs:
 
           report = os.environ["AUDITWHEEL_REPORT"]
           platform = re.search(
-              r'is\s+consistent with\s+the following platform tag: "([^"]+)"',
+              r'is\s+consistent\s+with\s+the\s+following\s+platform\s+tag:\s*"([^"]+)"',
               report,
           )
           if platform is None:
@@ -211,11 +214,39 @@ jobs:
                   f"wheel actually requires {platform.group(1)!r}, newer than manylinux_2_28"
               )
           PY
-      - name: Install and import wheel
+      - name: Install and test wheel on Python 3.14
         if: matrix.smoke
         shell: bash
         run: |
-          python -m pip install "mypy>=1.13,<2" "pytest>=8.3,<9" "pytest-asyncio>=0.24,<2"
+          python -m pip install --requirement crates/meshquill-python/requirements-dev.txt
+          python -m twine check --strict dist/wheels/*.whl
+          python -m pip install --force-reinstall dist/wheels/*.whl
+          python -m pip check
+          EXPECTED_RUST=${GITHUB_REF_NAME#v}
+          EXPECTED_PY=${EXPECTED_RUST/-rc./rc}
+          export EXPECTED_RUST EXPECTED_PY
+          python - <<'PY'
+          import importlib.metadata
+          import os
+
+          import meshcore_sdk
+
+          assert meshcore_sdk.__version__ == os.environ["EXPECTED_RUST"]
+          assert importlib.metadata.version("meshquill-sdk") == os.environ["EXPECTED_PY"]
+          PY
+          python -m pytest crates/meshquill-python/tests
+          python -m mypy.stubtest meshcore_sdk
+          python crates/meshquill-python/examples/quickstart.py
+          python crates/meshquill-python/examples/streaming.py
+      - name: Set up Python 3.9 wheel smoke environment
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        if: matrix.smoke
+        with:
+          python-version: "3.9"
+      - name: Install and compatibility-test wheel on Python 3.9
+        if: matrix.smoke
+        shell: bash
+        run: |
           python -m pip install --force-reinstall dist/wheels/*.whl
           python -m pip check
           EXPECTED_RUST=${GITHUB_REF_NAME#v}
@@ -238,8 +269,6 @@ jobs:
               assert any(name.endswith(".dist-info/licenses/LICENSE-MIT") for name in names)
               assert any(name.endswith(".dist-info/licenses/LICENSE-APACHE") for name in names)
           PY
-          python -m pytest crates/meshquill-python/tests
-          python -m mypy.stubtest meshcore_sdk
           python crates/meshquill-python/examples/quickstart.py
           python crates/meshquill-python/examples/streaming.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -264,14 +293,60 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(find dist -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 5
-          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
-          while IFS= read -r checksum; do
-            (cd dist && sha256sum --check "$(basename "$checksum")")
-          done < <(find dist -maxdepth 1 -type f -name '*.sha256' -print)
-          (cd dist && sha256sum ./*.tar.gz ./*.zip ./*.whl > SHA256SUMS)
+          python_version=${GITHUB_REF_NAME#v}
+          python_version=${python_version/-rc./rc}
+          python_version=${python_version/-alpha./a}
+          python_version=${python_version/-beta./b}
+          native_archives=(
+            "meshquill-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz"
+            "meshquill-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu.tar.gz"
+            "meshquill-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz"
+            "meshquill-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.zip"
+            "meshquill-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          wheel_assets=(
+            "meshquill_sdk-${python_version}-cp39-abi3-macosx_10_12_x86_64.whl"
+            "meshquill_sdk-${python_version}-cp39-abi3-macosx_11_0_arm64.whl"
+            "meshquill_sdk-${python_version}-cp39-abi3-manylinux_2_28_aarch64.whl"
+            "meshquill_sdk-${python_version}-cp39-abi3-manylinux_2_28_x86_64.whl"
+            "meshquill_sdk-${python_version}-cp39-abi3-win_amd64.whl"
+          )
+          expected_assets=("${native_archives[@]}" "${wheel_assets[@]}")
+          for archive in "${native_archives[@]}"; do
+            expected_assets+=("${archive}.sha256")
+          done
+          test "${#expected_assets[@]}" -eq 15
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 15
+          for asset in "${expected_assets[@]}"; do
+            test -s "dist/$asset"
+          done
+          (
+            cd dist
+            for archive in "${native_archives[@]}"; do
+              checksum="${archive}.sha256"
+              test "$(wc -l < "$checksum")" -eq 1
+              test "$(awk 'NF == 2 { print $2 }' "$checksum")" = "$archive"
+              sha256sum --check "$checksum"
+            done
+            sha256sum "${native_archives[@]}" "${wheel_assets[@]}" > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          test "$(wc -l < dist/SHA256SUMS)" -eq 10
+          expected_assets+=(SHA256SUMS)
+          test "${#expected_assets[@]}" -eq 16
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 16
+          printf '%s\n' "${expected_assets[@]}" > "$RUNNER_TEMP/meshquill-release-assets.txt"
       - name: Create draft GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --generate-notes --title "Meshquill $GITHUB_REF_NAME"
+        run: |
+          set -euo pipefail
+          mapfile -t assets < "$RUNNER_TEMP/meshquill-release-assets.txt"
+          for index in "${!assets[@]}"; do
+            assets[$index]="dist/${assets[$index]}"
+          done
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --draft --prerelease --latest=false --verify-tag --generate-notes \
+            --title "Meshquill $GITHUB_REF_NAME"

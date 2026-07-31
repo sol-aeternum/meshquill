@@ -1,0 +1,1 @@
+{"schema":"meshquill.mqtt/v1","event_id":"00000000-0000-0000-0000-000000000001","origin":"remote","timestamp":1,"type":"send_direct","data":{"destination":"alice","text":"hello"}}

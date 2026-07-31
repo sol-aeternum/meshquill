@@ -1,0 +1,1 @@
+{"schema":"meshquill.mqtt/v1","event_id":"00000000-0000-0000-0000-000000000002","origin":"remote","timestamp":2,"type":"send_channel","data":{"channel":3,"text":"hello room"}}

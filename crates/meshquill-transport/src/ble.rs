@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::discovery::{
     DiscoveredDevice, DiscoveryError, TargetError, TransportTarget, validate_nonempty,
-    validate_nonzero,
+    validate_timeout,
 };
 use crate::framed::validate_payload;
 
@@ -49,7 +49,7 @@ type AdapterEventStream = Pin<Box<dyn Stream<Item = CentralEvent> + Send>>;
 ///
 /// # Errors
 /// Returns an actionable [`DiscoveryError`] when no adapter exists, Bluetooth is off, permissions
-/// or provider operations fail, or the timeout is zero.
+/// or provider operations fail, or the timeout is zero or greater than 24 hours.
 pub async fn discover_ble(timeout: Duration) -> Result<Vec<DiscoveredDevice>, DiscoveryError> {
     discover_ble_with_cancellation(timeout, &CancellationToken::new()).await
 }
@@ -171,14 +171,15 @@ impl BleTransport {
     /// The constructor also accepts the `ble:`-qualified `id` exposed by [`DiscoveredDevice`].
     ///
     /// # Errors
-    /// Returns [`TargetError`] when the selector is blank or the timeout is zero.
+    /// Returns [`TargetError`] when the selector is blank or the timeout is zero or greater than
+    /// 24 hours.
     pub fn new(
         selector: impl Into<String>,
         connect_timeout: Duration,
     ) -> Result<Self, TargetError> {
         let selector = selector.into();
         validate_nonempty("selector", &selector)?;
-        validate_nonzero("connect_timeout", connect_timeout.as_nanos())?;
+        validate_timeout("connect_timeout", connect_timeout)?;
         Ok(Self {
             selector,
             connect_timeout,
@@ -943,7 +944,7 @@ fn ble_io(error: &btleplug::Error, operation: &str, selector: &str) -> Transport
 }
 
 fn validate_scan_timeout(timeout: Duration) -> Result<(), DiscoveryError> {
-    validate_nonzero("scan_timeout", timeout.as_nanos()).map_err(DiscoveryError::InvalidTarget)
+    validate_timeout("scan_timeout", timeout).map_err(DiscoveryError::InvalidTarget)
 }
 
 enum ScanStopError {
@@ -1131,6 +1132,20 @@ mod tests {
     fn constructor_accepts_discovery_id_and_rejects_invalid_inputs() {
         assert!(BleTransport::new("", Duration::from_secs(1)).is_err());
         assert!(BleTransport::new("device", Duration::ZERO).is_err());
+        assert!(
+            BleTransport::new(
+                "device",
+                meshquill_core::MAX_OPERATION_TIMEOUT.saturating_add(Duration::from_nanos(1)),
+            )
+            .is_err()
+        );
+        assert!(validate_scan_timeout(meshquill_core::MAX_OPERATION_TIMEOUT).is_ok());
+        assert!(
+            validate_scan_timeout(
+                meshquill_core::MAX_OPERATION_TIMEOUT.saturating_add(Duration::from_nanos(1)),
+            )
+            .is_err()
+        );
         let transport =
             BleTransport::new("ble:platform-id", Duration::from_secs(2)).expect("valid BLE target");
         assert_eq!(transport.selector(), "ble:platform-id");

@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use meshquill_core::transport::TransportKind;
+use meshquill_core::{MAX_OPERATION_TIMEOUT, transport::TransportKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -226,6 +226,19 @@ where
         return Err(TargetError::Invalid {
             field,
             message: format!("must be non-zero (got {value})"),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_timeout(
+    field: &'static str,
+    value: std::time::Duration,
+) -> Result<(), TargetError> {
+    if value.is_zero() || value > MAX_OPERATION_TIMEOUT {
+        return Err(TargetError::Invalid {
+            field,
+            message: "must be greater than zero and at most 24 hours".to_owned(),
         });
     }
     Ok(())

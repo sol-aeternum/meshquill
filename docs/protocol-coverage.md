@@ -75,7 +75,9 @@ scope, authentication, remote status, telemetry, binary/anonymous responses, pat
 control data. Python exposes raw local telemetry queries and unsolicited telemetry events as the
 same immutable typed response, separately from statistics. Exact field bounds, invalid UTF-8,
 truncated samples, unknown codes and oversized outer
-frames have unit tests; two libFuzzer targets continuously feed inner and outer parsers.
+frames have unit tests. Four libFuzzer targets exercise two codecs (`protocol_packet` for inner
+packets and `outer_frames` for transport framing) plus two remote/application parsers
+(`remote_payloads` and `mqtt_commands`).
 
 Advertisement/path-update/log/raw/trace/contact-deletion/channel-data packets whose current public
 model would discard information remain bounded `UnknownPacket` events rather than being silently

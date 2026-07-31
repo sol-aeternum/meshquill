@@ -5,25 +5,31 @@ use std::{
     fs,
     io::{self, BufRead, IsTerminal, Read, Write},
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc as std_mpsc,
+    },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::CommandFactory;
 use meshquill_core::{
     Client, Contact, ContactRoute, ContactType, CoreError, DefaultFloodScope, DeviceInfo, Event,
-    FloodScope, ManagedClient, Message, SelfInfo, TransportError, domain::CommandTracking,
+    FloodScope, ManagedClient, Message, SelfInfo, domain::CommandTracking,
     protocol::MAX_INNER_PAYLOAD,
 };
 use meshquill_hooks::ContactChange;
-use meshquill_store::{Config, DeviceProfile, HistoryEntry, LoadOutcome, TransportConfig};
+use meshquill_store::{
+    Config, DeviceProfile, HistoryDirection, HistoryEntry, LoadOutcome, TransportConfig,
+};
 use meshquill_transport::{
     DiscoveredDevice, discover_ble, discover_serial_async, manual_tcp_device,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -37,12 +43,17 @@ use crate::{
         SelectedProfile, config_store, initialize, load_optional, load_unmodified, select_profile,
     },
     error::CliError,
-    hooks_cli, mqtt_cli,
+    hooks_cli,
+    input::read_bounded_line,
+    interrupt::InterruptWatcher,
+    mqtt_cli,
     output::{ExitStatus, OutputWriter},
+    reconnect::{ReconnectPolicy, reconnect_device, reconnect_trigger},
     remote_cli,
     transport::CliTransport,
     workflow::{
-        OutgoingRecord, WorkflowServices, clear_history, history_store_for_selected, load_history,
+        IncomingOrigin, OutgoingRecord, WorkflowServices, clear_history,
+        history_store_for_selected, load_history,
     },
 };
 
@@ -1781,13 +1792,26 @@ async fn send<W: Write>(
         None => None,
     };
     let client = make_client(&selected)?;
-    let info = match client.connect().await {
+    let interrupt = InterruptWatcher::install().await;
+    let connect_result = tokio::select! {
+        result = client.connect() => result,
+        () = interrupt.cancelled() => {
+            client.cancel_pending_operations();
+            let _ = client.shutdown().await;
+            return Err(interrupt.error());
+        }
+    };
+    let info = match connect_result {
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
     if let Err(error) = workflow.connected(&info.name).await {
         let _ = client.shutdown().await;
         return Err(error);
+    }
+    if interrupt.token().is_cancelled() {
+        cleanup_workflow(&client, &workflow, "interrupted").await;
+        return Err(interrupt.error());
     }
 
     if let Some((scope, _)) = &scope
@@ -1796,6 +1820,10 @@ async fn send<W: Write>(
         let cli_error = CliError::from(error);
         cleanup_send(&client, &workflow, true, "scope selection failed").await;
         return Err(cli_error);
+    }
+    if interrupt.token().is_cancelled() {
+        cleanup_send(&client, &workflow, scope.is_some(), "interrupted").await;
+        return Err(interrupt.error());
     }
 
     let mut outgoing = match workflow
@@ -1809,9 +1837,23 @@ async fn send<W: Write>(
         }
     };
     let workflow_message_id = outgoing.message_id().to_string();
+    if interrupt.token().is_cancelled() {
+        if let Err(history_error) = workflow.failed(&mut outgoing).await {
+            tracing::warn!(error = %history_error, "could not record interrupted send state");
+        }
+        cleanup_send(&client, &workflow, scope.is_some(), "interrupted").await;
+        return Err(interrupt.error());
+    }
 
     let report = {
         if let Some(channel) = channel {
+            if interrupt.token().is_cancelled() {
+                if let Err(history_error) = workflow.failed(&mut outgoing).await {
+                    tracing::warn!(error = %history_error, "could not record interrupted send state");
+                }
+                cleanup_send(&client, &workflow, scope.is_some(), "interrupted").await;
+                return Err(interrupt.error());
+            }
             let result = client
                 .send_channel_message(channel, 0, &prepared.text)
                 .await;
@@ -1823,7 +1865,7 @@ async fn send<W: Write>(
                             &prepared.destination,
                             &prepared.text,
                             &workflow_message_id,
-                            [0; 4],
+                            None,
                         )
                         .await
                     {
@@ -1880,6 +1922,13 @@ async fn send<W: Write>(
                     return Err(error);
                 }
             };
+            if interrupt.token().is_cancelled() {
+                if let Err(history_error) = workflow.failed(&mut outgoing).await {
+                    tracing::warn!(error = %history_error, "could not record interrupted send state");
+                }
+                cleanup_send(&client, &workflow, scope.is_some(), "interrupted").await;
+                return Err(interrupt.error());
+            }
             let prefix = &contact.public_key.as_bytes()[..6];
             let tracking = match client.send_direct_text(prefix, 0, &prepared.text).await {
                 Ok(value) => value,
@@ -1898,7 +1947,7 @@ async fn send<W: Write>(
                     &contact.adv_name,
                     &prepared.text,
                     &workflow_message_id,
-                    tracking.ack_code,
+                    Some(tracking.ack_code),
                 )
                 .await
             {
@@ -1914,7 +1963,21 @@ async fn send<W: Write>(
             let ack = if args.wait {
                 let firmware_timeout = Duration::from_millis(u64::from(tracking.timeout_ms));
                 let timeout = firmware_timeout.min(cli.timeout);
-                match client.wait_for_ack(tracking.ack_code, Some(timeout)).await {
+                let ack_result = tokio::select! {
+                    result = client.wait_for_ack(tracking.ack_code, Some(timeout)) => result,
+                    () = interrupt.cancelled() => {
+                        client.cancel_pending_operations();
+                        cleanup_send(
+                            &client,
+                            &workflow,
+                            scope.is_some(),
+                            "interrupted",
+                        )
+                        .await;
+                        return Err(interrupt.error());
+                    }
+                };
+                match ack_result {
                     Ok(value) => {
                         if let Err(error) = workflow
                             .acknowledged(
@@ -1978,12 +2041,20 @@ async fn send<W: Write>(
             return Err(error);
         }
     };
+    if interrupt.token().is_cancelled() {
+        cleanup_send(&client, &workflow, scope.is_some(), "interrupted").await;
+        return Err(interrupt.error());
+    }
     if scope.is_some()
         && let Err(error) = client.set_flood_scope(&FloodScope::Default).await
     {
         let _ = workflow.disconnected(Some("scope reset failed")).await;
         let _ = client.shutdown().await;
         return Err(CliError::from(error));
+    }
+    if interrupt.token().is_cancelled() {
+        cleanup_workflow(&client, &workflow, "interrupted").await;
+        return Err(interrupt.error());
     }
 
     finish_workflow(&client, &workflow, "command completed").await?;
@@ -2048,13 +2119,14 @@ async fn inbox<W: Write>(
     let mut drained = false;
     while args.limit.is_none_or(|limit| messages.len() < limit) {
         match client.sync_next_message().await {
-            Ok(Some(message)) => {
-                if let Err(error) = workflow.incoming(&message).await {
+            Ok(Some(message)) => match workflow.incoming(&message, IncomingOrigin::Queue).await {
+                Ok(Some(_)) => messages.push(message),
+                Ok(None) => {}
+                Err(error) => {
                     cleanup_workflow(&client, &workflow, "incoming workflow failed").await;
                     return Err(error);
                 }
-                messages.push(message);
-            }
+            },
             Ok(None) => {
                 drained = true;
                 break;
@@ -2381,10 +2453,9 @@ fn read_legacy_address(source: &Path) -> Result<String, CliError> {
 pub(crate) fn make_client(selected: &SelectedProfile) -> Result<ManagedClient, CliError> {
     tracing::debug!(profile = %selected.name, "creating bounded CLI client");
     let transport = CliTransport::from_profile(&selected.profile, selected.connect_timeout())?;
-    Ok(ManagedClient::spawn(Client::with_timeout(
-        transport,
-        selected.request_timeout(),
-    )))
+    let client =
+        Client::with_timeout(transport, selected.request_timeout()).map_err(CliError::from)?;
+    Ok(ManagedClient::spawn(client))
 }
 
 async fn finish<T>(client: &ManagedClient, operation: Result<T, CoreError>) -> Result<T, CliError> {
@@ -2687,11 +2758,17 @@ pub(crate) fn resolve_contact<'a>(
         [] => {}
     }
     if query.is_empty() || !query.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(CliError::new(
+        let error = CliError::new(
             ExitStatus::NotFound,
             format!("contact '{query}' was not found"),
-        )
-        .with_hint("Use an exact case-sensitive name or a unique hexadecimal key prefix."));
+        );
+        return Err(match contact_name_suggestion(contacts, query) {
+            Some(suggestion) => error.with_hint(format!(
+                "Did you mean '{suggestion}'? Contact names are case-sensitive; no contact was selected."
+            )),
+            None => error
+                .with_hint("Use an exact case-sensitive name or a unique hexadecimal key prefix."),
+        });
     }
     let prefix = query.to_ascii_lowercase();
     let matches: Vec<_> = contacts
@@ -2700,10 +2777,20 @@ pub(crate) fn resolve_contact<'a>(
         .collect();
     match matches.as_slice() {
         [contact] => Ok(contact),
-        [] => Err(CliError::new(
-            ExitStatus::NotFound,
-            format!("contact key prefix '{query}' was not found"),
-        )),
+        [] => {
+            let error = CliError::new(
+                ExitStatus::NotFound,
+                format!("contact key prefix '{query}' was not found"),
+            );
+            Err(match contact_name_suggestion(contacts, query) {
+                Some(suggestion) => error.with_hint(format!(
+                    "Did you mean the contact '{suggestion}'? No contact was selected."
+                )),
+                None => error.with_hint(
+                    "Use an exact case-sensitive name or a unique hexadecimal key prefix.",
+                ),
+            })
+        }
         [_, ..] => Err(CliError::new(
             ExitStatus::Usage,
             format!("contact key prefix '{query}' is ambiguous"),
@@ -2866,10 +2953,9 @@ pub(crate) fn confirm(cli: &Cli, operation: &str) -> Result<(), CliError> {
         .and_then(|()| stderr.flush())
         .map_err(|_| CliError::new(ExitStatus::Protocol, "could not write confirmation prompt"))?;
     drop(stderr);
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|_| CliError::new(ExitStatus::Protocol, "could not read confirmation"))?;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let answer = read_bounded_line(&mut input, "confirmation input")?.unwrap_or_default();
     if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         Ok(())
     } else {
@@ -3443,10 +3529,21 @@ async fn watch_events<W: Write>(
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
     let selected = select_profile(cli)?;
+    let reconnect_policy =
+        ReconnectPolicy::new(selected.retry_timeout(), selected.connect_timeout());
     let workflow = WorkflowServices::from_selected(&selected)?;
     let client = make_client(&selected)?;
     let mut receiver = client.subscribe();
-    let info = match client.connect().await {
+    let interrupt = InterruptWatcher::install().await;
+    let connect_result = tokio::select! {
+        result = client.connect() => result,
+        () = interrupt.cancelled() => {
+            client.cancel_pending_operations();
+            let _ = client.shutdown().await;
+            return Err(interrupt.error());
+        }
+    };
+    let info = match connect_result {
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
@@ -3454,42 +3551,51 @@ async fn watch_events<W: Write>(
         let _ = client.shutdown().await;
         return Err(error);
     }
+    let mut device_name = info.name;
     let mut workflow_connected = true;
+    let mut awaiting_reconnect_confirmation = false;
     let mut emitted = 0_usize;
     while count.is_none_or(|limit| emitted < limit) {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                if signal.is_err() {
-                    if workflow_connected {
-                        cleanup_workflow(&client, &workflow, "interrupt handler failed").await;
-                    } else {
-                        let _ = client.shutdown().await;
-                    }
-                    return Err(CliError::new(
-                        ExitStatus::Interrupted,
-                        "could not install the interrupt handler",
-                    ));
-                }
+            () = interrupt.cancelled() => {
                 if workflow_connected {
                     cleanup_workflow(&client, &workflow, "interrupted").await;
                 } else {
                     let _ = client.shutdown().await;
                 }
-                return Err(CliError::new(ExitStatus::Interrupted, "interrupted by user"));
+                return Err(interrupt.error());
             }
             event = receiver.recv() => {
                 match event {
                     Ok(event) => {
+                        if awaiting_reconnect_confirmation
+                            && matches!(&event, Event::Disconnected)
+                        {
+                            continue;
+                        }
+                        if awaiting_reconnect_confirmation && matches!(&event, Event::Connected) {
+                            awaiting_reconnect_confirmation = false;
+                        }
+                        let disconnected = matches!(&event, Event::Disconnected);
+                        let mut suppress_event = false;
                         let workflow_result = match &event {
-                            Event::Message(message) => {
-                                workflow.incoming(message).await.map(|_| ())
-                            }
+                            Event::Message(message) => match workflow
+                                .incoming(message, IncomingOrigin::Live)
+                                .await
+                            {
+                                Ok(Some(_)) => Ok(()),
+                                Ok(None) => {
+                                    suppress_event = true;
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            },
                             Event::Disconnected if workflow_connected => {
                                 workflow_connected = false;
                                 workflow.disconnected(Some("device event")).await
                             }
                             Event::Connected if !workflow_connected => {
-                                let result = workflow.connected(&info.name).await;
+                                let result = workflow.connected(&device_name).await;
                                 if result.is_ok() {
                                     workflow_connected = true;
                                 }
@@ -3508,7 +3614,7 @@ async fn watch_events<W: Write>(
                             }
                             return Err(error);
                         }
-                        if event_matches(&event, filters) {
+                        if !suppress_event && event_matches(&event, filters) {
                             let record = watch_record(&event);
                             let human = watch_human(&record);
                             if let Err(error) = writer.event("event", &record, &human).map_err(CliError::from) {
@@ -3521,8 +3627,36 @@ async fn watch_events<W: Write>(
                             }
                             emitted = emitted.saturating_add(1);
                         }
+                        if disconnected && count.is_none_or(|limit| emitted < limit) {
+                            match reconnect_device(
+                                &client,
+                                reconnect_policy,
+                                interrupt.token(),
+                            )
+                            .await
+                            {
+                                Ok(reconnected) => {
+                                    device_name = reconnected.name;
+                                    if let Err(error) = workflow.connected(&device_name).await {
+                                        let _ = client.shutdown().await;
+                                        return Err(error);
+                                    }
+                                    workflow_connected = true;
+                                    awaiting_reconnect_confirmation = true;
+                                }
+                                Err(error) => {
+                                    let _ = client.shutdown().await;
+                                    return if interrupt.token().is_cancelled() {
+                                        Err(interrupt.error())
+                                    } else {
+                                        Err(error)
+                                    };
+                                }
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        awaiting_reconnect_confirmation = false;
                         emit_diagnostic(cli, &format!(
                             "event consumer lagged; {skipped} bounded event(s) were skipped"
                         ));
@@ -3766,10 +3900,319 @@ struct ChatIncomingRecord {
     message_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ChatHelpRecord {
+    state: &'static str,
+    destination: String,
+    commands: &'static [&'static str],
+}
+
+#[derive(Debug, Serialize)]
+struct ChatContactSummary {
+    name: String,
+    public_key_prefix: String,
+    kind: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatContactsRecord {
+    state: &'static str,
+    destination: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    contacts: Vec<ChatContactSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatHistoryRecord {
+    state: &'static str,
+    destination: String,
+    enabled: bool,
+    storage: &'static str,
+    entries: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCommandErrorRecord {
+    state: &'static str,
+    destination: String,
+    command: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
+}
+
+#[derive(Clone)]
 struct ChatTarget {
     destination: String,
     channel: Option<u8>,
     direct_prefix: Option<[u8; 6]>,
+}
+
+#[derive(Clone)]
+struct RetainedChatDraft {
+    target: ChatTarget,
+    text: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ParsedChatLine {
+    Empty,
+    Message(String),
+    Help,
+    Contacts {
+        query: Option<String>,
+    },
+    To {
+        query: String,
+    },
+    Channel {
+        channel: u8,
+    },
+    History {
+        limit: usize,
+    },
+    SendRetained,
+    DiscardRetained,
+    Quit,
+    CommandError {
+        command: String,
+        message: String,
+        suggestion: Option<String>,
+    },
+}
+
+const CHAT_HISTORY_DEFAULT: usize = 20;
+const CHAT_HISTORY_MAX: usize = 100;
+const CHAT_COMMAND_NAMES: &[&str] = &[
+    "/help",
+    "/contacts",
+    "/to",
+    "/channel",
+    "/history",
+    "/send",
+    "/discard",
+    "/quit",
+];
+const CHAT_HELP_COMMANDS: &[&str] = &[
+    "/help",
+    "/contacts [query]",
+    "/to <contact>",
+    "/channel <0..255>",
+    "/history [N]",
+    "/send",
+    "/discard",
+    "/quit",
+    "//text",
+];
+
+fn parse_chat_line(line: &str) -> ParsedChatLine {
+    if line.trim().is_empty() {
+        return ParsedChatLine::Empty;
+    }
+    if let Some(literal) = line.strip_prefix("//") {
+        return ParsedChatLine::Message(format!("/{literal}"));
+    }
+    if !line.starts_with('/') {
+        return ParsedChatLine::Message(line.to_owned());
+    }
+
+    let command_end = line.find(char::is_whitespace).unwrap_or(line.len());
+    let command = &line[..command_end];
+    let arguments = line[command_end..].trim();
+    match command {
+        "/help" => no_argument_chat_command(arguments, command, ParsedChatLine::Help),
+        "/contacts" => ParsedChatLine::Contacts {
+            query: (!arguments.is_empty()).then(|| arguments.to_owned()),
+        },
+        "/to" => {
+            if arguments.is_empty() {
+                chat_parse_error(command, "expected an exact contact name or key prefix")
+            } else {
+                ParsedChatLine::To {
+                    query: arguments.to_owned(),
+                }
+            }
+        }
+        "/channel" => match one_chat_argument(arguments) {
+            Some(value) => match value.parse::<u8>() {
+                Ok(channel) => ParsedChatLine::Channel { channel },
+                Err(_) => chat_parse_error(command, "expected one channel index from 0 to 255"),
+            },
+            None => chat_parse_error(command, "expected one channel index from 0 to 255"),
+        },
+        "/history" => {
+            if arguments.is_empty() {
+                ParsedChatLine::History {
+                    limit: CHAT_HISTORY_DEFAULT,
+                }
+            } else {
+                match one_chat_argument(arguments).and_then(|value| value.parse::<usize>().ok()) {
+                    Some(0) | None => {
+                        chat_parse_error(command, "expected one positive history entry count")
+                    }
+                    Some(limit) => ParsedChatLine::History {
+                        limit: limit.min(CHAT_HISTORY_MAX),
+                    },
+                }
+            }
+        }
+        "/send" => no_argument_chat_command(arguments, command, ParsedChatLine::SendRetained),
+        "/discard" => no_argument_chat_command(arguments, command, ParsedChatLine::DiscardRetained),
+        "/quit" => no_argument_chat_command(arguments, command, ParsedChatLine::Quit),
+        _ => ParsedChatLine::CommandError {
+            command: command.to_owned(),
+            message: format!("unknown chat command '{command}'"),
+            suggestion: closest_suggestion(command, CHAT_COMMAND_NAMES.iter().copied())
+                .map(str::to_owned),
+        },
+    }
+}
+
+fn one_chat_argument(arguments: &str) -> Option<&str> {
+    let mut values = arguments.split_whitespace();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn no_argument_chat_command(
+    arguments: &str,
+    command: &str,
+    parsed: ParsedChatLine,
+) -> ParsedChatLine {
+    if arguments.is_empty() {
+        parsed
+    } else {
+        chat_parse_error(command, "this command does not accept arguments")
+    }
+}
+
+fn chat_parse_error(command: &str, message: &str) -> ParsedChatLine {
+    ParsedChatLine::CommandError {
+        command: command.to_owned(),
+        message: message.to_owned(),
+        suggestion: None,
+    }
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.iter().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_char != *right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+fn closest_suggestion<'a>(
+    query: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    if query.is_empty() {
+        return None;
+    }
+    let normalized_query = query.to_lowercase();
+    let maximum_distance = normalized_query.chars().count().div_ceil(3).clamp(1, 3);
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            (
+                candidate,
+                edit_distance(&normalized_query, &candidate.to_lowercase()),
+            )
+        })
+        .filter(|(_, distance)| *distance <= maximum_distance)
+        .min_by(|(left, left_distance), (right, right_distance)| {
+            left_distance
+                .cmp(right_distance)
+                .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
+                .then_with(|| left.cmp(right))
+        })
+        .map(|(candidate, _)| candidate)
+}
+
+fn contact_name_suggestion<'a>(contacts: &'a [Contact], query: &str) -> Option<&'a str> {
+    closest_suggestion(
+        query,
+        contacts.iter().map(|contact| contact.adv_name.as_str()),
+    )
+}
+
+const CHAT_INPUT_CAPACITY: usize = 1;
+
+struct ChatInput {
+    receiver: tokio_mpsc::Receiver<Result<Option<String>, CliError>>,
+    resume: std_mpsc::Sender<()>,
+}
+
+impl ChatInput {
+    fn spawn() -> Result<Self, CliError> {
+        let (line_tx, receiver) = tokio_mpsc::channel(CHAT_INPUT_CAPACITY);
+        let (resume, resume_rx) = std_mpsc::channel();
+        thread::Builder::new()
+            .name("meshquill-chat-input".to_owned())
+            .spawn(move || {
+                let stdin = io::stdin();
+                let mut input = stdin.lock();
+                loop {
+                    let result = read_chat_line(&mut input);
+                    let terminal = !matches!(&result, Ok(Some(_)));
+                    if line_tx.blocking_send(result).is_err()
+                        || terminal
+                        || resume_rx.recv().is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| {
+                CliError::new(
+                    ExitStatus::Protocol,
+                    "could not start the bounded line chat input reader",
+                )
+            })?;
+        Ok(Self { receiver, resume })
+    }
+
+    async fn next(&mut self) -> Result<Option<String>, CliError> {
+        self.receiver.recv().await.ok_or_else(|| {
+            CliError::new(
+                ExitStatus::Protocol,
+                "the line chat input reader stopped unexpectedly",
+            )
+        })?
+    }
+
+    fn resume(&self) -> Result<(), CliError> {
+        self.resume.send(()).map_err(|_| {
+            CliError::new(
+                ExitStatus::Protocol,
+                "the line chat input reader stopped unexpectedly",
+            )
+        })
+    }
+}
+
+enum ChatLineFlow {
+    Continue,
+    Quit,
+    SessionReconnected(usize),
+}
+
+#[derive(Clone, Copy)]
+struct ChatSessionControl<'a> {
+    ack_timeout: Duration,
+    reconnect_policy: ReconnectPolicy,
+    interrupt: &'a InterruptWatcher,
+    workflow_connected: &'a AtomicBool,
 }
 
 enum ChatAckOutcome {
@@ -3805,9 +4248,21 @@ async fn chat<W: Write>(
     }
     let destination = chat_destination(cli, destination)?;
     let selected = select_profile(cli)?;
+    let reconnect_policy =
+        ReconnectPolicy::new(selected.retry_timeout(), selected.connect_timeout());
     let workflow = WorkflowServices::from_selected(&selected)?;
     let client = make_client(&selected)?;
-    let info = match client.connect().await {
+    let mut events = client.subscribe();
+    let interrupt = InterruptWatcher::install().await;
+    let connect_result = tokio::select! {
+        result = client.connect() => result,
+        () = interrupt.cancelled() => {
+            client.cancel_pending_operations();
+            let _ = client.shutdown().await;
+            return Err(interrupt.error());
+        }
+    };
+    let info = match connect_result {
         Ok(info) => info,
         Err(error) => return finish::<()>(&client, Err(error)).await,
     };
@@ -3815,24 +4270,82 @@ async fn chat<W: Write>(
         let _ = client.shutdown().await;
         return Err(error);
     }
-    let target = match prepare_chat_target(&client, destination).await {
+    let workflow_connected = AtomicBool::new(true);
+    let control = ChatSessionControl {
+        ack_timeout: cli.timeout,
+        reconnect_policy,
+        interrupt: &interrupt,
+        workflow_connected: &workflow_connected,
+    };
+    let (target, target_reconnected) = match prepare_chat_target_with_reconnect(
+        &client,
+        &workflow,
+        destination,
+        control,
+        "chat target lookup transport failed",
+    )
+    .await
+    {
         Ok(value) => value,
         Err(error) => {
-            cleanup_workflow(&client, &workflow, "chat target failed").await;
+            cleanup_chat_workflow(
+                &client,
+                &workflow,
+                &workflow_connected,
+                "chat target failed",
+            )
+            .await;
             return Err(error);
         }
     };
     if let Err(error) = emit_chat_connected(&target, writer) {
-        cleanup_workflow(&client, &workflow, "chat output failed").await;
+        cleanup_chat_workflow(
+            &client,
+            &workflow,
+            &workflow_connected,
+            "chat output failed",
+        )
+        .await;
         return Err(error);
     }
-    let result = run_chat_lines(&client, &workflow, &target, cli.timeout, writer).await;
+    if target_reconnected
+        && let Err(error) = emit_chat_state(
+            &target,
+            "reconnected",
+            false,
+            "Reconnected while resolving the chat target; no message was sent or replayed.",
+            writer,
+        )
+    {
+        cleanup_chat_workflow(
+            &client,
+            &workflow,
+            &workflow_connected,
+            "chat output failed",
+        )
+        .await;
+        return Err(error);
+    }
+    let result = run_chat_lines(&client, &workflow, &target, control, &mut events, writer).await;
     match result {
         Ok(()) => finish_workflow(&client, &workflow, "chat completed").await,
         Err(error) => {
-            cleanup_workflow(&client, &workflow, "chat failed").await;
+            cleanup_chat_workflow(&client, &workflow, &workflow_connected, "chat failed").await;
             Err(error)
         }
+    }
+}
+
+async fn cleanup_chat_workflow(
+    client: &ManagedClient,
+    workflow: &WorkflowServices,
+    workflow_connected: &AtomicBool,
+    reason: &str,
+) {
+    if workflow_connected.load(Ordering::Acquire) {
+        cleanup_workflow(client, workflow, reason).await;
+    } else {
+        let _ = client.shutdown().await;
     }
 }
 
@@ -3847,25 +4360,85 @@ fn chat_destination(cli: &Cli, destination: Option<&str>) -> Result<String, CliE
     }
 }
 
-async fn prepare_chat_target(
+async fn prepare_chat_target_with_reconnect(
     client: &ManagedClient,
+    workflow: &WorkflowServices,
     destination: String,
-) -> Result<ChatTarget, CliError> {
-    let channel = destination.parse::<u8>().ok();
-    let direct_prefix = if channel.is_some() {
-        None
-    } else {
-        let contacts = client.list_contacts(None).await.map_err(CliError::from)?;
-        let contact = resolve_contact(&contacts, &destination)?;
-        let mut prefix = [0_u8; 6];
-        prefix.copy_from_slice(&contact.public_key.as_bytes()[..6]);
-        Some(prefix)
+    control: ChatSessionControl<'_>,
+    disconnect_reason: &str,
+) -> Result<(ChatTarget, bool), CliError> {
+    if let Ok(channel) = destination.parse::<u8>() {
+        return Ok((chat_channel_target(channel), false));
+    }
+    let (contacts, reconnected) =
+        list_chat_contacts_with_reconnect(client, workflow, control, disconnect_reason).await?;
+    resolve_contact(&contacts, &destination)
+        .map(chat_contact_target)
+        .map(|target| (target, reconnected))
+}
+
+async fn list_chat_contacts_with_reconnect(
+    client: &ManagedClient,
+    workflow: &WorkflowServices,
+    control: ChatSessionControl<'_>,
+    disconnect_reason: &str,
+) -> Result<(Vec<Contact>, bool), CliError> {
+    let first = tokio::select! {
+        result = client.list_contacts(None) => result,
+        () = control.interrupt.cancelled() => {
+            client.cancel_pending_operations();
+            return Err(control.interrupt.error());
+        }
     };
-    Ok(ChatTarget {
-        destination,
-        channel,
-        direct_prefix,
-    })
+    match first {
+        Ok(contacts) => Ok((contacts, false)),
+        Err(error) if reconnect_trigger(&error) => {
+            reconnect_chat_session(client, workflow, control, disconnect_reason).await?;
+            let contacts = tokio::select! {
+                result = client.list_contacts(None) => result.map_err(CliError::from)?,
+                () = control.interrupt.cancelled() => {
+                    client.cancel_pending_operations();
+                    return Err(control.interrupt.error());
+                }
+            };
+            Ok((contacts, true))
+        }
+        Err(error) => Err(CliError::from(error)),
+    }
+}
+
+async fn reconnect_chat_session(
+    client: &ManagedClient,
+    workflow: &WorkflowServices,
+    control: ChatSessionControl<'_>,
+    disconnect_reason: &str,
+) -> Result<SelfInfo, CliError> {
+    if control.workflow_connected.swap(false, Ordering::AcqRel) {
+        workflow.disconnected(Some(disconnect_reason)).await?;
+    }
+    let info =
+        reconnect_device(client, control.reconnect_policy, control.interrupt.token()).await?;
+    workflow.connected(&info.name).await?;
+    control.workflow_connected.store(true, Ordering::Release);
+    Ok(info)
+}
+
+fn chat_contact_target(contact: &Contact) -> ChatTarget {
+    let mut prefix = [0_u8; 6];
+    prefix.copy_from_slice(&contact.public_key.as_bytes()[..6]);
+    ChatTarget {
+        destination: contact.adv_name.clone(),
+        channel: None,
+        direct_prefix: Some(prefix),
+    }
+}
+
+fn chat_channel_target(channel: u8) -> ChatTarget {
+    ChatTarget {
+        destination: channel.to_string(),
+        channel: Some(channel),
+        direct_prefix: None,
+    }
 }
 
 fn emit_chat_connected<W: Write>(
@@ -3881,107 +4454,433 @@ fn emit_chat_connected<W: Write>(
         .event(
             "chat",
             &connected,
-            &format!("Chatting with {}; /quit exits.", target.destination),
+            &format!(
+                "Chatting with {}; /help lists commands and /quit exits.",
+                target.destination
+            ),
         )
         .map_err(CliError::from)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_chat_lines<W: Write>(
     client: &ManagedClient,
     workflow: &WorkflowServices,
-    target: &ChatTarget,
-    ack_timeout: Duration,
+    initial_target: &ChatTarget,
+    control: ChatSessionControl<'_>,
+    events: &mut broadcast::Receiver<Event>,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let mut retained_draft: Option<String> = None;
+    let interrupt = control.interrupt;
+    drain_chat_inbox_with_reconnect(client, workflow, initial_target, control, events, writer)
+        .await?;
+    let mut input = ChatInput::spawn()?;
+    let mut target = initial_target.clone();
+    let mut retained_draft: Option<RetainedChatDraft> = None;
+    let mut pending_reconnect_confirmations = 0_usize;
     loop {
-        poll_chat_incoming(client, workflow, writer).await?;
-        let Some(line) = read_chat_line(&mut input)? else {
-            return Ok(());
-        };
-        if line == "/quit" {
-            return Ok(());
-        }
-        let text = if line == "/send" {
-            match retained_draft.take() {
-                Some(draft) => draft,
-                None => continue,
-            }
-        } else if line.is_empty() {
-            continue;
-        } else {
-            line
-        };
-        let prepared = workflow
-            .prepare_send(target.destination.clone(), text)
-            .await?;
-        let send_target = prepare_chat_target(client, prepared.destination).await?;
-        let mut outgoing = workflow
-            .begin_outgoing(
-                &send_target.destination,
-                send_target.channel,
-                &prepared.text,
-            )
-            .await?;
-        let message_id = outgoing.message_id().to_string();
-        let send_result = send_chat_message(client, &send_target, &prepared.text).await;
-        match send_result {
-            Ok(tracking) => {
-                workflow
-                    .sent(
-                        &mut outgoing,
-                        &send_target.destination,
-                        &prepared.text,
-                        &message_id,
-                        tracking.as_ref().map_or([0; 4], |value| value.ack_code),
-                    )
-                    .await?;
-                retained_draft = None;
-                emit_chat_state(&send_target, "sent", false, "sent", writer)?;
-                if let Some(tracking) = tracking {
-                    let outcome = wait_for_chat_ack(
-                        client,
-                        workflow,
-                        &send_target,
-                        &mut outgoing,
-                        &message_id,
-                        tracking,
-                        ack_timeout,
-                    )
-                    .await?;
-                    let (state, human) = outcome.output();
-                    emit_chat_state(&send_target, state, false, human, writer)?;
-                }
-            }
-            Err(error) if reconnectable_error(&error) => {
-                if let Err(history_error) = workflow.failed(&mut outgoing).await {
-                    tracing::warn!(error = %history_error, "could not record failed chat send");
-                }
-                let _ = workflow.disconnected(Some("chat transport failed")).await;
-                match client.reconnect().await {
-                    Ok(info) => {
-                        workflow.connected(&info.name).await?;
-                        retained_draft = Some(prepared.text);
+        tokio::select! {
+            biased;
+            () = interrupt.cancelled() => return Err(interrupt.error()),
+            event = events.recv() => {
+                match event {
+                    Ok(Event::Disconnected) if pending_reconnect_confirmations > 0 => {}
+                    Ok(Event::Connected) if pending_reconnect_confirmations > 0 => {
+                        pending_reconnect_confirmations = pending_reconnect_confirmations.saturating_sub(1);
+                    }
+                    Ok(Event::Message(message)) => {
+                        emit_chat_incoming(
+                            workflow,
+                            message,
+                            IncomingOrigin::Live,
+                            writer,
+                        )
+                        .await?;
+                    }
+                    Ok(Event::Disconnected) => {
+                        reconnect_chat_session(
+                            client,
+                            workflow,
+                            control,
+                            "chat device event",
+                        )
+                        .await
+                        .map_err(|error| {
+                            if interrupt.token().is_cancelled() {
+                                interrupt.error()
+                            } else {
+                                error
+                            }
+                        })?;
+                        pending_reconnect_confirmations = pending_reconnect_confirmations.saturating_add(1);
                         emit_chat_state(
-                            &send_target,
+                            &target,
                             "reconnected",
-                            true,
-                            "Reconnected; the unsent draft is retained. Type /send to submit it.",
+                            retained_draft.is_some(),
+                            "Reconnected to the companion; no message was replayed.",
                             writer,
                         )?;
                     }
-                    Err(reconnect_error) => return Err(CliError::from(reconnect_error)),
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        pending_reconnect_confirmations = 0;
+                        emit_chat_state(
+                            &target,
+                            "lagged",
+                            retained_draft.is_some(),
+                            &format!("Chat event consumer skipped {skipped} bounded event(s)."),
+                            writer,
+                        )?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(CliError::new(
+                            ExitStatus::Connection,
+                            "the device event stream closed during chat",
+                        ));
+                    }
                 }
             }
-            Err(error) => {
-                if let Err(history_error) = workflow.failed(&mut outgoing).await {
-                    tracing::warn!(error = %history_error, "could not record failed chat send");
+            line = input.next() => {
+                let Some(line) = line? else {
+                    return Ok(());
+                };
+                match handle_chat_line(
+                    client,
+                    workflow,
+                    &mut target,
+                    line,
+                    control,
+                    &mut retained_draft,
+                    writer,
+                )
+                .await?
+                {
+                    ChatLineFlow::Quit => return Ok(()),
+                    ChatLineFlow::Continue => {
+                        if interrupt.token().is_cancelled() {
+                            return Err(interrupt.error());
+                        }
+                        input.resume()?;
+                    }
+                    ChatLineFlow::SessionReconnected(count) => {
+                        pending_reconnect_confirmations = pending_reconnect_confirmations.saturating_add(count);
+                        if interrupt.token().is_cancelled() {
+                            return Err(interrupt.error());
+                        }
+                        input.resume()?;
+                    }
                 }
-                return Err(CliError::from(error));
             }
         }
+    }
+}
+
+async fn drain_chat_inbox_with_reconnect<W: Write>(
+    client: &ManagedClient,
+    workflow: &WorkflowServices,
+    target: &ChatTarget,
+    control: ChatSessionControl<'_>,
+    events: &mut broadcast::Receiver<Event>,
+    writer: &mut OutputWriter<W>,
+) -> Result<(), CliError> {
+    match poll_chat_incoming(client, workflow, events, control, writer).await {
+        Ok(()) => {}
+        Err(error) if error.status() == ExitStatus::Connection => {
+            reconnect_chat_session(
+                client,
+                workflow,
+                control,
+                "initial chat inbox transport failed",
+            )
+            .await?;
+            emit_chat_state(
+                target,
+                "reconnected",
+                false,
+                "Reconnected while loading the queued inbox; no message was sent or replayed.",
+                writer,
+            )?;
+            poll_chat_incoming(client, workflow, events, control, writer).await?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_chat_line<W: Write>(
+    client: &ManagedClient,
+    workflow: &WorkflowServices,
+    target: &mut ChatTarget,
+    line: String,
+    control: ChatSessionControl<'_>,
+    retained_draft: &mut Option<RetainedChatDraft>,
+    writer: &mut OutputWriter<W>,
+) -> Result<ChatLineFlow, CliError> {
+    match parse_chat_line(&line) {
+        ParsedChatLine::Empty => Ok(ChatLineFlow::Continue),
+        ParsedChatLine::Quit => Ok(ChatLineFlow::Quit),
+        ParsedChatLine::Help => {
+            emit_chat_help(target, writer)?;
+            Ok(ChatLineFlow::Continue)
+        }
+        ParsedChatLine::Contacts { query } => {
+            let (contacts, reconnected) = list_chat_contacts_with_reconnect(
+                client,
+                workflow,
+                control,
+                "chat contact listing transport failed",
+            )
+            .await?;
+            if reconnected {
+                emit_chat_state(
+                    target,
+                    "reconnected",
+                    retained_draft.is_some(),
+                    "Reconnected while listing contacts; no message was sent or replayed.",
+                    writer,
+                )?;
+            }
+            emit_chat_contacts(contacts, target, query, writer)?;
+            Ok(if reconnected {
+                ChatLineFlow::SessionReconnected(1)
+            } else {
+                ChatLineFlow::Continue
+            })
+        }
+        ParsedChatLine::To { query } => {
+            let (contacts, reconnected) = list_chat_contacts_with_reconnect(
+                client,
+                workflow,
+                control,
+                "chat destination lookup transport failed",
+            )
+            .await?;
+            if reconnected {
+                emit_chat_state(
+                    target,
+                    "reconnected",
+                    retained_draft.is_some(),
+                    "Reconnected while resolving the destination; no message was sent or replayed.",
+                    writer,
+                )?;
+            }
+            match resolve_contact(&contacts, &query) {
+                Ok(contact) => {
+                    *target = chat_contact_target(contact);
+                    emit_chat_destination_changed(target, retained_draft.as_ref(), writer)?;
+                }
+                Err(error) => {
+                    emit_chat_command_error(
+                        target,
+                        "/to",
+                        error.message(),
+                        contact_name_suggestion(&contacts, &query),
+                        writer,
+                    )?;
+                }
+            }
+            Ok(if reconnected {
+                ChatLineFlow::SessionReconnected(1)
+            } else {
+                ChatLineFlow::Continue
+            })
+        }
+        ParsedChatLine::Channel { channel } => {
+            *target = chat_channel_target(channel);
+            emit_chat_destination_changed(target, retained_draft.as_ref(), writer)?;
+            Ok(ChatLineFlow::Continue)
+        }
+        ParsedChatLine::History { limit } => {
+            emit_chat_history(workflow, target, limit, writer).await?;
+            Ok(ChatLineFlow::Continue)
+        }
+        ParsedChatLine::SendRetained => {
+            let Some(draft) = retained_draft.take() else {
+                emit_chat_command_error(
+                    target,
+                    "/send",
+                    "there is no retained failed-send draft",
+                    None,
+                    writer,
+                )?;
+                return Ok(ChatLineFlow::Continue);
+            };
+            submit_chat_draft(client, workflow, draft, control, retained_draft, writer).await
+        }
+        ParsedChatLine::DiscardRetained => {
+            let Some(discarded) = retained_draft.take() else {
+                emit_chat_command_error(
+                    target,
+                    "/discard",
+                    "there is no retained failed-send draft",
+                    None,
+                    writer,
+                )?;
+                return Ok(ChatLineFlow::Continue);
+            };
+            emit_chat_state(
+                target,
+                "draft_discarded",
+                false,
+                &format!(
+                    "Discarded the retained draft addressed to {}.",
+                    discarded.target.destination
+                ),
+                writer,
+            )?;
+            Ok(ChatLineFlow::Continue)
+        }
+        ParsedChatLine::Message(text) => {
+            if let Some(draft) = retained_draft.as_ref() {
+                emit_chat_command_error(
+                    target,
+                    "message",
+                    &format!(
+                        "a failed-send draft for {} is retained; use /send or /discard before composing another message",
+                        draft.target.destination
+                    ),
+                    None,
+                    writer,
+                )?;
+                return Ok(ChatLineFlow::Continue);
+            }
+            let prepared = workflow
+                .prepare_send(target.destination.clone(), text)
+                .await?;
+            let (send_target, target_reconnected) = prepare_chat_target_with_reconnect(
+                client,
+                workflow,
+                prepared.destination,
+                control,
+                "chat send target lookup transport failed",
+            )
+            .await?;
+            if target_reconnected {
+                emit_chat_state(
+                    target,
+                    "reconnected",
+                    false,
+                    "Reconnected while resolving the unsent draft; its text was retained and no message was replayed.",
+                    writer,
+                )?;
+            }
+            let draft = RetainedChatDraft {
+                target: send_target,
+                text: prepared.text,
+            };
+            let flow =
+                submit_chat_draft(client, workflow, draft, control, retained_draft, writer).await?;
+            Ok(match flow {
+                ChatLineFlow::Continue if target_reconnected => ChatLineFlow::SessionReconnected(1),
+                ChatLineFlow::SessionReconnected(count) if target_reconnected => {
+                    ChatLineFlow::SessionReconnected(count.saturating_add(1))
+                }
+                flow => flow,
+            })
+        }
+        ParsedChatLine::CommandError {
+            command,
+            message,
+            suggestion,
+        } => {
+            emit_chat_command_error(target, &command, &message, suggestion.as_deref(), writer)?;
+            Ok(ChatLineFlow::Continue)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn submit_chat_draft<W: Write>(
+    client: &ManagedClient,
+    workflow: &WorkflowServices,
+    draft: RetainedChatDraft,
+    control: ChatSessionControl<'_>,
+    retained_draft: &mut Option<RetainedChatDraft>,
+    writer: &mut OutputWriter<W>,
+) -> Result<ChatLineFlow, CliError> {
+    let mut outgoing = workflow
+        .begin_outgoing(&draft.target.destination, draft.target.channel, &draft.text)
+        .await?;
+    let message_id = outgoing.message_id().to_string();
+    let send_result = send_chat_message(client, &draft.target, &draft.text).await;
+    let mut session_reconnected = false;
+    match send_result {
+        Ok(tracking) => {
+            workflow
+                .sent(
+                    &mut outgoing,
+                    &draft.target.destination,
+                    &draft.text,
+                    &message_id,
+                    tracking.as_ref().map(|value| value.ack_code),
+                )
+                .await?;
+            emit_chat_state(
+                &draft.target,
+                "sent",
+                retained_draft.is_some(),
+                &format!("Sent to {}.", draft.target.destination),
+                writer,
+            )?;
+            if control.interrupt.token().is_cancelled() {
+                return Err(control.interrupt.error());
+            }
+            if let Some(tracking) = tracking {
+                let outcome = wait_for_chat_ack(
+                    client,
+                    workflow,
+                    &draft.target,
+                    &mut outgoing,
+                    &message_id,
+                    tracking,
+                    control,
+                )
+                .await?;
+                session_reconnected = matches!(&outcome, ChatAckOutcome::Reconnected);
+                let (state, human) = outcome.output();
+                emit_chat_state(
+                    &draft.target,
+                    state,
+                    retained_draft.is_some(),
+                    &format!("{}: {human}", draft.target.destination),
+                    writer,
+                )?;
+            }
+        }
+        Err(error) if reconnect_trigger(&error) => {
+            if let Err(history_error) = workflow.failed(&mut outgoing).await {
+                tracing::warn!(error = %history_error, "could not record failed chat send");
+            }
+            if control.interrupt.token().is_cancelled() {
+                return Err(control.interrupt.error());
+            }
+            reconnect_chat_session(client, workflow, control, "chat transport failed").await?;
+            session_reconnected = true;
+            let failed_target = draft.target.clone();
+            *retained_draft = Some(draft);
+            emit_chat_state(
+                &failed_target,
+                "reconnected",
+                true,
+                &format!(
+                    "Reconnected; delivery to {} was not confirmed. Its draft is retained, and /send deliberately submits it again.",
+                    failed_target.destination
+                ),
+                writer,
+            )?;
+        }
+        Err(error) => {
+            if let Err(history_error) = workflow.failed(&mut outgoing).await {
+                tracing::warn!(error = %history_error, "could not record failed chat send");
+            }
+            return Err(CliError::from(error));
+        }
+    }
+    if session_reconnected {
+        Ok(ChatLineFlow::SessionReconnected(1))
+    } else {
+        Ok(ChatLineFlow::Continue)
     }
 }
 
@@ -3992,11 +4891,18 @@ async fn wait_for_chat_ack(
     outgoing: &mut OutgoingRecord,
     message_id: &str,
     tracking: CommandTracking,
-    global_timeout: Duration,
+    control: ChatSessionControl<'_>,
 ) -> Result<ChatAckOutcome, CliError> {
     let firmware_timeout = Duration::from_millis(u64::from(tracking.timeout_ms));
-    let timeout = firmware_timeout.min(global_timeout);
-    match client.wait_for_ack(tracking.ack_code, Some(timeout)).await {
+    let timeout = firmware_timeout.min(control.ack_timeout);
+    let ack_result = tokio::select! {
+        result = client.wait_for_ack(tracking.ack_code, Some(timeout)) => result,
+        () = control.interrupt.cancelled() => {
+            client.cancel_pending_operations();
+            return Err(control.interrupt.error());
+        },
+    };
+    match ack_result {
         Ok(ack) => {
             workflow
                 .acknowledged(
@@ -4010,7 +4916,7 @@ async fn wait_for_chat_ack(
             Ok(ChatAckOutcome::Acknowledged)
         }
         Err(error) => {
-            let reconnectable = reconnectable_error(&error);
+            let reconnectable = reconnect_trigger(&error);
             let cli_error = CliError::from(error);
             if cli_error.status() == ExitStatus::Timeout {
                 if let Err(workflow_error) = workflow
@@ -4029,16 +4935,14 @@ async fn wait_for_chat_ack(
                 return Err(cli_error);
             }
 
-            let _ = workflow
-                .disconnected(Some("chat acknowledgement transport failed"))
-                .await;
-            match client.reconnect().await {
-                Ok(info) => {
-                    workflow.connected(&info.name).await?;
-                    Ok(ChatAckOutcome::Reconnected)
-                }
-                Err(reconnect_error) => Err(CliError::from(reconnect_error)),
-            }
+            reconnect_chat_session(
+                client,
+                workflow,
+                control,
+                "chat acknowledgement transport failed",
+            )
+            .await?;
+            Ok(ChatAckOutcome::Reconnected)
         }
     }
 }
@@ -4046,45 +4950,88 @@ async fn wait_for_chat_ack(
 async fn poll_chat_incoming<W: Write>(
     client: &ManagedClient,
     workflow: &WorkflowServices,
+    events: &mut broadcast::Receiver<Event>,
+    control: ChatSessionControl<'_>,
     writer: &mut OutputWriter<W>,
 ) -> Result<(), CliError> {
+    let mut connection_active = true;
     loop {
-        let Some(message) = client.sync_next_message().await.map_err(CliError::from)? else {
+        let message = tokio::select! {
+            result = client.sync_next_message() => result.map_err(CliError::from)?,
+            () = control.interrupt.cancelled() => {
+                client.cancel_pending_operations();
+                return Err(control.interrupt.error());
+            }
+        };
+        let drained = message.is_none();
+        loop {
+            match events.try_recv() {
+                Ok(Event::Message(message)) => {
+                    emit_chat_incoming(workflow, message, IncomingOrigin::Live, writer).await?;
+                }
+                Ok(Event::Disconnected) => connection_active = false,
+                Ok(Event::Connected) => connection_active = true,
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    return Err(CliError::new(
+                        ExitStatus::Protocol,
+                        "initial chat event buffering lagged while draining the queued inbox",
+                    )
+                    .with_hint("Retry after reducing the companion's queued-message backlog."));
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(CliError::new(
+                        ExitStatus::Connection,
+                        "the device event stream closed during chat setup",
+                    ));
+                }
+            }
+        }
+        if let Some(message) = message {
+            emit_chat_incoming(workflow, message, IncomingOrigin::Queue, writer).await?;
+        }
+        if !connection_active {
+            return Err(CliError::new(
+                ExitStatus::Connection,
+                "the companion disconnected while chat was loading the queued inbox",
+            ));
+        }
+        if drained {
             return Ok(());
-        };
-        let message_id = workflow.incoming(&message).await?;
-        let source = message_source(&message);
-        let human = format!(
-            "{}: {}",
-            terminal_safe(&source),
-            terminal_safe(&message.text)
-        );
-        let record = ChatIncomingRecord {
-            state: "incoming",
-            source,
-            text: message.text,
-            message_id,
-        };
-        writer
-            .event("chat", &record, &human)
-            .map_err(CliError::from)?;
+        }
     }
 }
 
+async fn emit_chat_incoming<W: Write>(
+    workflow: &WorkflowServices,
+    message: Message,
+    origin: IncomingOrigin,
+    writer: &mut OutputWriter<W>,
+) -> Result<bool, CliError> {
+    let Some(message_id) = workflow.incoming(&message, origin).await? else {
+        return Ok(false);
+    };
+    let source = message_source(&message);
+    let human = format!(
+        "{}: {}",
+        terminal_safe(&source),
+        terminal_safe(&message.text)
+    );
+    let record = ChatIncomingRecord {
+        state: "incoming",
+        source,
+        text: message.text,
+        message_id,
+    };
+    writer
+        .event("chat", &record, &human)
+        .map_err(CliError::from)?;
+    Ok(true)
+}
+
 fn read_chat_line(input: &mut impl BufRead) -> Result<Option<String>, CliError> {
-    let mut line = String::new();
-    match input.read_line(&mut line) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(line.trim_end_matches(['\r', '\n']).to_owned())),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(CliError::new(
-            ExitStatus::Interrupted,
-            "chat was interrupted",
-        )),
-        Err(_) => Err(CliError::new(
-            ExitStatus::Protocol,
-            "could not read line chat input",
-        )),
-    }
+    read_bounded_line(input, "line chat input")
 }
 
 async fn send_chat_message(
@@ -4127,18 +5074,224 @@ fn emit_chat_state<W: Write>(
     writer.event("chat", &record, human).map_err(CliError::from)
 }
 
-fn reconnectable_error(error: &CoreError) -> bool {
-    matches!(
-        error,
-        CoreError::Disconnected
-            | CoreError::ActorStopped
-            | CoreError::Transport(
-                TransportError::NotConnected
-                    | TransportError::Closed
-                    | TransportError::ReconnectFailed { .. }
-                    | TransportError::Io(_)
+fn emit_chat_help<W: Write>(
+    target: &ChatTarget,
+    writer: &mut OutputWriter<W>,
+) -> Result<(), CliError> {
+    let record = ChatHelpRecord {
+        state: "help",
+        destination: target.destination.clone(),
+        commands: CHAT_HELP_COMMANDS,
+    };
+    let human = std::iter::once(format!("Chat commands (target: {}):", target.destination))
+        .chain(
+            CHAT_HELP_COMMANDS
+                .iter()
+                .map(|command| format!("{command}\t{}", chat_help_description(command))),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    writer
+        .event("chat", &record, &human)
+        .map_err(CliError::from)
+}
+
+fn chat_help_description(command: &str) -> &'static str {
+    match command {
+        "/help" => "show this command list",
+        "/contacts [query]" => "list contacts, optionally filtered by name",
+        "/to <contact>" => "change to an exact contact name or unique key prefix",
+        "/channel <0..255>" => "change to a channel index",
+        "/history [N]" => "show up to 100 retained messages for the current target",
+        "/send" => "deliberately retry the retained failed-send draft",
+        "/discard" => "discard the retained failed-send draft without transmitting it",
+        "/quit" => "exit chat",
+        "//text" => "send a message beginning with a literal slash",
+        _ => "",
+    }
+}
+
+fn emit_chat_contacts<W: Write>(
+    contacts: Vec<Contact>,
+    target: &ChatTarget,
+    query: Option<String>,
+    writer: &mut OutputWriter<W>,
+) -> Result<(), CliError> {
+    let needle = query.as_ref().map(|value| value.to_lowercase());
+    let mut contacts: Vec<_> = contacts
+        .into_iter()
+        .filter(|contact| {
+            needle.as_ref().is_none_or(|needle| {
+                contact.adv_name.to_lowercase().contains(needle)
+                    || contact.public_key.to_hex().contains(needle)
+            })
+        })
+        .map(|contact| ChatContactSummary {
+            name: contact.adv_name,
+            public_key_prefix: hex::encode(&contact.public_key.as_bytes()[..6]),
+            kind: contact_type_name(contact.contact_type),
+        })
+        .collect();
+    contacts.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.public_key_prefix.cmp(&right.public_key_prefix))
+    });
+    let human = if contacts.is_empty() {
+        match &query {
+            Some(query) => format!(
+                "No contacts matched '{query}'. Current target: {}.",
+                target.destination
+            ),
+            None => format!(
+                "No contacts are available. Current target: {}.",
+                target.destination
+            ),
+        }
+    } else {
+        std::iter::once(format!(
+            "Contacts (current target: {}):",
+            target.destination
+        ))
+        .chain(contacts.iter().map(|contact| {
+            format!(
+                "{}\t{}\t{}",
+                contact.name, contact.public_key_prefix, contact.kind
             )
-    )
+        }))
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+    let record = ChatContactsRecord {
+        state: "contacts",
+        destination: target.destination.clone(),
+        query,
+        contacts,
+    };
+    writer
+        .event("chat", &record, &human)
+        .map_err(CliError::from)
+}
+
+fn emit_chat_destination_changed<W: Write>(
+    target: &ChatTarget,
+    retained_draft: Option<&RetainedChatDraft>,
+    writer: &mut OutputWriter<W>,
+) -> Result<(), CliError> {
+    let record = ChatRecord {
+        state: "destination_changed",
+        destination: target.destination.clone(),
+        draft_retained: retained_draft.is_some(),
+    };
+    let human = retained_draft.map_or_else(
+        || format!("Chat target changed to {}.", target.destination),
+        |draft| {
+            format!(
+                "Chat target changed to {}. The retained draft remains addressed to {}.",
+                target.destination, draft.target.destination
+            )
+        },
+    );
+    writer
+        .event("chat", &record, &human)
+        .map_err(CliError::from)
+}
+
+async fn emit_chat_history<W: Write>(
+    workflow: &WorkflowServices,
+    target: &ChatTarget,
+    limit: usize,
+    writer: &mut OutputWriter<W>,
+) -> Result<(), CliError> {
+    let loaded = workflow.load_history().await?;
+    let enabled = loaded.is_some();
+    let mut entries: Vec<_> = loaded
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| chat_history_entry_matches(entry, target))
+        .collect();
+    let first = entries.len().saturating_sub(limit);
+    entries = entries.split_off(first);
+    let human = if !enabled {
+        format!(
+            "History is disabled for {} (plaintext opt-in); no entries were loaded.",
+            target.destination
+        )
+    } else if entries.is_empty() {
+        format!("No retained history for {}.", target.destination)
+    } else {
+        std::iter::once(format!("History for {}:", target.destination))
+            .chain(entries.iter().map(|entry| {
+                format!(
+                    "{}\t{:?}\t{:?}\t{}",
+                    entry.recorded_at_unix_ms,
+                    entry.direction,
+                    entry.status,
+                    terminal_safe(&entry.text)
+                )
+            }))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let record = ChatHistoryRecord {
+        state: "history",
+        destination: target.destination.clone(),
+        enabled,
+        storage: "plaintext_opt_in",
+        entries,
+    };
+    writer
+        .event("chat", &record, &human)
+        .map_err(CliError::from)
+}
+
+fn chat_history_entry_matches(entry: &HistoryEntry, target: &ChatTarget) -> bool {
+    match target.channel {
+        Some(channel) => entry.channel == Some(channel),
+        None if entry.channel.is_none() => match entry.direction {
+            HistoryDirection::Outgoing => entry.peer == target.destination,
+            HistoryDirection::Incoming => target
+                .direct_prefix
+                .as_ref()
+                .is_some_and(|prefix| entry.peer == format!("direct:{}", hex::encode(prefix))),
+        },
+        None => false,
+    }
+}
+
+fn emit_chat_command_error<W: Write>(
+    target: &ChatTarget,
+    command: &str,
+    message: &str,
+    suggestion: Option<&str>,
+    writer: &mut OutputWriter<W>,
+) -> Result<(), CliError> {
+    let record = ChatCommandErrorRecord {
+        state: "command_error",
+        destination: target.destination.clone(),
+        command: command.to_owned(),
+        message: message.to_owned(),
+        suggestion: suggestion.map(str::to_owned),
+    };
+    let human = suggestion.map_or_else(
+        || {
+            format!(
+                "{command}: {message} Current target: {}.",
+                target.destination
+            )
+        },
+        |suggestion| {
+            format!(
+                "{command}: {message} Did you mean '{suggestion}'? Current target: {}.",
+                target.destination
+            )
+        },
+    );
+    writer
+        .event("chat", &record, &human)
+        .map_err(CliError::from)
 }
 
 fn prompt_chat_destination() -> Result<String, CliError> {
@@ -4147,10 +5300,9 @@ fn prompt_chat_destination() -> Result<String, CliError> {
         .and_then(|()| stderr.flush())
         .map_err(|_| CliError::new(ExitStatus::Protocol, "could not write chat prompt"))?;
     drop(stderr);
-    let mut destination = String::new();
-    io::stdin()
-        .read_line(&mut destination)
-        .map_err(|_| CliError::new(ExitStatus::Protocol, "could not read chat destination"))?;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let destination = read_bounded_line(&mut input, "chat destination")?.unwrap_or_default();
     let destination = destination.trim().to_owned();
     if destination.is_empty() {
         return Err(CliError::new(
@@ -4236,11 +5388,14 @@ mod tests {
 
     use super::{
         ChannelInfoView, ContactRoute, FirmwareCompatibility, FloodScope, MAX_INNER_PAYLOAD,
-        apply_contact_update, classify_firmware_compatibility, format_cli_error, parse_flood_scope,
-        parse_meshcore_uri, read_channel_secret, resolve_channel_query,
+        ParsedChatLine, apply_contact_update, chat_channel_target, chat_contact_target,
+        chat_history_entry_matches, classify_firmware_compatibility, closest_suggestion,
+        edit_distance, format_cli_error, parse_chat_line, parse_flood_scope, parse_meshcore_uri,
+        read_channel_secret, resolve_channel_query, resolve_contact,
     };
     use crate::{args::ContactUpdateArgs, error::CliError, output::ExitStatus};
     use meshquill_core::{Contact, ContactType, Path, PublicKey};
+    use meshquill_store::{HistoryDirection, HistoryEntry, HistoryStatus};
     use sha2::{Digest, Sha256};
 
     fn must<T, E: Display>(result: Result<T, E>, context: &str) -> T {
@@ -4255,6 +5410,169 @@ mod tests {
             Ok(_) => panic!("{context}"),
             Err(error) => error,
         }
+    }
+
+    #[test]
+    fn line_chat_parser_handles_commands_literal_slashes_and_limits() {
+        assert_eq!(parse_chat_line(""), ParsedChatLine::Empty);
+        assert_eq!(parse_chat_line("   "), ParsedChatLine::Empty);
+        assert_eq!(
+            parse_chat_line("//help"),
+            ParsedChatLine::Message("/help".to_owned())
+        );
+        assert_eq!(parse_chat_line("/help"), ParsedChatLine::Help);
+        assert_eq!(
+            parse_chat_line("/contacts ALi"),
+            ParsedChatLine::Contacts {
+                query: Some("ALi".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_chat_line("/to Alice Smith"),
+            ParsedChatLine::To {
+                query: "Alice Smith".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_chat_line("/channel 255"),
+            ParsedChatLine::Channel { channel: 255 }
+        );
+        assert_eq!(
+            parse_chat_line("/history"),
+            ParsedChatLine::History { limit: 20 }
+        );
+        assert_eq!(
+            parse_chat_line("/history 999"),
+            ParsedChatLine::History { limit: 100 }
+        );
+        assert_eq!(parse_chat_line("/send"), ParsedChatLine::SendRetained);
+        assert_eq!(parse_chat_line("/discard"), ParsedChatLine::DiscardRetained);
+        assert_eq!(parse_chat_line("/quit"), ParsedChatLine::Quit);
+    }
+
+    #[test]
+    fn line_chat_parser_rejects_malformed_commands_without_turning_them_into_messages() {
+        for line in [
+            "/help now",
+            "/to",
+            "/channel 256",
+            "/history 0",
+            "/discard now",
+        ] {
+            assert!(
+                matches!(parse_chat_line(line), ParsedChatLine::CommandError { .. }),
+                "{line} was not rejected"
+            );
+        }
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(
+            closest_suggestion("/hlep", ["/quit", "/help"]),
+            Some("/help")
+        );
+        assert!(matches!(
+            parse_chat_line("/hlep"),
+            ParsedChatLine::CommandError {
+                suggestion: Some(suggestion),
+                ..
+            } if suggestion == "/help"
+        ));
+    }
+
+    #[test]
+    fn contact_resolution_suggests_case_mistakes_without_selecting_them() {
+        let contacts = [Contact {
+            public_key: must(
+                PublicKey::try_from_bytes(&[0xaa; 32]),
+                "valid public key rejected",
+            ),
+            contact_type: ContactType::Chat,
+            flags: 0,
+            route: ContactRoute::Flood,
+            out_path: must(Path::try_from_bytes(&[]), "empty flood path rejected"),
+            adv_name: "Alice".to_owned(),
+            last_advert: 0,
+            adv_lat: 0.0,
+            adv_lon: 0.0,
+            lastmod: 0,
+        }];
+        let error = expect_cli_error(
+            resolve_contact(&contacts, "alice"),
+            "case-insensitive contact match was silently accepted",
+        );
+        assert_eq!(error.status(), ExitStatus::NotFound);
+        assert!(error.hint().is_some_and(|hint| hint.contains("Alice")));
+    }
+
+    #[test]
+    fn line_chat_history_matches_only_the_current_conversation() {
+        let contact = Contact {
+            public_key: must(
+                PublicKey::try_from_bytes(&[0x22; 32]),
+                "valid public key rejected",
+            ),
+            contact_type: ContactType::Chat,
+            flags: 0,
+            route: ContactRoute::Flood,
+            out_path: must(Path::try_from_bytes(&[]), "empty flood path rejected"),
+            adv_name: "Alice".to_owned(),
+            last_advert: 0,
+            adv_lat: 0.0,
+            adv_lon: 0.0,
+            lastmod: 0,
+        };
+        let direct = chat_contact_target(&contact);
+        let channel = chat_channel_target(7);
+        let outgoing = must(
+            HistoryEntry::new(
+                HistoryDirection::Outgoing,
+                "Alice",
+                None,
+                "outgoing",
+                HistoryStatus::Pending,
+                None,
+            ),
+            "outgoing history entry",
+        );
+        let incoming = must(
+            HistoryEntry::new(
+                HistoryDirection::Incoming,
+                "direct:222222222222",
+                None,
+                "incoming",
+                HistoryStatus::Received,
+                None,
+            ),
+            "incoming history entry",
+        );
+        let other_direct = must(
+            HistoryEntry::new(
+                HistoryDirection::Incoming,
+                "direct:aaaaaaaaaaaa",
+                None,
+                "other",
+                HistoryStatus::Received,
+                None,
+            ),
+            "other direct history entry",
+        );
+        let channel_entry = must(
+            HistoryEntry::new(
+                HistoryDirection::Outgoing,
+                "7",
+                Some(7),
+                "channel",
+                HistoryStatus::Pending,
+                None,
+            ),
+            "channel history entry",
+        );
+
+        assert!(chat_history_entry_matches(&outgoing, &direct));
+        assert!(chat_history_entry_matches(&incoming, &direct));
+        assert!(!chat_history_entry_matches(&other_direct, &direct));
+        assert!(!chat_history_entry_matches(&channel_entry, &direct));
+        assert!(chat_history_entry_matches(&channel_entry, &channel));
+        assert!(!chat_history_entry_matches(&outgoing, &channel));
     }
 
     #[test]
