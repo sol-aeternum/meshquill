@@ -3431,15 +3431,15 @@ mod tests {
         use std::os::windows::ffi::OsStringExt;
 
         let first = PathBuf::from(OsString::from_wide(&[
-            b'C' as u16,
-            b':' as u16,
-            b'\\' as u16,
+            u16::from(b'C'),
+            u16::from(b':'),
+            u16::from(b'\\'),
             0xd800,
         ]));
         let second = PathBuf::from(OsString::from_wide(&[
-            b'C' as u16,
-            b':' as u16,
-            b'\\' as u16,
+            u16::from(b'C'),
+            u16::from(b':'),
+            u16::from(b'\\'),
             0xd801,
         ]));
         assert_ne!(
