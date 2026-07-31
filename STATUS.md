@@ -10,12 +10,14 @@ fuzz targets, and local Linux x86-64 package have completed their applicable loc
 CI Rust test command passed 338 tests; the four deliberately ignored real-broker cases also passed
 separately against disposable digest-pinned Mosquitto brokers.
 
-RC2 is **not published yet**. At this point it has no pushed source commit, tag, GitHub release, or
-public assets. The next evidence boundary is the exact pushed commit passing GitHub CI and
-supply-chain workflows; only then may an annotated `v0.1.0-rc.2` tag trigger the five-target native
-and wheel matrix. A successful tagged workflow creates a private draft pre-classified as a
-prerelease, not a public download. This file must be updated with the immutable commit, run, tag,
-asset, and public-download evidence as those boundaries complete.
+RC2 is **not published yet**. Source candidate
+`52702397834916fad2cdd148a9dad03dc283578f` is pushed and passed its exact GitHub CI and
+supply-chain workflows, but it has no tag, GitHub release, or public assets. Recording that evidence
+in this file creates the final tag candidate; that resulting exact commit must pass both workflows
+before an annotated `v0.1.0-rc.2` tag may trigger the five-target native and wheel matrix. A
+successful tagged workflow creates a private draft pre-classified as a prerelease, not a public
+download. This file must be updated with the immutable tag, asset, and public-download evidence as
+those boundaries complete.
 
 No physical MeshCore companion was available, so no BLE, serial, or over-the-air radio result is
 claimed. No crates.io or PyPI credential is available; those independent registry uploads remain
@@ -61,9 +63,9 @@ The physical matrix remains in [hardware testing](docs/hardware-testing.md).
 | MQTT | MQTT 3.1.1, MQTT 5, allowlisted broker-to-demo direct send, and private-CA TLS/auth/mTLS enforcement all passed; the negative cases rejected wrong trust, password, client identity, and server name |
 | Fuzzing | All four sanitizer targets completed 20-second gates without a crash: `protocol_packet` 2,640,848 runs, `outer_frames` 774,764, `remote_payloads` 1,698,222, and `mqtt_commands` 99,305 |
 | Dependencies/licences | `cargo audit --no-fetch` and `cargo deny check` passed for root and fuzz lockfiles; Pip Audit reported no known vulnerabilities for the exact Python requirements |
-| Workflows/docs | Actionlint 1.7.12 passed after the exact 16-asset draft allowlist was added; the shell package script passed `bash -n`; Lychee 0.24.2 validated 145 source Markdown links. PowerShell syntax awaits the Windows workflow because `pwsh` is unavailable locally |
+| Workflows/docs | Actionlint 1.7.12 passed after the exact 16-asset draft allowlist was added; the shell package script passed `bash -n`; Lychee 0.24.2 validated 145 source Markdown links. PowerShell release packaging awaits the tagged Windows artifact workflow because `pwsh` is unavailable locally |
 | Native package | `scripts/package-release.sh x86_64-unknown-linux-gnu v0.1.0-rc.2` produced a verified archive and sibling checksum; clean extraction found both licences, the CLI schema and fixtures, four completions, and 77 man pages, then passed version, init, info, contacts, ACKed send, inbox, and JSONL watch |
-| Remote source matrix | **Pending:** RC2 has not been pushed; no CI or supply-chain run is yet attributable to its final commit |
+| Remote source matrix | Passed for pushed source candidate `52702397834916fad2cdd148a9dad03dc283578f`: [CI run 30593438470](https://github.com/sol-aeternum/meshquill/actions/runs/30593438470) and [supply-chain run 30593438464](https://github.com/sol-aeternum/meshquill/actions/runs/30593438464) both completed successfully. The evidence-only status commit still requires its own exact-SHA rerun before tagging |
 | Tagged artifact matrix | **Pending:** no RC2 tag exists; no RC2 draft or public assets are claimed |
 
 The local archive was built on a rolling Linux host and is local smoke evidence only. Release CI
@@ -118,10 +120,11 @@ disconnect instrumentation.
   are disabled by default and broker ACLs remain a security boundary.
 - Release archives and wheels use SHA-256 integrity checks but are unsigned; macOS and Windows
   binaries are not code-signed.
-- RC2 still requires: a clean committed/pushed source snapshot, successful CI and supply-chain runs
-  for that exact SHA, an immutable annotated tag, successful five-target artifact jobs, inspection
-  of all 16 draft assets, publication as a GitHub prerelease, and a fresh public checksum/download
-  smoke. Physical hardware and registry publication remain separately recorded limitations.
+- RC2 still requires: committing and pushing this evidence-only status update, successful CI and
+  supply-chain runs for that resulting exact SHA, an immutable annotated tag, successful
+  five-target artifact jobs, inspection of all 16 draft assets, publication as a GitHub prerelease,
+  and a fresh public checksum/download smoke. Physical hardware and registry publication remain
+  separately recorded limitations.
 
 ## Historical RC1 evidence
 
