@@ -18,7 +18,7 @@ jobs:
     name: Workflow syntax
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run checksum-verified actionlint
         shell: bash
         run: |
@@ -40,7 +40,7 @@ jobs:
         os: [ubuntu-24.04, macos-15, macos-15-intel, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
         shell: bash
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
@@ -66,7 +66,7 @@ jobs:
     name: Minimum supported Rust
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev libudev-dev pkg-config
       - run: rustup toolchain install 1.88.0 --profile minimal
       - run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
@@ -75,7 +75,7 @@ jobs:
     name: Parser fuzz smoke
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install nightly-2026-07-30 --profile minimal
       - run: cargo +nightly-2026-07-30 install cargo-fuzz --version 0.13.2 --locked
       - run: cargo +nightly-2026-07-30 fuzz run protocol_packet -- -max_total_time=20
@@ -91,8 +91,8 @@ jobs:
         python: ["3.9", "3.14"]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -178,7 +178,7 @@ jobs:
     name: MQTT integration (Mosquitto)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev libudev-dev pkg-config
       - name: Start disposable broker
@@ -279,7 +279,7 @@ jobs:
     name: Documentation links
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
         with:
           args: --root-dir . --max-retries 3 --timeout 20 --no-progress './**/*.md'
