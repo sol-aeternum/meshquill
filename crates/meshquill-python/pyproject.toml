@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin==1.11.5"]
+requires = ["maturin==1.14.1"]
 build-backend = "maturin"
 
 [project]
@@ -34,14 +34,14 @@ Issues = "https://github.com/sol-aeternum/meshquill/issues"
 
 [dependency-groups]
 dev = [
-  "maturin==1.11.5",
+  "maturin==1.14.1",
   "jsonschema==4.26.0",
   "mypy==1.20.2",
   "pytest==9.1.1",
   "pytest-asyncio==1.4.0",
-  "ruff==0.16.0",
+  "ruff==0.16.2",
   "twine==7.0.0",
-  "pip-audit==2.10.0",
+  "pip-audit==2.10.1",
 ]
 
 [tool.maturin]
